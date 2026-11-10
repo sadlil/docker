@@ -1,36 +1,69 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
+	"net/netip"
 	"os"
-	"sort"
 	"testing"
 
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/daemon/images"
-	"github.com/docker/docker/libnetwork"
-	"github.com/docker/docker/registry"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/mitchellh/copystructure"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/images"
+	"github.com/moby/moby/v2/daemon/libnetwork"
+	"github.com/moby/moby/v2/daemon/pkg/registry"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
 // muteLogs suppresses logs that are generated during the test
-func muteLogs() {
-	logrus.SetLevel(logrus.ErrorLevel)
+func muteLogs(t *testing.T) {
+	t.Helper()
+	err := log.SetLevel(log.ErrorLevel)
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func TestCopystructureNetipAddr(t *testing.T) {
+	// Verify that our custom copier for netip.Addr works correctly.
+	// Without it, copystructure.Copy produces zero-value (invalid) addresses.
+	original := []netip.Addr{netip.MustParseAddr("8.8.8.8")}
+	copied, err := copystructure.Copy(original)
+	assert.NilError(t, err)
+	assert.Check(t, is.DeepEqual(copied.([]netip.Addr), original, cmpopts.EquateComparable(netip.Addr{})))
+}
+
+func TestCopystructureNetipPrefix(t *testing.T) {
+	// Verify that our custom copier for netip.Prefix works correctly.
+	// Without it, copystructure.Copy produces zero-value (invalid) prefixes.
+	original := []netip.Prefix{netip.MustParsePrefix("172.30.0.0/16")}
+	copied, err := copystructure.Copy(original)
+	assert.NilError(t, err)
+	assert.Check(t, is.DeepEqual(copied.([]netip.Prefix), original, cmpopts.EquateComparable(netip.Prefix{})))
+}
+
+func newDaemonForReloadT(t *testing.T, cfg *config.Config) *Daemon {
+	t.Helper()
+	daemon := &Daemon{
+		imageService: images.NewImageService(t.Context(), images.ImageServiceConfig{}),
+	}
+	var err error
+	daemon.registryService, err = registry.NewService(registry.ServiceOptions{})
+	assert.Assert(t, err)
+	daemon.configStore.Store(&configStore{Config: *cfg})
+	return daemon
 }
 
 func TestDaemonReloadLabels(t *testing.T) {
-	daemon := &Daemon{
-		configStore: &config.Config{
-			CommonConfig: config.CommonConfig{
-				Labels: []string{"foo:bar"},
-			},
+	daemon := newDaemonForReloadT(t, &config.Config{
+		CommonConfig: config.CommonConfig{
+			Labels: []string{"foo:bar"},
 		},
-		imageService: images.NewImageService(images.ImageServiceConfig{}),
-	}
-	muteLogs()
+	})
+	muteLogs(t)
 
-	valuesSets := make(map[string]interface{})
+	valuesSets := make(map[string]any)
 	valuesSets["labels"] = "foo:baz"
 	newConfig := &config.Config{
 		CommonConfig: config.CommonConfig{
@@ -43,74 +76,17 @@ func TestDaemonReloadLabels(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	label := daemon.configStore.Labels[0]
+	label := daemon.config().Labels[0]
 	if label != "foo:baz" {
 		t.Fatalf("Expected daemon label `foo:baz`, got %s", label)
 	}
 }
 
-func TestDaemonReloadAllowNondistributableArtifacts(t *testing.T) {
-	daemon := &Daemon{
-		configStore:  &config.Config{},
-		imageService: images.NewImageService(images.ImageServiceConfig{}),
-	}
-	muteLogs()
-
-	var err error
-	// Initialize daemon with some registries.
-	daemon.registryService, err = registry.NewService(registry.ServiceOptions{
-		AllowNondistributableArtifacts: []string{
-			"127.0.0.0/8",
-			"10.10.1.11:5000",
-			"10.10.1.22:5000", // This will be removed during reload.
-			"docker1.com",
-			"docker2.com", // This will be removed during reload.
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	registries := []string{
-		"127.0.0.0/8",
-		"10.10.1.11:5000",
-		"10.10.1.33:5000", // This will be added during reload.
-		"docker1.com",
-		"docker3.com", // This will be added during reload.
-	}
-
-	newConfig := &config.Config{
-		CommonConfig: config.CommonConfig{
-			ServiceOptions: registry.ServiceOptions{
-				AllowNondistributableArtifacts: registries,
-			},
-			ValuesSet: map[string]interface{}{
-				"allow-nondistributable-artifacts": registries,
-			},
-		},
-	}
-
-	if err := daemon.Reload(newConfig); err != nil {
-		t.Fatal(err)
-	}
-
-	var actual []string
-	serviceConfig := daemon.registryService.ServiceConfig()
-	for _, value := range serviceConfig.AllowNondistributableArtifactsCIDRs {
-		actual = append(actual, value.String())
-	}
-	actual = append(actual, serviceConfig.AllowNondistributableArtifactsHostnames...)
-
-	sort.Strings(registries)
-	sort.Strings(actual)
-	assert.Check(t, is.DeepEqual(registries, actual))
-}
-
 func TestDaemonReloadMirrors(t *testing.T) {
 	daemon := &Daemon{
-		imageService: images.NewImageService(images.ImageServiceConfig{}),
+		imageService: images.NewImageService(t.Context(), images.ImageServiceConfig{}),
 	}
-	muteLogs()
+	muteLogs(t)
 
 	var err error
 	daemon.registryService, err = registry.NewService(registry.ServiceOptions{
@@ -124,8 +100,6 @@ func TestDaemonReloadMirrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	daemon.configStore = &config.Config{}
 
 	type pair struct {
 		valid   bool
@@ -157,7 +131,7 @@ func TestDaemonReloadMirrors(t *testing.T) {
 	}
 
 	for _, value := range loadMirrors {
-		valuesSets := make(map[string]interface{})
+		valuesSets := make(map[string]any)
 		valuesSets["registry-mirrors"] = value.mirrors
 
 		newConfig := &config.Config{
@@ -209,14 +183,15 @@ func TestDaemonReloadMirrors(t *testing.T) {
 
 func TestDaemonReloadInsecureRegistries(t *testing.T) {
 	daemon := &Daemon{
-		imageService: images.NewImageService(images.ImageServiceConfig{}),
+		imageService: images.NewImageService(t.Context(), images.ImageServiceConfig{}),
 	}
-	muteLogs()
+	muteLogs(t)
 
 	var err error
 	// initialize daemon with existing insecure registries: "127.0.0.0/8", "10.10.1.11:5000", "10.10.1.22:5000"
 	daemon.registryService, err = registry.NewService(registry.ServiceOptions{
 		InsecureRegistries: []string{
+			"::1/128",
 			"127.0.0.0/8",
 			"10.10.1.11:5000",
 			"10.10.1.22:5000", // this will be removed when reloading
@@ -228,9 +203,8 @@ func TestDaemonReloadInsecureRegistries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	daemon.configStore = &config.Config{}
-
 	insecureRegistries := []string{
+		"::1/128",             // this will be kept
 		"127.0.0.0/8",         // this will be kept
 		"10.10.1.11:5000",     // this will be kept
 		"10.10.1.33:5000",     // this will be newly added
@@ -238,13 +212,19 @@ func TestDaemonReloadInsecureRegistries(t *testing.T) {
 		"docker3.example.com", // this will be newly added
 	}
 
-	valuesSets := make(map[string]interface{})
+	mirrors := []string{
+		"https://mirror.test.example.com",
+	}
+
+	valuesSets := make(map[string]any)
 	valuesSets["insecure-registries"] = insecureRegistries
+	valuesSets["registry-mirrors"] = mirrors
 
 	newConfig := &config.Config{
 		CommonConfig: config.CommonConfig{
 			ServiceOptions: registry.ServiceOptions{
 				InsecureRegistries: insecureRegistries,
+				Mirrors:            mirrors,
 			},
 			ValuesSet: valuesSets,
 		},
@@ -302,19 +282,15 @@ func TestDaemonReloadInsecureRegistries(t *testing.T) {
 }
 
 func TestDaemonReloadNotAffectOthers(t *testing.T) {
-	daemon := &Daemon{
-		imageService: images.NewImageService(images.ImageServiceConfig{}),
-	}
-	muteLogs()
-
-	daemon.configStore = &config.Config{
+	daemon := newDaemonForReloadT(t, &config.Config{
 		CommonConfig: config.CommonConfig{
 			Labels: []string{"foo:bar"},
 			Debug:  true,
 		},
-	}
+	})
+	muteLogs(t)
 
-	valuesSets := make(map[string]interface{})
+	valuesSets := make(map[string]any)
 	valuesSets["labels"] = "foo:baz"
 	newConfig := &config.Config{
 		CommonConfig: config.CommonConfig{
@@ -327,13 +303,44 @@ func TestDaemonReloadNotAffectOthers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	label := daemon.configStore.Labels[0]
+	label := daemon.config().Labels[0]
 	if label != "foo:baz" {
 		t.Fatalf("Expected daemon label `foo:baz`, got %s", label)
 	}
-	debug := daemon.configStore.Debug
+	debug := daemon.config().Debug
 	if !debug {
 		t.Fatal("Expected debug 'enabled', got 'disabled'")
+	}
+}
+
+func TestDaemonReloadDefaultStopTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		timeout int
+	}{
+		{name: "positive", timeout: 42},
+		{name: "zero", timeout: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			daemon := newDaemonForReloadT(t, &config.Config{
+				CommonConfig: config.CommonConfig{
+					ContainerDefaults: config.ContainerDefaults{
+						DefaultStopTimeout: 10,
+					},
+				},
+			})
+			newConfig := &config.Config{
+				CommonConfig: config.CommonConfig{
+					ContainerDefaults: config.ContainerDefaults{
+						DefaultStopTimeout: tc.timeout,
+					},
+					ValuesSet: map[string]any{"default-stop-timeout": tc.timeout},
+				},
+			}
+
+			assert.NilError(t, daemon.Reload(newConfig))
+			assert.Equal(t, daemon.config().DefaultStopTimeout, tc.timeout)
+		})
 	}
 }
 
@@ -341,51 +348,45 @@ func TestDaemonReloadNetworkDiagnosticPort(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("root required")
 	}
-	daemon := &Daemon{
-		imageService: images.NewImageService(images.ImageServiceConfig{}),
-	}
-	daemon.configStore = &config.Config{}
+	daemon := newDaemonForReloadT(t, &config.Config{})
 
-	valuesSet := make(map[string]interface{})
-	valuesSet["network-diagnostic-port"] = 2000
 	enableConfig := &config.Config{
 		CommonConfig: config.CommonConfig{
 			NetworkDiagnosticPort: 2000,
-			ValuesSet:             valuesSet,
+			ValuesSet: map[string]any{
+				"network-diagnostic-port": 2000,
+			},
 		},
 	}
-	disableConfig := &config.Config{
-		CommonConfig: config.CommonConfig{},
-	}
 
-	netOptions, err := daemon.networkOptions(enableConfig, nil, nil)
+	netOptions, err := daemon.networkOptions(&config.Config{CommonConfig: config.CommonConfig{Root: t.TempDir(), ExecRoot: t.TempDir()}}, nil, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	controller, err := libnetwork.New(netOptions...)
+	controller, err := libnetwork.New(t.Context(), netOptions...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	daemon.netController = controller
 
 	// Enable/Disable the server for some iterations
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		enableConfig.CommonConfig.NetworkDiagnosticPort++
 		if err := daemon.Reload(enableConfig); err != nil {
 			t.Fatal(err)
 		}
 		// Check that the diagnostic is enabled
 		if !daemon.netController.IsDiagnosticEnabled() {
-			t.Fatalf("diagnostic should be enable")
+			t.Fatalf("diagnostic should be enabled")
 		}
 
 		// Reload
-		if err := daemon.Reload(disableConfig); err != nil {
+		if err := daemon.Reload(&config.Config{}); err != nil {
 			t.Fatal(err)
 		}
 		// Check that the diagnostic is disabled
 		if daemon.netController.IsDiagnosticEnabled() {
-			t.Fatalf("diagnostic should be disable")
+			t.Fatalf("diagnostic should be disabled")
 		}
 	}
 
@@ -407,5 +408,90 @@ func TestDaemonReloadNetworkDiagnosticPort(t *testing.T) {
 	if !daemon.netController.IsDiagnosticEnabled() {
 		t.Fatalf("diagnostic should be enable")
 	}
+}
 
+func TestDaemonReloadPreservesDNSConfig(t *testing.T) {
+	dnsServers := []netip.Addr{
+		netip.MustParseAddr("8.8.8.8"),
+		netip.MustParseAddr("8.8.4.4"),
+	}
+	hostGatewayIPs := []netip.Addr{
+		netip.MustParseAddr("192.168.1.1"),
+		netip.MustParseAddr("fd00::1"),
+	}
+
+	daemon := newDaemonForReloadT(t, &config.Config{
+		CommonConfig: config.CommonConfig{
+			Labels: []string{"foo:bar"},
+			DNSConfig: config.DNSConfig{
+				DNS:            dnsServers,
+				HostGatewayIPs: hostGatewayIPs,
+			},
+		},
+	})
+	muteLogs(t)
+
+	// Reload with a different config (labels change)
+	newConfig := &config.Config{
+		CommonConfig: config.CommonConfig{
+			Labels:    []string{"foo:baz"},
+			ValuesSet: map[string]any{"labels": "foo:baz"},
+		},
+	}
+
+	err := daemon.Reload(newConfig)
+	assert.NilError(t, err)
+
+	// Verify DNS config is preserved after reload
+	cfg := daemon.config()
+	assert.Check(t, is.DeepEqual(cfg.DNS, dnsServers, cmpopts.EquateComparable(netip.Addr{})))
+	assert.Check(t, is.DeepEqual(cfg.HostGatewayIPs, hostGatewayIPs, cmpopts.EquateComparable(netip.Addr{})))
+
+	// Verify all addresses are valid (not zero-value)
+	for i, addr := range cfg.DNS {
+		assert.Check(t, addr.IsValid(), "DNS[%d] should be valid, got %q", i, addr)
+	}
+	for i, addr := range cfg.HostGatewayIPs {
+		assert.Check(t, addr.IsValid(), "HostGatewayIPs[%d] should be valid, got %q", i, addr)
+	}
+}
+
+func TestReloadTxn(t *testing.T) {
+	// Count callback sets without making execution order part of the contract.
+	type calls struct {
+		commit   int
+		rollback int
+	}
+	newTxn := func() (*reloadTxn, *calls) {
+		var tx reloadTxn
+		called := new(calls)
+		commit := func() error {
+			called.commit++
+			return nil
+		}
+		rollback := func() error {
+			called.rollback++
+			return nil
+		}
+		// Interleave duplicates to catch replacement and cross-execution.
+		tx.OnCommit(commit)
+		tx.OnRollback(rollback)
+		tx.OnCommit(commit)
+		tx.OnRollback(rollback)
+		return &tx, called
+	}
+
+	t.Run("Commit", func(t *testing.T) {
+		tx, called := newTxn()
+		assert.NilError(t, tx.Commit())
+		assert.Equal(t, called.commit, 2)
+		assert.Equal(t, called.rollback, 0)
+	})
+
+	t.Run("Rollback", func(t *testing.T) {
+		tx, called := newTxn()
+		assert.NilError(t, tx.Rollback())
+		assert.Equal(t, called.commit, 0)
+		assert.Equal(t, called.rollback, 2)
+	})
 }

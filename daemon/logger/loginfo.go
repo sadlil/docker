@@ -1,4 +1,4 @@
-package logger // import "github.com/docker/docker/daemon/logger"
+package logger
 
 import (
 	"fmt"
@@ -6,6 +6,18 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/moby/moby/v2/daemon/internal/stringid"
+)
+
+// Common log-opts to include extra attributes through [Info.ExtraAttributes]
+// and [loggerutils.ParseLogTag].
+const (
+	AttrEnv         = "env"          // Comma-separated list of env-vars to include as log-metadata.
+	AttrEnvRegex    = "env-regex"    // Regular Expression to match environment variables to include as log-metadata.
+	AttrLabels      = "labels"       // Comma-separated list of labels to include as log-metadata.
+	AttrLabelsRegex = "labels-regex" // Regular Expression to match labels to include as log-metadata.
+	AttrLogTag      = "tag"          // Log "tag" log-metadata. Can be either a literal value or a Go template to use for templating the "tag" log-metadata.
 )
 
 // Info provides enough information for a logging driver to do its function.
@@ -29,9 +41,9 @@ type Info struct {
 // that support metadata to add more context to a log.
 func (info *Info) ExtraAttributes(keyMod func(string) string) (map[string]string, error) {
 	extra := make(map[string]string)
-	labels, ok := info.Config["labels"]
-	if ok && len(labels) > 0 {
-		for _, l := range strings.Split(labels, ",") {
+
+	if labels, ok := info.Config[AttrLabels]; ok && labels != "" {
+		for l := range strings.SplitSeq(labels, ",") {
 			if v, ok := info.ContainerLabels[l]; ok {
 				if keyMod != nil {
 					l = keyMod(l)
@@ -41,8 +53,7 @@ func (info *Info) ExtraAttributes(keyMod func(string) string) (map[string]string
 		}
 	}
 
-	labelsRegex, ok := info.Config["labels-regex"]
-	if ok && len(labelsRegex) > 0 {
+	if labelsRegex, ok := info.Config[AttrLabelsRegex]; ok && labelsRegex != "" {
 		re, err := regexp.Compile(labelsRegex)
 		if err != nil {
 			return nil, err
@@ -59,14 +70,18 @@ func (info *Info) ExtraAttributes(keyMod func(string) string) (map[string]string
 
 	envMapping := make(map[string]string)
 	for _, e := range info.ContainerEnv {
-		if kv := strings.SplitN(e, "=", 2); len(kv) == 2 {
-			envMapping[kv[0]] = kv[1]
+		if k, v, ok := strings.Cut(e, "="); ok {
+			envMapping[k] = v
 		}
 	}
 
-	env, ok := info.Config["env"]
-	if ok && len(env) > 0 {
-		for _, l := range strings.Split(env, ",") {
+	// Code below is only to handle adding attributes based on env-vars.
+	if len(envMapping) == 0 {
+		return extra, nil
+	}
+
+	if env, ok := info.Config[AttrEnv]; ok && env != "" {
+		for l := range strings.SplitSeq(env, ",") {
 			if v, ok := envMapping[l]; ok {
 				if keyMod != nil {
 					l = keyMod(l)
@@ -76,8 +91,7 @@ func (info *Info) ExtraAttributes(keyMod func(string) string) (map[string]string
 		}
 	}
 
-	envRegex, ok := info.Config["env-regex"]
-	if ok && len(envRegex) > 0 {
+	if envRegex, ok := info.Config[AttrEnvRegex]; ok && envRegex != "" {
 		re, err := regexp.Compile(envRegex)
 		if err != nil {
 			return nil, err
@@ -114,32 +128,32 @@ func (info *Info) Command() string {
 	return command
 }
 
-// ID Returns the Container ID shortened to 12 characters.
+// ID returns the container ID-prefix (truncated ID).
 func (info *Info) ID() string {
-	return info.ContainerID[:12]
+	return stringid.TruncateID(info.ContainerID)
 }
 
-// FullID is an alias of ContainerID.
+// FullID returns the container ID.
 func (info *Info) FullID() string {
 	return info.ContainerID
 }
 
-// Name returns the ContainerName without a preceding '/'.
+// Name returns the container name.
 func (info *Info) Name() string {
 	return strings.TrimPrefix(info.ContainerName, "/")
 }
 
-// ImageID returns the ContainerImageID shortened to 12 characters.
+// ImageID returns the ID-prefix (truncated ID) of the image the container was created from.
 func (info *Info) ImageID() string {
-	return info.ContainerImageID[:12]
+	return stringid.TruncateID(info.ContainerImageID)
 }
 
-// ImageFullID is an alias of ContainerImageID.
+// ImageFullID returns the ID (digest) of the image the container was created from.
 func (info *Info) ImageFullID() string {
 	return info.ContainerImageID
 }
 
-// ImageName is an alias of ContainerImageName
+// ImageName returns the name of the image the container was created from.
 func (info *Info) ImageName() string {
 	return info.ContainerImageName
 }

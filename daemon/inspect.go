@@ -1,273 +1,243 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"runtime"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/backend"
-	networktypes "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/api/types/versions/v1p20"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/network"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/go-connections/nat"
+	containertypes "github.com/moby/moby/api/types/container"
+	networktypes "github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/storage"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/errdefs"
 )
 
 // ContainerInspect returns low-level information about a
 // container. Returns an error if the container cannot be found, or if
 // there is an error getting the data.
-func (daemon *Daemon) ContainerInspect(name string, size bool, version string) (interface{}, error) {
-	switch {
-	case versions.LessThan(version, "1.20"):
-		return daemon.containerInspectPre120(name)
-	case versions.Equal(version, "1.20"):
-		return daemon.containerInspect120(name)
-	}
-	return daemon.ContainerInspectCurrent(name, size)
-}
-
-// ContainerInspectCurrent returns low-level information about a
-// container in a most recent api version.
-func (daemon *Daemon) ContainerInspectCurrent(name string, size bool) (*types.ContainerJSON, error) {
+func (daemon *Daemon) ContainerInspect(ctx context.Context, name string, options backend.ContainerInspectOptions) (_ *containertypes.InspectResponse, desiredMACAddress networktypes.HardwareAddr, _ error) {
 	ctr, err := daemon.GetContainer(name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	ctr.Lock()
-
-	base, err := daemon.getInspectData(ctr)
+	base, desiredMACAddress, err := daemon.containerInspect(&daemon.config().Config, ctr)
 	if err != nil {
-		ctr.Unlock()
-		return nil, err
+		return base, desiredMACAddress, err
 	}
 
-	apiNetworks := make(map[string]*networktypes.EndpointSettings)
-	for name, epConf := range ctr.NetworkSettings.Networks {
-		if epConf.EndpointSettings != nil {
-			// We must make a copy of this pointer object otherwise it can race with other operations
-			apiNetworks[name] = epConf.EndpointSettings.Copy()
+	// Don’t hold container lock for size calculation (see https://github.com/moby/moby/issues/31158)
+	if options.Size {
+		sizeRw, sizeRootFs, err := daemon.imageService.GetContainerLayerSize(ctx, base.ID)
+		if err != nil {
+			return nil, nil, err
 		}
-	}
-
-	mountPoints := ctr.GetMountPoints()
-	networkSettings := &types.NetworkSettings{
-		NetworkSettingsBase: types.NetworkSettingsBase{
-			Bridge:                 ctr.NetworkSettings.Bridge,
-			SandboxID:              ctr.NetworkSettings.SandboxID,
-			HairpinMode:            ctr.NetworkSettings.HairpinMode,
-			LinkLocalIPv6Address:   ctr.NetworkSettings.LinkLocalIPv6Address,
-			LinkLocalIPv6PrefixLen: ctr.NetworkSettings.LinkLocalIPv6PrefixLen,
-			SandboxKey:             ctr.NetworkSettings.SandboxKey,
-			SecondaryIPAddresses:   ctr.NetworkSettings.SecondaryIPAddresses,
-			SecondaryIPv6Addresses: ctr.NetworkSettings.SecondaryIPv6Addresses,
-		},
-		DefaultNetworkSettings: daemon.getDefaultNetworkSettings(ctr.NetworkSettings.Networks),
-		Networks:               apiNetworks,
-	}
-
-	ports := make(nat.PortMap, len(ctr.NetworkSettings.Ports))
-	for k, pm := range ctr.NetworkSettings.Ports {
-		ports[k] = pm
-	}
-	networkSettings.NetworkSettingsBase.Ports = ports
-
-	ctr.Unlock()
-
-	if size {
-		sizeRw, sizeRootFs := daemon.imageService.GetContainerLayerSize(base.ID)
 		base.SizeRw = &sizeRw
 		base.SizeRootFs = &sizeRootFs
 	}
-
-	return &types.ContainerJSON{
-		ContainerJSONBase: base,
-		Mounts:            mountPoints,
-		Config:            ctr.Config,
-		NetworkSettings:   networkSettings,
-	}, nil
+	return base, desiredMACAddress, nil
 }
 
-// containerInspect120 serializes the master version of a container into a json type.
-func (daemon *Daemon) containerInspect120(name string) (*v1p20.ContainerJSON, error) {
-	container, err := daemon.GetContainer(name)
+func (daemon *Daemon) containerInspect(daemonCfg *config.Config, ctr *container.Container) (_ *containertypes.InspectResponse, desiredMACAddress networktypes.HardwareAddr, _ error) {
+	ctr.Lock()
+	defer ctr.Unlock()
+
+	base, desiredMACAddress, err := daemon.getInspectData(daemonCfg, ctr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	container.Lock()
-	defer container.Unlock()
+	if !daemon.UsesSnapshotter() {
+		if ctr.RWLayer == nil {
+			if ctr.State.Dead {
+				return base, desiredMACAddress, nil
+			}
+			return nil, nil, errdefs.System(errors.New("RWLayer of container " + ctr.ID + " is unexpectedly nil"))
+		}
 
-	base, err := daemon.getInspectData(container)
-	if err != nil {
-		return nil, err
+		graphDriverData, err := ctr.RWLayer.Metadata()
+		if err != nil {
+			if ctr.State.Dead {
+				// container is marked as Dead, and its graphDriver metadata may
+				// have been removed; we can ignore errors.
+				return base, desiredMACAddress, nil
+			}
+			return nil, nil, errdefs.System(err)
+		}
+
+		base.GraphDriver.Data = graphDriverData
 	}
 
-	mountPoints := container.GetMountPoints()
-	config := &v1p20.ContainerConfig{
-		Config:          container.Config,
-		MacAddress:      container.Config.MacAddress,
-		NetworkDisabled: container.Config.NetworkDisabled,
-		ExposedPorts:    container.Config.ExposedPorts,
-		VolumeDriver:    container.HostConfig.VolumeDriver,
-	}
-	networkSettings := daemon.getBackwardsCompatibleNetworkSettings(container.NetworkSettings)
-
-	return &v1p20.ContainerJSON{
-		ContainerJSONBase: base,
-		Mounts:            mountPoints,
-		Config:            config,
-		NetworkSettings:   networkSettings,
-	}, nil
+	return base, desiredMACAddress, nil
 }
 
-func (daemon *Daemon) getInspectData(container *container.Container) (*types.ContainerJSONBase, error) {
+func (daemon *Daemon) getInspectData(daemonCfg *config.Config, ctr *container.Container) (_ *containertypes.InspectResponse, desiredMACAddress networktypes.HardwareAddr, _ error) {
 	// make a copy to play with
-	hostConfig := *container.HostConfig
+	hostConfig := *ctr.HostConfig
 
-	children := daemon.children(container)
+	// Add information for legacy links
+	children := daemon.linkIndex.children(ctr)
 	hostConfig.Links = nil // do not expose the internal structure
 	for linkAlias, child := range children {
 		hostConfig.Links = append(hostConfig.Links, fmt.Sprintf("%s:%s", child.Name, linkAlias))
 	}
 
 	// We merge the Ulimits from hostConfig with daemon default
-	daemon.mergeUlimits(&hostConfig)
+	daemon.mergeUlimits(&hostConfig, daemonCfg)
 
-	var containerHealth *types.Health
-	if container.State.Health != nil {
-		containerHealth = &types.Health{
-			Status:        container.State.Health.Status(),
-			FailingStreak: container.State.Health.FailingStreak,
-			Log:           append([]*types.HealthcheckResult{}, container.State.Health.Log...),
+	// Migrate the container's default network's MacAddress to the top-level
+	// Config.MacAddress field for older API versions (< 1.44). We set it here
+	// unconditionally, to keep backward compatibility with clients that use
+	// unversioned API endpoints.
+	var macAddress networktypes.HardwareAddr
+	if ctr.Config != nil {
+		if nwm := hostConfig.NetworkMode; nwm.IsBridge() || nwm.IsUserDefined() {
+			if epConf, ok := ctr.NetworkSettings.Networks[nwm.NetworkName()]; ok {
+				macAddress = epConf.DesiredMacAddress
+			}
 		}
 	}
 
-	containerState := &types.ContainerState{
-		Status:     container.State.StateString(),
-		Running:    container.State.Running,
-		Paused:     container.State.Paused,
-		Restarting: container.State.Restarting,
-		OOMKilled:  container.State.OOMKilled,
-		Dead:       container.State.Dead,
-		Pid:        container.State.Pid,
-		ExitCode:   container.State.ExitCode(),
-		Error:      container.State.ErrorMsg,
-		StartedAt:  container.State.StartedAt.Format(time.RFC3339Nano),
-		FinishedAt: container.State.FinishedAt.Format(time.RFC3339Nano),
-		Health:     containerHealth,
-	}
-
-	contJSONBase := &types.ContainerJSONBase{
-		ID:           container.ID,
-		Created:      container.Created.Format(time.RFC3339Nano),
-		Path:         container.Path,
-		Args:         container.Args,
-		State:        containerState,
-		Image:        container.ImageID.String(),
-		LogPath:      container.LogPath,
-		Name:         container.Name,
-		RestartCount: container.RestartCount,
-		Driver:       container.Driver,
-		Platform:     container.OS,
-		MountLabel:   container.MountLabel,
-		ProcessLabel: container.ProcessLabel,
-		ExecIDs:      container.GetExecIDs(),
-		HostConfig:   &hostConfig,
-	}
-
-	// Now set any platform-specific fields
-	contJSONBase = setPlatformSpecificContainerFields(container, contJSONBase)
-
-	contJSONBase.GraphDriver.Name = container.Driver
-
-	if container.RWLayer == nil {
-		if container.Dead {
-			return contJSONBase, nil
+	var containerHealth *containertypes.Health
+	if ctr.State.Health != nil {
+		containerHealth = &containertypes.Health{
+			Status:        ctr.State.Health.Status(),
+			FailingStreak: ctr.State.Health.Health.FailingStreak,
+			Log:           append([]*containertypes.HealthcheckResult{}, ctr.State.Health.Health.Log...),
 		}
-		return nil, errdefs.System(errors.New("RWLayer of container " + container.ID + " is unexpectedly nil"))
 	}
 
-	graphDriverData, err := container.RWLayer.Metadata()
-	// If container is marked as Dead, the container's graphdriver metadata
-	// could have been removed, it will cause error if we try to get the metadata,
-	// we can ignore the error if the container is dead.
-	if err != nil {
-		if !container.Dead {
-			return nil, errdefs.System(err)
+	inspectResponse := &containertypes.InspectResponse{
+		ID:      ctr.ID,
+		Created: ctr.Created.Format(time.RFC3339Nano),
+		Path:    ctr.Path,
+		Args:    ctr.Args,
+		State: &containertypes.State{
+			Status:     ctr.State.State(),
+			Running:    ctr.State.Running,
+			Paused:     ctr.State.Paused,
+			Restarting: ctr.State.Restarting,
+			OOMKilled:  ctr.State.OOMKilled,
+			Dead:       ctr.State.Dead,
+			Pid:        ctr.State.Pid,
+			ExitCode:   ctr.State.ExitCode,
+			Error:      ctr.State.ErrorMsg,
+			StartedAt:  ctr.State.StartedAt.Format(time.RFC3339Nano),
+			FinishedAt: ctr.State.FinishedAt.Format(time.RFC3339Nano),
+			Health:     containerHealth,
+		},
+		Image:           ctr.ImageID.String(),
+		ResolvConfPath:  ctr.ResolvConfPath, // Only used on Linux.
+		HostnamePath:    ctr.HostnamePath,   // Only used on Linux.
+		HostsPath:       ctr.HostsPath,      // Only used on Linux.
+		LogPath:         ctr.LogPath,
+		Name:            ctr.Name,
+		RestartCount:    ctr.RestartCount,
+		Driver:          ctr.Driver,
+		Platform:        ctr.ImagePlatform.OS,
+		MountLabel:      ctr.MountLabel,      // Only used on Linux.
+		ProcessLabel:    ctr.ProcessLabel,    // Only used on Linux.
+		AppArmorProfile: ctr.AppArmorProfile, // Only used on Linux.
+		ExecIDs:         ctr.GetExecIDs(),
+		HostConfig:      &hostConfig,
+		Config:          ctr.Config,
+	}
+
+	// TODO(thaJeztah): do we need a deep copy here? Otherwise we could use maps.Clone (see https://github.com/moby/moby/commit/7917a36cc787ada58987320e67cc6d96858f3b55)
+	ports := make(networktypes.PortMap, len(ctr.NetworkSettings.Ports))
+	maps.Copy(ports, ctr.NetworkSettings.Ports)
+
+	apiNetworks := make(map[string]*networktypes.EndpointSettings)
+	for nwName, epConf := range ctr.NetworkSettings.Networks {
+		if epConf.EndpointSettings != nil {
+			// We must make a copy of this pointer object otherwise it can race with other operations
+			apiNetworks[nwName] = epConf.EndpointSettings.Copy()
+		}
+	}
+
+	inspectResponse.NetworkSettings = &containertypes.NetworkSettings{
+		SandboxID:  ctr.NetworkSettings.SandboxID,
+		SandboxKey: ctr.NetworkSettings.SandboxKey,
+		Ports:      ports,
+		Networks:   apiNetworks,
+	}
+	inspectResponse.Mounts = ctr.GetMountPoints()
+
+	imageManifest := ctr.ImageManifest
+	if imageManifest != nil && imageManifest.Platform == nil {
+		// Copy the image manifest to avoid mutating the original
+		c := *imageManifest
+		imageManifest = &c
+
+		imageManifest.Platform = &ctr.ImagePlatform
+	}
+
+	inspectResponse.ImageManifestDescriptor = imageManifest
+
+	if daemon.UsesSnapshotter() {
+		inspectResponse.Storage = &storage.Storage{
+			RootFS: &storage.RootFSStorage{
+				Snapshot: &storage.RootFSStorageSnapshot{
+					Name: ctr.Driver,
+				},
+			},
 		}
 	} else {
-		contJSONBase.GraphDriver.Data = graphDriverData
+		inspectResponse.GraphDriver = &storage.DriverData{
+			Name: ctr.Driver,
+		}
 	}
-
-	return contJSONBase, nil
+	return inspectResponse, macAddress, nil
 }
 
 // ContainerExecInspect returns low-level information about the exec
 // command. An error is returned if the exec cannot be found.
-func (daemon *Daemon) ContainerExecInspect(id string) (*backend.ExecInspect, error) {
+func (daemon *Daemon) ContainerExecInspect(id string) (*containertypes.ExecInspectResponse, error) {
 	e := daemon.execCommands.Get(id)
 	if e == nil {
 		return nil, errExecNotFound(id)
 	}
 
-	if ctr := daemon.containers.Get(e.ContainerID); ctr == nil {
+	if ctr := daemon.containers.Get(e.Container.ID); ctr == nil {
 		return nil, errExecNotFound(id)
 	}
 
-	pc := inspectExecProcessConfig(e)
+	e.Lock()
+	defer e.Unlock()
+	var pid int
+	if e.Process != nil {
+		pid = int(e.Process.Pid())
+	}
+	var privileged *bool
+	if runtime.GOOS != "windows" || e.Privileged {
+		// Privileged is not used on Windows, so should always be false
+		// (and omitted in the response), but set it if it happened to
+		// be true. On non-Windows, we always set it, and the field should
+		// not be omitted.
+		privileged = &e.Privileged
+	}
 
-	return &backend.ExecInspect{
-		ID:            e.ID,
-		Running:       e.Running,
-		ExitCode:      e.ExitCode,
-		ProcessConfig: pc,
-		OpenStdin:     e.OpenStdin,
-		OpenStdout:    e.OpenStdout,
-		OpenStderr:    e.OpenStderr,
-		CanRemove:     e.CanRemove,
-		ContainerID:   e.ContainerID,
-		DetachKeys:    e.DetachKeys,
-		Pid:           e.Pid,
-	}, nil
-}
-
-func (daemon *Daemon) getBackwardsCompatibleNetworkSettings(settings *network.Settings) *v1p20.NetworkSettings {
-	result := &v1p20.NetworkSettings{
-		NetworkSettingsBase: types.NetworkSettingsBase{
-			Bridge:                 settings.Bridge,
-			SandboxID:              settings.SandboxID,
-			HairpinMode:            settings.HairpinMode,
-			LinkLocalIPv6Address:   settings.LinkLocalIPv6Address,
-			LinkLocalIPv6PrefixLen: settings.LinkLocalIPv6PrefixLen,
-			Ports:                  settings.Ports,
-			SandboxKey:             settings.SandboxKey,
-			SecondaryIPAddresses:   settings.SecondaryIPAddresses,
-			SecondaryIPv6Addresses: settings.SecondaryIPv6Addresses,
+	return &containertypes.ExecInspectResponse{
+		ID:       e.ID,
+		Running:  e.Running,
+		ExitCode: e.ExitCode,
+		ProcessConfig: &containertypes.ExecProcessConfig{
+			Tty:        e.Tty,
+			Entrypoint: e.Entrypoint,
+			Arguments:  e.Args,
+			Privileged: privileged, // Privileged is not used on Windows
+			User:       e.User,     // User is not used on Windows
 		},
-		DefaultNetworkSettings: daemon.getDefaultNetworkSettings(settings.Networks),
-	}
-
-	return result
-}
-
-// getDefaultNetworkSettings creates the deprecated structure that holds the information
-// about the bridge network for a container.
-func (daemon *Daemon) getDefaultNetworkSettings(networks map[string]*network.EndpointSettings) types.DefaultNetworkSettings {
-	var settings types.DefaultNetworkSettings
-
-	if defaultNetwork, ok := networks["bridge"]; ok && defaultNetwork.EndpointSettings != nil {
-		settings.EndpointID = defaultNetwork.EndpointID
-		settings.Gateway = defaultNetwork.Gateway
-		settings.GlobalIPv6Address = defaultNetwork.GlobalIPv6Address
-		settings.GlobalIPv6PrefixLen = defaultNetwork.GlobalIPv6PrefixLen
-		settings.IPAddress = defaultNetwork.IPAddress
-		settings.IPPrefixLen = defaultNetwork.IPPrefixLen
-		settings.IPv6Gateway = defaultNetwork.IPv6Gateway
-		settings.MacAddress = defaultNetwork.MacAddress
-	}
-	return settings
+		OpenStdin:   e.OpenStdin,
+		OpenStdout:  e.OpenStdout,
+		OpenStderr:  e.OpenStderr,
+		CanRemove:   e.CanRemove,
+		ContainerID: e.Container.ID,
+		DetachKeys:  e.DetachKeys,
+		Pid:         pid,
+	}, nil
 }

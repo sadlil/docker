@@ -1,36 +1,35 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 
-	"github.com/docker/docker/api/types/swarm"
+	"github.com/moby/moby/api/types/swarm"
 )
 
-// ConfigInspectWithRaw returns the config information with raw data
-func (cli *Client) ConfigInspectWithRaw(ctx context.Context, id string) (swarm.Config, []byte, error) {
-	if id == "" {
-		return swarm.Config{}, nil, objectNotFoundError{object: "config", id: id}
-	}
-	if err := cli.NewVersionError("1.30", "config inspect"); err != nil {
-		return swarm.Config{}, nil, err
+// ConfigInspectOptions holds options for inspecting a config.
+type ConfigInspectOptions struct {
+	// Add future optional parameters here
+}
+
+// ConfigInspectResult holds the result from the ConfigInspect method.
+type ConfigInspectResult struct {
+	Config swarm.Config
+	Raw    json.RawMessage
+}
+
+// ConfigInspect returns the config information with raw data
+func (cli *Client) ConfigInspect(ctx context.Context, id string, options ConfigInspectOptions) (ConfigInspectResult, error) {
+	id, err := trimID("config", id)
+	if err != nil {
+		return ConfigInspectResult{}, err
 	}
 	resp, err := cli.get(ctx, "/configs/"+id, nil, nil)
-	defer ensureReaderClosed(resp)
 	if err != nil {
-		return swarm.Config{}, nil, wrapResponseError(err, resp, "config", id)
+		return ConfigInspectResult{}, err
 	}
 
-	body, err := io.ReadAll(resp.body)
-	if err != nil {
-		return swarm.Config{}, nil, err
-	}
-
-	var config swarm.Config
-	rdr := bytes.NewReader(body)
-	err = json.NewDecoder(rdr).Decode(&config)
-
-	return config, body, err
+	var out ConfigInspectResult
+	out.Raw, err = decodeWithRaw(resp, &out.Config)
+	return out, err
 }

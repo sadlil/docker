@@ -1,31 +1,25 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net/url"
 
-	"github.com/docker/docker/api/types"
+	"github.com/moby/moby/api/types/network"
 )
 
-// NetworkInspect returns the information for a specific network configured in the docker host.
-func (cli *Client) NetworkInspect(ctx context.Context, networkID string, options types.NetworkInspectOptions) (types.NetworkResource, error) {
-	networkResource, _, err := cli.NetworkInspectWithRaw(ctx, networkID, options)
-	return networkResource, err
+// NetworkInspectResult contains the result of a network inspection.
+type NetworkInspectResult struct {
+	Network network.Inspect
+	Raw     json.RawMessage
 }
 
-// NetworkInspectWithRaw returns the information for a specific network configured in the docker host and its raw representation.
-func (cli *Client) NetworkInspectWithRaw(ctx context.Context, networkID string, options types.NetworkInspectOptions) (types.NetworkResource, []byte, error) {
-	if networkID == "" {
-		return types.NetworkResource{}, nil, objectNotFoundError{object: "network", id: networkID}
+// NetworkInspect returns the information for a specific network configured in the docker host.
+func (cli *Client) NetworkInspect(ctx context.Context, networkID string, options NetworkInspectOptions) (NetworkInspectResult, error) {
+	networkID, err := trimID("network", networkID)
+	if err != nil {
+		return NetworkInspectResult{}, err
 	}
-	var (
-		networkResource types.NetworkResource
-		resp            serverResponse
-		err             error
-	)
 	query := url.Values{}
 	if options.Verbose {
 		query.Set("verbose", "true")
@@ -33,17 +27,13 @@ func (cli *Client) NetworkInspectWithRaw(ctx context.Context, networkID string, 
 	if options.Scope != "" {
 		query.Set("scope", options.Scope)
 	}
-	resp, err = cli.get(ctx, "/networks/"+networkID, query, nil)
-	defer ensureReaderClosed(resp)
+
+	resp, err := cli.get(ctx, "/networks/"+networkID, query, nil)
 	if err != nil {
-		return networkResource, nil, wrapResponseError(err, resp, "network", networkID)
+		return NetworkInspectResult{}, err
 	}
 
-	body, err := io.ReadAll(resp.body)
-	if err != nil {
-		return networkResource, nil, err
-	}
-	rdr := bytes.NewReader(body)
-	err = json.NewDecoder(rdr).Decode(&networkResource)
-	return networkResource, body, err
+	var out NetworkInspectResult
+	out.Raw, err = decodeWithRaw(resp, &out.Network)
+	return out, err
 }

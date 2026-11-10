@@ -1,47 +1,44 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerRenameError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	err := client.ContainerRename(context.Background(), "nothing", "newNothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
+	_, err = client.ContainerRename(t.Context(), "nothing", ContainerRenameOptions{NewName: "newNothing"})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ContainerRename(t.Context(), "", ContainerRenameOptions{NewName: "newNothing"})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ContainerRename(t.Context(), "    ", ContainerRenameOptions{NewName: "newNothing"})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestContainerRename(t *testing.T) {
-	expectedURL := "/containers/container_id/rename"
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
-			name := req.URL.Query().Get("name")
-			if name != "newName" {
-				return nil, fmt.Errorf("name not set in URL query properly. Expected 'newName', got %s", name)
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader([]byte(""))),
-			}, nil
-		}),
-	}
+	const expectedURL = "/containers/container_id/rename"
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+			return nil, err
+		}
+		name := req.URL.Query().Get("name")
+		if name != "newName" {
+			return nil, fmt.Errorf("name not set in URL query properly. Expected 'newName', got %s", name)
+		}
+		return mockResponse(http.StatusOK, nil, "")(req)
+	}))
+	assert.NilError(t, err)
 
-	err := client.ContainerRename(context.Background(), "container_id", "newName")
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, err = client.ContainerRename(t.Context(), "container_id", ContainerRenameOptions{NewName: "newName"})
+	assert.NilError(t, err)
 }

@@ -4,16 +4,96 @@ import (
 	"io"
 	"os"
 
+	"github.com/Microsoft/go-winio"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/windows"
 )
 
-func (c *copier) copyFileInfo(fi os.FileInfo, name string) error {
+const (
+	seTakeOwnershipPrivilege = "SeTakeOwnershipPrivilege"
+)
+
+func getUIDGID(_ os.FileInfo) (uid, gid int) {
+	return 0, 0
+}
+
+func getFileSecurityInfo(name string) (*windows.SID, *windows.ACL, error) {
+	secInfo, err := windows.GetNamedSecurityInfo(
+		name, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "fetching security info")
+	}
+	sid, _, err := secInfo.Owner()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "fetching owner SID")
+	}
+	dacl, _, err := secInfo.DACL()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "fetching dacl")
+	}
+	return sid, dacl, nil
+}
+
+func (c *copier) copyFileInfo(fi os.FileInfo, src, name string) error {
+	if c.modeSet != nil {
+		return errors.Errorf("non-octal mode not supported on windows")
+	}
+
 	if err := os.Chmod(name, fi.Mode()); err != nil {
 		return errors.Wrapf(err, "failed to chmod %s", name)
 	}
 
-	// TODO: copy windows specific metadata
+	sid, dacl, err := getFileSecurityInfo(src)
+	if err != nil {
+		return errors.Wrap(err, "getting file info")
+	}
 
+	if c.chown != nil {
+		// Use the defined chowner.
+		usr := &User{SID: sid.String()}
+		if err := Chown(name, usr, c.chown); err != nil {
+			return errors.Wrapf(err, "failed to chown %s", name)
+		}
+		return nil
+	} else {
+		// Copy file ownership and ACL from the source file.
+		// We need SeRestorePrivilege and SeTakeOwnershipPrivilege in order
+		// to restore security info on a file, especially if we're trying to
+		// apply security info which includes SIDs not necessarily present on
+		// the host.
+		privileges := []string{winio.SeRestorePrivilege, seTakeOwnershipPrivilege}
+		if err := winio.EnableProcessPrivileges(privileges); err != nil {
+			return err
+		}
+		defer winio.DisableProcessPrivileges(privileges)
+
+		if err := windows.SetNamedSecurityInfo(
+			name, windows.SE_FILE_OBJECT,
+			windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
+			sid, nil, dacl, nil); err != nil {
+
+			return err
+		}
+	}
+
+	if err := c.copyFileTimestamp(fi, name); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *copier) copyFileTimestamp(fi os.FileInfo, name string) error {
+	if c.utime != nil {
+		return Utimes(name, c.utime)
+	}
+
+	if fi.Mode()&os.ModeSymlink == 0 {
+		if err := os.Chtimes(name, fi.ModTime(), fi.ModTime()); err != nil {
+			return errors.Wrap(err, "changing mtime")
+		}
+	}
 	return nil
 }
 
@@ -39,10 +119,10 @@ func copyFileContent(dst, src *os.File) error {
 	return err
 }
 
-func copyXAttrs(dst, src string, xeh XAttrErrorHandler) error {
+func copyXAttrs(_, _ string, _ XAttrErrorHandler) error {
 	return nil
 }
 
-func copyDevice(dst string, fi os.FileInfo) error {
+func copyDevice(_ string, _ os.FileInfo) error {
 	return errors.New("device copy not supported")
 }

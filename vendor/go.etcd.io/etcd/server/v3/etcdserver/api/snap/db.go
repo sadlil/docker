@@ -18,25 +18,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
 
-	"go.etcd.io/etcd/client/pkg/v3/fileutil"
-
 	humanize "github.com/dustin/go-humanize"
 	"go.uber.org/zap"
+
+	"go.etcd.io/etcd/client/pkg/v3/fileutil"
 )
 
 var ErrNoDBSnapshot = errors.New("snap: snapshot file doesn't exist")
 
-// SaveDBFrom saves snapshot of the database from the given reader. It
-// guarantees the save operation is atomic.
+// SaveDBFrom atomically saves a database snapshot from r. Before a successful
+// return, it syncs the file and containing directory so the rename is durable
+// on storage that honors fsync. The receiver processes the Raft message only
+// afterward, so its WAL snapshot record cannot precede snap.db.
 func (s *Snapshotter) SaveDBFrom(r io.Reader, id uint64) (int64, error) {
 	start := time.Now()
 
-	f, err := ioutil.TempFile(s.dir, "tmp")
+	f, err := os.CreateTemp(s.dir, "tmp")
 	if err != nil {
 		return 0, err
 	}
@@ -55,11 +56,29 @@ func (s *Snapshotter) SaveDBFrom(r io.Reader, id uint64) (int64, error) {
 	fn := s.dbFilePath(id)
 	if fileutil.Exist(fn) {
 		os.Remove(f.Name())
+		// A prior SaveDBFrom can have renamed this file and crashed before
+		// syncing the directory. Sync again before reporting success.
+		if err = s.fsyncDir(s.dir); err != nil {
+			return n, err
+		}
 		return n, nil
 	}
 	err = os.Rename(f.Name(), fn)
 	if err != nil {
 		os.Remove(f.Name())
+		return n, err
+	}
+
+	// gofail: var snapDBRenameBeforeDirSync struct{}
+
+	// The file is synced above. Sync the directory to make the renamed entry
+	// durable before the snapshot receiver processes the Raft message.
+	if err = s.fsyncDir(s.dir); err != nil {
+		s.lg.Warn(
+			"failed to fsync snap directory after saving database snapshot",
+			zap.String("path", fn),
+			zap.Error(err),
+		)
 		return n, err
 	}
 
@@ -97,4 +116,17 @@ func (s *Snapshotter) DBFilePath(id uint64) (string, error) {
 
 func (s *Snapshotter) dbFilePath(id uint64) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%016x.snap.db", id))
+}
+
+// fsyncSnapDir makes a renamed snapshot database durable. On Linux, syncing
+// the file alone does not necessarily persist its containing directory entry.
+func fsyncSnapDir(dir string) error {
+	// gofail: var snapDBDirSyncError string
+	// return errors.New(snapDBDirSyncError)
+	d, err := fileutil.OpenDir(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return fileutil.Fsync(d)
 }

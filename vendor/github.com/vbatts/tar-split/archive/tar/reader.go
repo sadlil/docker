@@ -7,7 +7,6 @@ package tar
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"strconv"
 	"strings"
 	"time"
@@ -41,7 +40,7 @@ type fileReader interface {
 // RawBytes accesses the raw bytes of the archive, apart from the file payload itself.
 // This includes the header and padding.
 //
-// This call resets the current rawbytes buffer
+// # This call resets the current rawbytes buffer
 //
 // Only when RawAccounting is enabled, otherwise this returns nil
 func (tr *Reader) RawBytes() []byte {
@@ -55,6 +54,11 @@ func (tr *Reader) RawBytes() []byte {
 
 	return tr.rawBytes.Bytes()
 
+}
+
+// ExpectedPadding returns the number of bytes of padding expected after the last header returned by Next()
+func (tr *Reader) ExpectedPadding() int64 {
+	return tr.pad
 }
 
 // NewReader creates a new Reader reading from r.
@@ -126,7 +130,9 @@ func (tr *Reader) next() (*Header, error) {
 				return nil, err
 			}
 			if hdr.Typeflag == TypeXGlobalHeader {
-				mergePAX(hdr, paxHdrs)
+				if err = mergePAX(hdr, paxHdrs); err != nil {
+					return nil, err
+				}
 				return &Header{
 					Name:       hdr.Name,
 					Typeflag:   hdr.Typeflag,
@@ -138,7 +144,7 @@ func (tr *Reader) next() (*Header, error) {
 			continue // This is a meta header affecting the next header
 		case TypeGNULongName, TypeGNULongLink:
 			format.mayOnlyBe(FormatGNU)
-			realname, err := ioutil.ReadAll(tr)
+			realname, err := readSpecialFile(tr)
 			if err != nil {
 				return nil, err
 			}
@@ -332,7 +338,7 @@ func mergePAX(hdr *Header, paxHdrs map[string]string) (err error) {
 // parsePAX parses PAX headers.
 // If an extended header (type 'x') is invalid, ErrHeader is returned
 func parsePAX(r io.Reader) (map[string]string, error) {
-	buf, err := ioutil.ReadAll(r)
+	buf, err := readSpecialFile(r)
 	if err != nil {
 		return nil, err
 	}
@@ -381,9 +387,9 @@ func parsePAX(r io.Reader) (map[string]string, error) {
 // header in case further processing is required.
 //
 // The err will be set to io.EOF only when one of the following occurs:
-//	* Exactly 0 bytes are read and EOF is hit.
-//	* Exactly 1 block of zeros is read and EOF is hit.
-//	* At least 2 blocks of zeros are read.
+//   - Exactly 0 bytes are read and EOF is hit.
+//   - Exactly 1 block of zeros is read and EOF is hit.
+//   - At least 2 blocks of zeros are read.
 func (tr *Reader) readHeader() (*Header, *block, error) {
 	// Two blocks of zero bytes marks the end of the archive.
 	n, err := io.ReadFull(tr.r, tr.blk[:])
@@ -531,7 +537,8 @@ func (tr *Reader) readOldGNUSparseMap(hdr *Header, blk *block) (sparseDatas, err
 	}
 	s := blk.GNU().Sparse()
 	spd := make(sparseDatas, 0, s.MaxEntries())
-	for {
+	totalSize := len(s)
+	for totalSize < maxSpecialFileSize {
 		for i := 0; i < s.MaxEntries(); i++ {
 			// This termination condition is identical to GNU and BSD tar.
 			if s.Entry(i).Offset()[0] == 0x00 {
@@ -542,7 +549,11 @@ func (tr *Reader) readOldGNUSparseMap(hdr *Header, blk *block) (sparseDatas, err
 			if p.err != nil {
 				return nil, p.err
 			}
-			spd = append(spd, sparseEntry{Offset: offset, Length: length})
+			var err error
+			spd, err = appendSparseEntry(spd, sparseEntry{Offset: offset, Length: length})
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		if s.IsExtended()[0] > 0 {
@@ -554,10 +565,12 @@ func (tr *Reader) readOldGNUSparseMap(hdr *Header, blk *block) (sparseDatas, err
 				tr.rawBytes.Write(blk[:])
 			}
 			s = blk.Sparse()
+			totalSize += len(s)
 			continue
 		}
 		return spd, nil // Done
 	}
+	return nil, errSparseTooLong
 }
 
 // readGNUSparseMap1x0 reads the sparse map as stored in GNU's PAX sparse format
@@ -575,12 +588,17 @@ func readGNUSparseMap1x0(r io.Reader) (sparseDatas, error) {
 		cntNewline int64
 		buf        bytes.Buffer
 		blk        block
+		totalSize  int
 	)
 
 	// feedTokens copies data in blocks from r into buf until there are
 	// at least cnt newlines in buf. It will not read more blocks than needed.
 	feedTokens := func(n int64) error {
 		for cntNewline < n {
+			totalSize += len(blk)
+			if totalSize > maxSpecialFileSize {
+				return errSparseTooLong
+			}
 			if _, err := mustReadFull(r, blk[:]); err != nil {
 				return err
 			}
@@ -613,8 +631,8 @@ func readGNUSparseMap1x0(r io.Reader) (sparseDatas, error) {
 	}
 
 	// Parse for all member entries.
-	// numEntries is trusted after this since a potential attacker must have
-	// committed resources proportional to what this library used.
+	// numEntries is trusted after this since feedTokens limits the number of
+	// tokens based on maxSpecialFileSize.
 	if err := feedTokens(2 * numEntries); err != nil {
 		return nil, err
 	}
@@ -625,7 +643,10 @@ func readGNUSparseMap1x0(r io.Reader) (sparseDatas, error) {
 		if err1 != nil || err2 != nil {
 			return nil, ErrHeader
 		}
-		spd = append(spd, sparseEntry{Offset: offset, Length: length})
+		spd, err = appendSparseEntry(spd, sparseEntry{Offset: offset, Length: length})
+		if err != nil {
+			return nil, err
+		}
 	}
 	return spd, nil
 }
@@ -659,10 +680,20 @@ func readGNUSparseMap0x1(paxHdrs map[string]string) (sparseDatas, error) {
 		if err1 != nil || err2 != nil {
 			return nil, ErrHeader
 		}
-		spd = append(spd, sparseEntry{Offset: offset, Length: length})
+		spd, err = appendSparseEntry(spd, sparseEntry{Offset: offset, Length: length})
+		if err != nil {
+			return nil, err
+		}
 		sparseMap = sparseMap[2:]
 	}
 	return spd, nil
+}
+
+func appendSparseEntry(spd sparseDatas, ent sparseEntry) (sparseDatas, error) {
+	if len(spd) >= maxSparseFileEntries {
+		return nil, errSparseTooLong
+	}
+	return append(spd, ent), nil
 }
 
 // Read reads from the current file in the tar archive.
@@ -883,6 +914,16 @@ func tryReadFull(r io.Reader, b []byte) (n int, err error) {
 	return n, err
 }
 
+// readSpecialFile is like io.ReadAll except it returns
+// ErrFieldTooLong if more than maxSpecialFileSize is read.
+func readSpecialFile(r io.Reader) ([]byte, error) {
+	buf, err := io.ReadAll(io.LimitReader(r, maxSpecialFileSize+1))
+	if len(buf) > maxSpecialFileSize {
+		return nil, ErrFieldTooLong
+	}
+	return buf, err
+}
+
 // discard skips n bytes in r, reporting an error if unable to do so.
 func discard(tr *Reader, n int64) error {
 	var seekSkipped, copySkipped int64
@@ -914,7 +955,7 @@ func discard(tr *Reader, n int64) error {
 		}
 	}
 
-	copySkipped, err = io.CopyN(ioutil.Discard, r, n-seekSkipped)
+	copySkipped, err = io.CopyN(io.Discard, r, n-seekSkipped)
 out:
 	if err == io.EOF && seekSkipped+copySkipped < n {
 		err = io.ErrUnexpectedEOF

@@ -1,4 +1,4 @@
-package listeners // import "github.com/docker/docker/daemon/listeners"
+package listeners
 
 import (
 	"crypto/tls"
@@ -6,13 +6,19 @@ import (
 	"net"
 	"strings"
 
-	winio "github.com/Microsoft/go-winio"
+	"github.com/Microsoft/go-winio"
 	"github.com/docker/go-connections/sockets"
 )
 
 // Init creates new listeners for the server.
 func Init(proto, addr, socketGroup string, tlsConfig *tls.Config) ([]net.Listener, error) {
 	ls := []net.Listener{}
+
+	// Windows allows a comma-separated list of groups and/or users to be set.
+	var additionalUsersAndGroups []string
+	if socketGroup != "" {
+		additionalUsersAndGroups = strings.Split(socketGroup, ",")
+	}
 
 	switch proto {
 	case "tcp":
@@ -23,32 +29,59 @@ func Init(proto, addr, socketGroup string, tlsConfig *tls.Config) ([]net.Listene
 		ls = append(ls, l)
 
 	case "npipe":
-		// allow Administrators and SYSTEM, plus whatever additional users or groups were specified
-		sddl := "D:P(A;;GA;;;BA)(A;;GA;;;SY)"
-		if socketGroup != "" {
-			for _, g := range strings.Split(socketGroup, ",") {
-				sid, err := winio.LookupSidByName(g)
-				if err != nil {
-					return nil, err
-				}
-				sddl += fmt.Sprintf("(A;;GRGW;;;%s)", sid)
-			}
+		sddl, err := getSecurityDescriptor(additionalUsersAndGroups)
+		if err != nil {
+			return nil, err
 		}
-		c := winio.PipeConfig{
+		l, err := winio.ListenPipe(addr, &winio.PipeConfig{
 			SecurityDescriptor: sddl,
 			MessageMode:        true,  // Use message mode so that CloseWrite() is supported
 			InputBufferSize:    65536, // Use 64KB buffers to improve performance
 			OutputBufferSize:   65536,
-		}
-		l, err := winio.ListenPipe(addr, &c)
+		})
 		if err != nil {
 			return nil, err
 		}
 		ls = append(ls, l)
 
+	case "unix":
+		l, err := sockets.NewUnixSocket(addr, additionalUsersAndGroups)
+		if err != nil {
+			return nil, err
+		}
+		ls = append(ls, l)
 	default:
-		return nil, fmt.Errorf("invalid protocol format: windows only supports tcp and npipe")
+		return nil, fmt.Errorf("invalid protocol format: windows only supports tcp, unix and npipe")
 	}
 
 	return ls, nil
+}
+
+// Default DACL allows Administrators and LocalSystem full access;
+//
+// - D:P: DACL without inheritance (protected, (P)).
+// - (A;;GA;;;BA): Allow full access (GA) for built-in Administrators (BA).
+// - (A;;GA;;;SY); Allow full access (GA) for LocalSystem (SY).
+// - Any other user is denied access.
+const defaultPermissions = "D:P(A;;GA;;;BA)(A;;GA;;;SY)"
+
+// getSecurityDescriptor returns the DACL for the API socket or named pipe.
+//
+// By default, it grants [defaultPermissions], but allows for additional
+// users and groups to get generic read (GR) and write (GW) access. It
+// returns an error when failing to resolve any of the additional users
+// and groups.
+func getSecurityDescriptor(additionalUsersAndGroups []string) (sddl string, _ error) {
+	sddl = defaultPermissions
+
+	// Grant generic read (GR) and write (GW) access to whatever
+	// additional users or groups were specified.
+	for _, g := range additionalUsersAndGroups {
+		sid, err := winio.LookupSidByName(strings.TrimSpace(g))
+		if err != nil {
+			return "", err
+		}
+		sddl += fmt.Sprintf("(A;;GRGW;;;%s)", sid)
+	}
+	return sddl, nil
 }

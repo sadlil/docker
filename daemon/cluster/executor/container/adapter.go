@@ -1,4 +1,4 @@
-package container // import "github.com/docker/docker/daemon/cluster/executor/container"
+package container
 
 import (
 	"context"
@@ -7,28 +7,33 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/backend"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	containerpkg "github.com/docker/docker/container"
-	"github.com/docker/docker/daemon"
-	"github.com/docker/docker/daemon/cluster/convert"
-	executorpkg "github.com/docker/docker/daemon/cluster/executor"
-	"github.com/docker/docker/libnetwork"
-	volumeopts "github.com/docker/docker/volume/service/opts"
-	"github.com/docker/swarmkit/agent/exec"
-	"github.com/docker/swarmkit/api"
-	"github.com/docker/swarmkit/log"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
 	gogotypes "github.com/gogo/protobuf/types"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/v2/daemon"
+	"github.com/moby/moby/v2/daemon/cluster/convert"
+	executorpkg "github.com/moby/moby/v2/daemon/cluster/executor"
+	containerpkg "github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/libnetwork"
+	networkSettings "github.com/moby/moby/v2/daemon/network"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
+	volumeopts "github.com/moby/moby/v2/daemon/volume/service/opts"
+	"github.com/moby/swarmkit/v2/agent/exec"
+	"github.com/moby/swarmkit/v2/api"
+	swarmlog "github.com/moby/swarmkit/v2/log"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 
@@ -61,6 +66,15 @@ func newContainerAdapter(b executorpkg.Backend, i executorpkg.ImageBackend, v ex
 	}, nil
 }
 
+// imageExists reports whether the image the container is configured with is
+// present in the local image store. An error other than "not found" is not
+// conclusive, so the image is reported as present and the container create
+// is left to surface the error.
+func (c *containerAdapter) imageExists(ctx context.Context) bool {
+	_, err := c.imageBackend.GetImage(ctx, c.container.image(), imagebackend.GetImageOpts{})
+	return !cerrdefs.IsNotFound(err)
+}
+
 func (c *containerAdapter) pullImage(ctx context.Context) error {
 	spec := c.container.spec()
 
@@ -74,7 +88,10 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 	named, err := reference.ParseNormalizedNamed(spec.Image)
 	if err == nil {
 		if _, ok := named.(reference.Canonical); ok {
-			_, err := c.imageBackend.LookupImage(spec.Image)
+			_, err := c.imageBackend.GetImage(ctx, spec.Image, imagebackend.GetImageOpts{})
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 			if err == nil {
 				return nil
 			}
@@ -87,10 +104,10 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 		encodedAuthConfig = spec.PullOptions.RegistryAuth
 	}
 
-	authConfig := &types.AuthConfig{}
+	authConfig := &registry.AuthConfig{}
 	if encodedAuthConfig != "" {
 		if err := json.NewDecoder(base64.NewDecoder(base64.URLEncoding, strings.NewReader(encodedAuthConfig))).Decode(authConfig); err != nil {
-			logrus.Warnf("invalid authconfig: %v", err)
+			swarmlog.G(ctx).Warnf("invalid authconfig: %v", err)
 		}
 	}
 
@@ -99,13 +116,20 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 	go func() {
 		// TODO LCOW Support: This will need revisiting as
 		// the stack is built up to include LCOW support for swarm.
-		err := c.imageBackend.PullImage(ctx, c.container.image(), "", nil, metaHeaders, authConfig, pw)
+
+		// Make sure the image has a tag, otherwise it will pull all tags.
+		ref := reference.TagNameOnly(named)
+		err := c.imageBackend.PullImage(ctx, ref, imagebackend.PullOptions{
+			MetaHeaders: metaHeaders,
+			AuthConfig:  authConfig,
+			OutStream:   pw,
+		})
 		pw.CloseWithError(err)
 	}()
 
 	dec := json.NewDecoder(pr)
 	dec.UseNumber()
-	m := map[string]interface{}{}
+	m := map[string]any{}
 	spamLimiter := rate.NewLimiter(rate.Every(time.Second), 1)
 
 	lastStatus := ""
@@ -116,19 +140,19 @@ func (c *containerAdapter) pullImage(ctx context.Context) error {
 			}
 			return err
 		}
-		l := log.G(ctx)
+		l := swarmlog.G(ctx)
 		// limit pull progress logs unless the status changes
 		if spamLimiter.Allow() || lastStatus != m["status"] {
 			// if we have progress details, we have everything we need
-			if progress, ok := m["progressDetail"].(map[string]interface{}); ok {
+			if progress, ok := m["progressDetail"].(map[string]any); ok {
 				// first, log the image and status
-				l = l.WithFields(logrus.Fields{
+				l = l.WithFields(log.Fields{
 					"image":  c.container.image(),
 					"status": m["status"],
 				})
 				// then, if we have progress, log the progress
 				if progress["current"] != nil && progress["total"] != nil {
-					l = l.WithFields(logrus.Fields{
+					l = l.WithFields(log.Fields{
 						"current": progress["current"],
 						"total":   progress["total"],
 					})
@@ -159,7 +183,7 @@ func (c *containerAdapter) waitNodeAttachments(ctx context.Context) error {
 	// we'll wait and try again.
 	attachmentStore := c.backend.GetAttachmentStore()
 	if attachmentStore == nil {
-		return fmt.Errorf("error getting attachment store")
+		return errors.New("error getting attachment store")
 	}
 
 	// essentially, we're long-polling here. this is really sub-optimal, but a
@@ -172,13 +196,13 @@ func (c *containerAdapter) waitNodeAttachments(ctx context.Context) error {
 		// set a flag ready to true. if we try to get a network IP that doesn't
 		// exist yet, we will set this flag to "false"
 		ready := true
-		for _, attachment := range c.container.networksAttachments {
+		for _, nw := range c.container.networks {
 			// we only need node attachments (IP address) for overlay networks
 			// TODO(dperny): unsure if this will work with other network
 			// drivers, but i also don't think other network drivers use the
 			// node attachment IP address.
-			if attachment.Network.DriverState.Name == "overlay" {
-				if _, exists := attachmentStore.GetIPForNetwork(attachment.Network.ID); !exists {
+			if nw.DriverState.Name == "overlay" {
+				if _, exists := attachmentStore.GetIPForNetwork(nw.ID); !exists {
 					ready = false
 				}
 			}
@@ -192,19 +216,15 @@ func (c *containerAdapter) waitNodeAttachments(ctx context.Context) error {
 		// otherwise, try polling again, or wait for context canceled.
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("node is missing network attachments, ip addresses may be exhausted")
+			return errors.New("node is missing network attachments, ip addresses may be exhausted")
 		case <-poll.C:
 		}
 	}
 }
 
 func (c *containerAdapter) createNetworks(ctx context.Context) error {
-	for name := range c.container.networksAttachments {
-		ncr, err := c.container.networkCreateRequest(name)
-		if err != nil {
-			return err
-		}
-
+	for name, nw := range c.container.networks {
+		ncr := networkCreateRequest(name, nw)
 		if err := c.backend.CreateManagedNetwork(ncr); err != nil { // todo name missing
 			if _, ok := err.(libnetwork.NetworkNameError); ok {
 				continue
@@ -227,15 +247,15 @@ func (c *containerAdapter) removeNetworks(ctx context.Context) error {
 		errNoSuchNetwork     libnetwork.ErrNoSuchNetwork
 	)
 
-	for name, v := range c.container.networksAttachments {
-		if err := c.backend.DeleteManagedNetwork(v.Network.ID); err != nil {
+	for name, nw := range c.container.networks {
+		if err := c.backend.DeleteManagedNetwork(nw.ID); err != nil {
 			switch {
 			case errors.As(err, &activeEndpointsError):
 				continue
 			case errors.As(err, &errNoSuchNetwork):
 				continue
 			default:
-				log.G(ctx).Errorf("network %s remove failed: %v", name, err)
+				swarmlog.G(ctx).Errorf("network %s remove failed: %v", name, err)
 				return err
 			}
 		}
@@ -283,32 +303,40 @@ func (c *containerAdapter) waitForDetach(ctx context.Context) error {
 }
 
 func (c *containerAdapter) create(ctx context.Context) error {
-	var cr containertypes.ContainerCreateCreatedBody
+	hostConfig := c.container.hostConfig(c.dependencies.Volumes())
+	netConfig := c.container.createNetworkingConfig(c.backend)
+
+	// We need to make sure no empty string or "default" NetworkMode is
+	// provided to the daemon as it doesn't support them.
+	//
+	// This is in line with what the ContainerCreate API endpoint does, but
+	// unlike that endpoint we can't do that in the ServiceCreate endpoint as
+	// the cluster leader and the current node might not be running on the same
+	// OS. Since the normalized value isn't the same on Windows and Linux, we
+	// need to make this normalization happen once we're sure we won't make a
+	// cross-OS API call.
+	if hostConfig.NetworkMode == "" || hostConfig.NetworkMode.IsDefault() {
+		hostConfig.NetworkMode = networkSettings.DefaultNetwork
+		if v, ok := netConfig.EndpointsConfig[network.NetworkDefault]; ok {
+			delete(netConfig.EndpointsConfig, network.NetworkDefault)
+			netConfig.EndpointsConfig[networkSettings.DefaultNetwork] = v
+		}
+	}
+
+	var cr containertypes.CreateResponse
 	var err error
-	if cr, err = c.backend.CreateManagedContainer(types.ContainerCreateConfig{
+	if cr, err = c.backend.CreateManagedContainer(ctx, backend.ContainerCreateConfig{
 		Name:       c.container.name(),
 		Config:     c.container.config(),
-		HostConfig: c.container.hostConfig(),
+		HostConfig: hostConfig,
 		// Use the first network in container create
-		NetworkingConfig: c.container.createNetworkingConfig(c.backend),
+		NetworkingConfig: netConfig,
 	}); err != nil {
 		return err
 	}
 
-	// Docker daemon currently doesn't support multiple networks in container create
-	// Connect to all other networks
-	nc := c.container.connectNetworkingConfig(c.backend)
-
-	if nc != nil {
-		for n, ep := range nc.EndpointsConfig {
-			if err := c.backend.ConnectContainerToNetwork(cr.ID, n, ep); err != nil {
-				return err
-			}
-		}
-	}
-
-	container := c.container.task.Spec.GetContainer()
-	if container == nil {
+	ctr := c.container.task.Spec.GetContainer()
+	if ctr == nil {
 		return errors.New("unable to get container from task spec")
 	}
 
@@ -317,12 +345,12 @@ func (c *containerAdapter) create(ctx context.Context) error {
 	}
 
 	// configure secrets
-	secretRefs := convert.SecretReferencesFromGRPC(container.Secrets)
+	secretRefs := convert.SecretReferencesFromGRPC(ctr.Secrets)
 	if err := c.backend.SetContainerSecretReferences(cr.ID, secretRefs); err != nil {
 		return err
 	}
 
-	configRefs := convert.ConfigReferencesFromGRPC(container.Configs)
+	configRefs := convert.ConfigReferencesFromGRPC(ctr.Configs)
 	if err := c.backend.SetContainerConfigReferences(cr.ID, configRefs); err != nil {
 		return err
 	}
@@ -341,6 +369,8 @@ func (c *containerAdapter) checkMounts() error {
 			if _, err := os.Stat(mount.Source); os.IsNotExist(err) {
 				return fmt.Errorf("invalid bind mount source, source path not found: %s", mount.Source)
 			}
+		default:
+			// TODO(thaJeztah): make switch exhaustive; add api.MountTypeVolume, api.MountTypeTmpfs, api.MountTypeNamedPipe, api.MountTypeCluster
 		}
 	}
 
@@ -352,16 +382,16 @@ func (c *containerAdapter) start(ctx context.Context) error {
 		return err
 	}
 
-	return c.backend.ContainerStart(c.container.name(), nil, "", "")
+	return c.backend.ContainerStart(ctx, c.container.name(), "", "")
 }
 
-func (c *containerAdapter) inspect(ctx context.Context) (types.ContainerJSON, error) {
-	cs, err := c.backend.ContainerInspectCurrent(c.container.name(), false)
+func (c *containerAdapter) inspect(ctx context.Context) (containertypes.InspectResponse, error) {
+	cs, _, err := c.backend.ContainerInspect(ctx, c.container.name(), backend.ContainerInspectOptions{})
 	if ctx.Err() != nil {
-		return types.ContainerJSON{}, ctx.Err()
+		return containertypes.InspectResponse{}, ctx.Err()
 	}
 	if err != nil {
-		return types.ContainerJSON{}, err
+		return containertypes.InspectResponse{}, err
 	}
 	return *cs, nil
 }
@@ -369,23 +399,26 @@ func (c *containerAdapter) inspect(ctx context.Context) (types.ContainerJSON, er
 // events issues a call to the events API and returns a channel with all
 // events. The stream of events can be shutdown by cancelling the context.
 func (c *containerAdapter) events(ctx context.Context) <-chan events.Message {
-	log.G(ctx).Debugf("waiting on events")
-	buffer, l := c.backend.SubscribeToEvents(time.Time{}, time.Time{}, c.container.eventFilter())
-	eventsq := make(chan events.Message, len(buffer))
+	swarmlog.G(ctx).Debugf("waiting on events")
 
-	for _, event := range buffer {
-		eventsq <- event
-	}
+	// Discard buffered events; we don't provide since/until filters and use live events only.
+	_, l := c.backend.SubscribeToEvents(time.Time{}, time.Time{}, c.container.eventFilter())
+	eventsq := make(chan events.Message)
 
 	go func() {
+		defer close(eventsq)
 		defer c.backend.UnsubscribeFromEvents(l)
 
 		for {
 			select {
-			case ev := <-l:
+			case ev, ok := <-l:
+				if !ok {
+					return
+				}
+
 				jev, ok := ev.(events.Message)
 				if !ok {
-					log.G(ctx).Warnf("unexpected event message: %q", ev)
+					swarmlog.G(ctx).Warnf("unexpected event message: %q", ev)
 					continue
 				}
 				select {
@@ -403,26 +436,25 @@ func (c *containerAdapter) events(ctx context.Context) <-chan events.Message {
 }
 
 func (c *containerAdapter) wait(ctx context.Context) (<-chan containerpkg.StateStatus, error) {
-	return c.backend.ContainerWait(ctx, c.container.nameOrID(), containerpkg.WaitConditionNotRunning)
+	return c.backend.ContainerWait(ctx, c.container.nameOrID(), containertypes.WaitConditionNotRunning)
 }
 
 func (c *containerAdapter) shutdown(ctx context.Context) error {
+	options := backend.ContainerStopOptions{}
 	// Default stop grace period to nil (daemon will use the stopTimeout of the container)
-	var stopgrace *int
-	spec := c.container.spec()
-	if spec.StopGracePeriod != nil {
-		stopgraceValue := int(spec.StopGracePeriod.Seconds)
-		stopgrace = &stopgraceValue
+	if spec := c.container.spec(); spec.StopGracePeriod != nil {
+		timeout := int(spec.StopGracePeriod.Seconds)
+		options.Timeout = &timeout
 	}
-	return c.backend.ContainerStop(c.container.name(), stopgrace)
+	return c.backend.ContainerStop(ctx, c.container.name(), options)
 }
 
 func (c *containerAdapter) terminate(ctx context.Context) error {
-	return c.backend.ContainerKill(c.container.name(), uint64(syscall.SIGKILL))
+	return c.backend.ContainerKill(ctx, c.container.name(), syscall.SIGKILL.String())
 }
 
 func (c *containerAdapter) remove(ctx context.Context) error {
-	return c.backend.ContainerRm(c.container.name(), &types.ContainerRmConfig{
+	return c.backend.ContainerRm(c.container.name(), &backend.ContainerRmConfig{
 		RemoveVolume: true,
 		ForceRemove:  true,
 	})
@@ -431,7 +463,6 @@ func (c *containerAdapter) remove(ctx context.Context) error {
 func (c *containerAdapter) createVolumes(ctx context.Context) error {
 	// Create plugin volumes that are embedded inside a Mount
 	for _, mount := range c.container.task.Spec.GetContainer().Mounts {
-		mount := mount
 		if mount.Type != api.MountTypeVolume {
 			continue
 		}
@@ -456,9 +487,32 @@ func (c *containerAdapter) createVolumes(ctx context.Context) error {
 			// It returns an error if the driver name is different - that is a valid error
 			return err
 		}
-
 	}
 
+	return nil
+}
+
+// waitClusterVolumes blocks until the VolumeGetter returns a path for each
+// cluster volume in use by this task
+func (c *containerAdapter) waitClusterVolumes(ctx context.Context) error {
+	for _, attached := range c.container.task.Volumes {
+		// for every attachment, try until we succeed or until the context
+		// is canceled.
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				// continue through the code.
+			}
+			path, err := c.dependencies.Volumes().Get(attached.ID)
+			if err == nil && path != "" {
+				// break out of the inner-most loop
+				break
+			}
+		}
+	}
+	swarmlog.G(ctx).Debug("volumes ready")
 	return nil
 }
 
@@ -471,7 +525,7 @@ func (c *containerAdapter) deactivateServiceBinding() error {
 }
 
 func (c *containerAdapter) logs(ctx context.Context, options api.LogSubscriptionOptions) (<-chan *backend.LogMessage, error) {
-	apiOptions := &types.ContainerLogsOptions{
+	apiOptions := &backend.ContainerLogsOptions{
 		Follow: options.Follow,
 
 		// Always say yes to Timestamps and Details. we make the decision
@@ -486,15 +540,12 @@ func (c *containerAdapter) logs(ctx context.Context, options api.LogSubscription
 		if err != nil {
 			return nil, err
 		}
-		// print since as this formatted string because the docker container
-		// logs interface expects it like this.
-		// see github.com/docker/docker/api/types/time.ParseTimestamps
-		apiOptions.Since = fmt.Sprintf("%d.%09d", since.Unix(), int64(since.Nanosecond()))
+		apiOptions.Since = since
 	}
 
 	if options.Tail < 0 {
 		// See protobuf documentation for details of how this works.
-		apiOptions.Tail = fmt.Sprint(-options.Tail - 1)
+		apiOptions.Tail = strconv.FormatInt(-options.Tail-1, 10)
 	} else if options.Tail > 0 {
 		return nil, errors.New("tail relative to start of logs not supported via docker API")
 	}
@@ -509,6 +560,8 @@ func (c *containerAdapter) logs(ctx context.Context, options api.LogSubscription
 				apiOptions.ShowStdout = true
 			case api.LogStreamStderr:
 				apiOptions.ShowStderr = true
+			default:
+				// TODO(thaJeztah): make switch exhaustive; add api.LogStreamUnknown
 			}
 		}
 	}
@@ -517,17 +570,4 @@ func (c *containerAdapter) logs(ctx context.Context, options api.LogSubscription
 		return nil, err
 	}
 	return msgs, nil
-}
-
-// todo: typed/wrapped errors
-func isContainerCreateNameConflict(err error) bool {
-	return strings.Contains(err.Error(), "Conflict. The name")
-}
-
-func isUnknownContainer(err error) bool {
-	return strings.Contains(err.Error(), "No such container:")
-}
-
-func isStoppedContainer(err error) bool {
-	return strings.Contains(err.Error(), "is already stopped")
 }

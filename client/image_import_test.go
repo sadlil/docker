@@ -1,82 +1,93 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"fmt"
 	"io"
 	"net/http"
-	"reflect"
+	"net/url"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestImageImportError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ImageImport(context.Background(), types.ImageImportSource{}, "image:tag", types.ImageImportOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
+	_, err = client.ImageImport(t.Context(), ImageImportSource{}, "image:tag", ImageImportOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestImageImport(t *testing.T) {
-	expectedURL := "/images/create"
-	client := &Client{
-		client: newMockClient(func(r *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(r.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, r.URL)
-			}
-			query := r.URL.Query()
-			fromSrc := query.Get("fromSrc")
-			if fromSrc != "image_source" {
-				return nil, fmt.Errorf("fromSrc not set in URL query properly. Expected 'image_source', got %s", fromSrc)
-			}
-			repo := query.Get("repo")
-			if repo != "repository_name:imported" {
-				return nil, fmt.Errorf("repo not set in URL query properly. Expected 'repository_name:imported', got %s", repo)
-			}
-			tag := query.Get("tag")
-			if tag != "imported" {
-				return nil, fmt.Errorf("tag not set in URL query properly. Expected 'imported', got %s", tag)
-			}
-			message := query.Get("message")
-			if message != "A message" {
-				return nil, fmt.Errorf("message not set in URL query properly. Expected 'A message', got %s", message)
-			}
-			changes := query["changes"]
-			expectedChanges := []string{"change1", "change2"}
-			if !reflect.DeepEqual(expectedChanges, changes) {
-				return nil, fmt.Errorf("changes not set in URL query properly. Expected %v, got %v", expectedChanges, changes)
-			}
+	const (
+		expectedURL    = "/images/create"
+		expectedOutput = "outputBody"
+	)
+	tests := []struct {
+		doc                 string
+		options             ImageImportOptions
+		expectedQueryParams url.Values
+	}{
+		{
+			doc: "no options",
+			expectedQueryParams: url.Values{
+				"fromSrc": {"image_source"},
+				"repo":    {"repository_name:imported"},
+			},
+		},
+		{
+			doc: "change options",
+			options: ImageImportOptions{
+				Tag:     "imported",
+				Message: "A message",
+				Changes: []string{"change1", "change2"},
+			},
+			expectedQueryParams: url.Values{
+				"changes": {"change1", "change2"},
+				"fromSrc": {"image_source"},
+				"message": {"A message"},
+				"repo":    {"repository_name:imported"},
+				"tag":     {"imported"},
+			},
+		},
+		{
+			doc: "with platform",
+			options: ImageImportOptions{
+				Platform: ocispec.Platform{
+					Architecture: "amd64",
+					OS:           "linux",
+				},
+			},
+			expectedQueryParams: url.Values{
+				"fromSrc":  {"image_source"},
+				"platform": {"linux/amd64"},
+				"repo":     {"repository_name:imported"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.doc, func(t *testing.T) {
+			client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+				assert.Check(t, assertRequest(req, http.MethodPost, expectedURL))
+				query := req.URL.Query()
+				assert.Check(t, is.DeepEqual(query, tc.expectedQueryParams))
+				return mockResponse(http.StatusOK, nil, expectedOutput)(req)
+			}))
+			assert.NilError(t, err)
+			result, err := client.ImageImport(t.Context(), ImageImportSource{
+				Source:     strings.NewReader("source"),
+				SourceName: "image_source",
+			}, "repository_name:imported", tc.options)
+			assert.NilError(t, err)
+			defer func() {
+				assert.NilError(t, result.Close())
+			}()
 
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader([]byte("response"))),
-			}, nil
-		}),
-	}
-	importResponse, err := client.ImageImport(context.Background(), types.ImageImportSource{
-		Source:     strings.NewReader("source"),
-		SourceName: "image_source",
-	}, "repository_name:imported", types.ImageImportOptions{
-		Tag:     "imported",
-		Message: "A message",
-		Changes: []string{"change1", "change2"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := io.ReadAll(importResponse)
-	if err != nil {
-		t.Fatal(err)
-	}
-	importResponse.Close()
-	if string(response) != "response" {
-		t.Fatalf("expected response to contain 'response', got %s", string(response))
+			body, err := io.ReadAll(result)
+			assert.NilError(t, err)
+			assert.Check(t, is.Equal(string(body), expectedOutput))
+		})
 	}
 }

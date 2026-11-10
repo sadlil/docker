@@ -1,56 +1,27 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
-	"os"
-	"path/filepath"
-	"reflect"
-	"strings"
+	"crypto/sha256"
+	"encoding/hex"
+	"maps"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
-	mounttypes "github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/volume"
-	volumemounts "github.com/docker/docker/volume/mounts"
-	"github.com/docker/docker/volume/service"
-	volumeopts "github.com/docker/docker/volume/service/opts"
+	"github.com/containerd/log"
+	mounttypes "github.com/moby/moby/api/types/mount"
+	volumetypes "github.com/moby/moby/api/types/volume"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/layer"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
+	"github.com/moby/moby/v2/daemon/volume"
+	volumemounts "github.com/moby/moby/v2/daemon/volume/mounts"
+	"github.com/moby/moby/v2/daemon/volume/service"
+	volumeopts "github.com/moby/moby/v2/daemon/volume/service/opts"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
-var (
-	// ErrVolumeReadonly is used to signal an error when trying to copy data into
-	// a volume mount that is not writable.
-	ErrVolumeReadonly = errors.New("mounted volume is marked read-only")
-)
-
-type mounts []container.Mount
-
-// Len returns the number of mounts. Used in sorting.
-func (m mounts) Len() int {
-	return len(m)
-}
-
-// Less returns true if the number of parts (a/b/c would be 3 parts) in the
-// mount indexed by parameter 1 is less than that of the mount indexed by
-// parameter 2. Used in sorting.
-func (m mounts) Less(i, j int) bool {
-	return m.parts(i) < m.parts(j)
-}
-
-// Swap swaps two items in an array of mounts. Used in sorting
-func (m mounts) Swap(i, j int) {
-	m[i], m[j] = m[j], m[i]
-}
-
-// parts returns the number of parts in the destination of a mount. Used in sorting.
-func (m mounts) parts(i int) int {
-	return strings.Count(filepath.Clean(m[i].Destination), string(os.PathSeparator))
-}
+var _ volume.LiveRestorer = (*volumeWrapper)(nil)
 
 // registerMountPoints initializes the container mount points with the configured volumes and bind mounts.
 // It follows the next sequence to decide what to mount in each final destination:
@@ -59,7 +30,10 @@ func (m mounts) parts(i int) int {
 // 2. Select the volumes mounted from another containers. Overrides previously configured mount point destination.
 // 3. Select the bind mounts set by the client. Overrides previously configured mount point destinations.
 // 4. Cleanup old volumes that are about to be reassigned.
-func (daemon *Daemon) registerMountPoints(container *container.Container, hostConfig *containertypes.HostConfig) (retErr error) {
+//
+// Do not lock while creating volumes since this could be calling out to external plugins
+// Don't want to block other actions, like `docker ps` because we're waiting on an external plugin
+func (daemon *Daemon) registerMountPoints(ctr *container.Container, defaultReadOnlyNonRecursive bool) (retErr error) {
 	binds := map[string]bool{}
 	mountPoints := map[string]*volumemounts.MountPoint{}
 	parser := volumemounts.NewParser()
@@ -72,27 +46,25 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 				if m.Volume == nil {
 					continue
 				}
-				daemon.volumes.Release(ctx, m.Volume.Name(), container.ID)
+				daemon.volumes.Release(ctx, m.Volume.Name(), ctr.ID)
 			}
 		}
 	}()
 
 	dereferenceIfExists := func(destination string) {
 		if v, ok := mountPoints[destination]; ok {
-			logrus.Debugf("Duplicate mount point '%s'", destination)
+			log.G(ctx).Debugf("Duplicate mount point '%s'", destination)
 			if v.Volume != nil {
-				daemon.volumes.Release(ctx, v.Volume.Name(), container.ID)
+				daemon.volumes.Release(ctx, v.Volume.Name(), ctr.ID)
 			}
 		}
 	}
 
 	// 1. Read already configured mount points.
-	for destination, point := range container.MountPoints {
-		mountPoints[destination] = point
-	}
+	maps.Copy(mountPoints, ctr.MountPoints)
 
 	// 2. Read volumes from other containers.
-	for _, v := range hostConfig.VolumesFrom {
+	for _, v := range ctr.HostConfig.VolumesFrom {
 		containerID, mode, err := parser.ParseVolumesFrom(v)
 		if err != nil {
 			return errdefs.InvalidParameter(err)
@@ -116,8 +88,8 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 				CopyData:    false,
 			}
 
-			if len(cp.Source) == 0 {
-				v, err := daemon.volumes.Get(ctx, cp.Name, volumeopts.WithGetDriver(cp.Driver), volumeopts.WithGetReference(container.ID))
+			if cp.Source == "" {
+				v, err := daemon.volumes.Get(ctx, cp.Name, volumeopts.WithGetDriver(cp.Driver), volumeopts.WithGetReference(ctr.ID))
 				if err != nil {
 					return err
 				}
@@ -129,8 +101,8 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 	}
 
 	// 3. Read bind mounts
-	for _, b := range hostConfig.Binds {
-		bind, err := parser.ParseMountRaw(b, hostConfig.VolumeDriver)
+	for _, b := range ctr.HostConfig.Binds {
+		bind, err := parser.ParseMountRaw(b, ctr.HostConfig.VolumeDriver)
 		if err != nil {
 			return err
 		}
@@ -139,18 +111,18 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 			return err
 		}
 		if needsSlavePropagation {
-			bind.Propagation = mount.PropagationRSlave
+			bind.Propagation = mounttypes.PropagationRSlave
 		}
 
 		// #10618
-		_, tmpfsExists := hostConfig.Tmpfs[bind.Destination]
+		_, tmpfsExists := ctr.HostConfig.Tmpfs[bind.Destination]
 		if binds[bind.Destination] || tmpfsExists {
 			return duplicateMountPointError(bind.Destination)
 		}
 
 		if bind.Type == mounttypes.TypeVolume {
 			// create the volume
-			v, err := daemon.volumes.Create(ctx, bind.Name, bind.Driver, volumeopts.WithCreateReference(container.ID))
+			v, err := daemon.volumes.Create(ctx, bind.Name, bind.Driver, volumeopts.WithCreateReference(ctr.ID))
 			if err != nil {
 				return err
 			}
@@ -163,12 +135,21 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 			}
 		}
 
+		if bind.Type == mounttypes.TypeBind && !bind.RW {
+			if defaultReadOnlyNonRecursive {
+				if bind.Spec.BindOptions == nil {
+					bind.Spec.BindOptions = &mounttypes.BindOptions{}
+				}
+				bind.Spec.BindOptions.ReadOnlyNonRecursive = true
+			}
+		}
+
 		binds[bind.Destination] = true
 		dereferenceIfExists(bind.Destination)
 		mountPoints[bind.Destination] = bind
 	}
 
-	for _, cfg := range hostConfig.Mounts {
+	for _, cfg := range ctr.HostConfig.Mounts {
 		mp, err := parser.ParseMountSpec(cfg)
 		if err != nil {
 			return errdefs.InvalidParameter(err)
@@ -178,15 +159,16 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 			return err
 		}
 		if needsSlavePropagation {
-			mp.Propagation = mount.PropagationRSlave
+			mp.Propagation = mounttypes.PropagationRSlave
 		}
 
 		if binds[mp.Destination] {
 			return duplicateMountPointError(cfg.Target)
 		}
 
-		if mp.Type == mounttypes.TypeVolume {
-			var v *types.Volume
+		switch mp.Type {
+		case mounttypes.TypeVolume:
+			var v *volumetypes.Volume
 			if cfg.VolumeOptions != nil {
 				var driverOpts map[string]string
 				if cfg.VolumeOptions.DriverConfig != nil {
@@ -195,12 +177,12 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 				v, err = daemon.volumes.Create(ctx,
 					mp.Name,
 					mp.Driver,
-					volumeopts.WithCreateReference(container.ID),
+					volumeopts.WithCreateReference(ctr.ID),
 					volumeopts.WithCreateOptions(driverOpts),
 					volumeopts.WithCreateLabels(cfg.VolumeOptions.Labels),
 				)
 			} else {
-				v, err = daemon.volumes.Create(ctx, mp.Name, mp.Driver, volumeopts.WithCreateReference(container.ID))
+				v, err = daemon.volumes.Create(ctx, mp.Name, mp.Driver, volumeopts.WithCreateReference(ctr.ID))
 			}
 			if err != nil {
 				return err
@@ -215,10 +197,55 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 			if mp.Driver == volume.DefaultDriverName {
 				setBindModeIfNull(mp)
 			}
-		}
+		case mounttypes.TypeBind:
+			if cfg.BindOptions == nil || !cfg.BindOptions.CreateMountpoint {
+				mp.SkipMountpointCreation = true
+			}
 
-		if mp.Type == mounttypes.TypeBind {
-			mp.SkipMountpointCreation = true
+			if !mp.RW && defaultReadOnlyNonRecursive {
+				if mp.Spec.BindOptions == nil {
+					mp.Spec.BindOptions = &mounttypes.BindOptions{}
+				}
+				mp.Spec.BindOptions.ReadOnlyNonRecursive = true
+			}
+		case mounttypes.TypeImage:
+			img, err := daemon.imageService.GetImage(ctx, mp.Source, imagebackend.GetImageOpts{})
+			if err != nil {
+				return err
+			}
+
+			// Hash the source and destination to create a safe, unique identifier for each mount point and container.
+			// This makes sure that the same image can be mounted multiple times with different destinations.
+			// We hash it so that the snapshot name is friendly to the underlying filesystem and doesn't exceed path length limits.
+			destHash := sha256.Sum256([]byte(ctr.ID + "-src=" + mp.Source + "-dst=" + mp.Destination))
+			layerName := hex.EncodeToString(destHash[:])
+			imgLayer, err := daemon.imageService.CreateLayerFromImage(img, layerName, &layer.CreateRWLayerOpts{
+				StorageOpt: ctr.HostConfig.StorageOpt,
+			})
+			if err != nil {
+				return err
+			}
+			metadata, err := imgLayer.Metadata()
+			if err != nil {
+				return err
+			}
+
+			srcPath, err := imgLayer.Mount("")
+			if err != nil {
+				return err
+			}
+
+			if metadata["ID"] != "" {
+				mp.ID = metadata["ID"]
+			}
+
+			mp.Name = mp.Spec.Source
+			mp.Spec.Source = img.ID().String()
+			mp.Source = srcPath
+			mp.Layer = imgLayer
+			mp.RW = false
+		case mounttypes.TypeTmpfs, mounttypes.TypeCluster, mounttypes.TypeNamedPipe:
+			// nothing to do
 		}
 
 		binds[mp.Destination] = true
@@ -226,19 +253,19 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 		mountPoints[mp.Destination] = mp
 	}
 
-	container.Lock()
+	ctr.Lock()
 
 	// 4. Cleanup old volumes that are about to be reassigned.
 	for _, m := range mountPoints {
 		if parser.IsBackwardCompatible(m) {
-			if mp, exists := container.MountPoints[m.Destination]; exists && mp.Volume != nil {
-				daemon.volumes.Release(ctx, mp.Volume.Name(), container.ID)
+			if mp, exists := ctr.MountPoints[m.Destination]; exists && mp.Volume != nil {
+				daemon.volumes.Release(ctx, mp.Volume.Name(), ctr.ID)
 			}
 		}
 	}
-	container.MountPoints = mountPoints
+	ctr.MountPoints = mountPoints
 
-	container.Unlock()
+	ctr.Unlock()
 
 	return nil
 }
@@ -246,7 +273,7 @@ func (daemon *Daemon) registerMountPoints(container *container.Container, hostCo
 // lazyInitializeVolume initializes a mountpoint's volume if needed.
 // This happens after a daemon restart.
 func (daemon *Daemon) lazyInitializeVolume(containerID string, m *volumemounts.MountPoint) error {
-	if len(m.Driver) > 0 && m.Volume == nil {
+	if m.Driver != "" && m.Volume == nil {
 		v, err := daemon.volumes.Get(context.TODO(), m.Name, volumeopts.WithGetDriver(m.Driver), volumeopts.WithGetReference(containerID))
 		if err != nil {
 			return err
@@ -256,140 +283,19 @@ func (daemon *Daemon) lazyInitializeVolume(containerID string, m *volumemounts.M
 	return nil
 }
 
-// backportMountSpec resolves mount specs (introduced in 1.13) from pre-1.13
-// mount configurations
-// The container lock should not be held when calling this function.
-// Changes are only made in-memory and may make changes to containers referenced
-// by `container.HostConfig.VolumesFrom`
-func (daemon *Daemon) backportMountSpec(container *container.Container) {
-	container.Lock()
-	defer container.Unlock()
-
-	maybeUpdate := make(map[string]bool)
-	for _, mp := range container.MountPoints {
-		if mp.Spec.Source != "" && mp.Type != "" {
-			continue
-		}
-		maybeUpdate[mp.Destination] = true
-	}
-	if len(maybeUpdate) == 0 {
-		return
-	}
-
-	mountSpecs := make(map[string]bool, len(container.HostConfig.Mounts))
-	for _, m := range container.HostConfig.Mounts {
-		mountSpecs[m.Target] = true
-	}
-
-	parser := volumemounts.NewParser()
-	binds := make(map[string]*volumemounts.MountPoint, len(container.HostConfig.Binds))
-	for _, rawSpec := range container.HostConfig.Binds {
-		mp, err := parser.ParseMountRaw(rawSpec, container.HostConfig.VolumeDriver)
-		if err != nil {
-			logrus.WithError(err).Error("Got unexpected error while re-parsing raw volume spec during spec backport")
-			continue
-		}
-		binds[mp.Destination] = mp
-	}
-
-	volumesFrom := make(map[string]volumemounts.MountPoint)
-	for _, fromSpec := range container.HostConfig.VolumesFrom {
-		from, _, err := parser.ParseVolumesFrom(fromSpec)
-		if err != nil {
-			logrus.WithError(err).WithField("id", container.ID).Error("Error reading volumes-from spec during mount spec backport")
-			continue
-		}
-		fromC, err := daemon.GetContainer(from)
-		if err != nil {
-			logrus.WithError(err).WithField("from-container", from).Error("Error looking up volumes-from container")
-			continue
-		}
-
-		// make sure from container's specs have been backported
-		daemon.backportMountSpec(fromC)
-
-		fromC.Lock()
-		for t, mp := range fromC.MountPoints {
-			volumesFrom[t] = *mp
-		}
-		fromC.Unlock()
-	}
-
-	needsUpdate := func(containerMount, other *volumemounts.MountPoint) bool {
-		if containerMount.Type != other.Type || !reflect.DeepEqual(containerMount.Spec, other.Spec) {
-			return true
-		}
-		return false
-	}
-
-	// main
-	for _, cm := range container.MountPoints {
-		if !maybeUpdate[cm.Destination] {
-			continue
-		}
-		// nothing to backport if from hostconfig.Mounts
-		if mountSpecs[cm.Destination] {
-			continue
-		}
-
-		if mp, exists := binds[cm.Destination]; exists {
-			if needsUpdate(cm, mp) {
-				cm.Spec = mp.Spec
-				cm.Type = mp.Type
-			}
-			continue
-		}
-
-		if cm.Name != "" {
-			if mp, exists := volumesFrom[cm.Destination]; exists {
-				if needsUpdate(cm, &mp) {
-					cm.Spec = mp.Spec
-					cm.Type = mp.Type
-				}
-				continue
-			}
-
-			if cm.Type != "" {
-				// probably specified via the hostconfig.Mounts
-				continue
-			}
-
-			// anon volume
-			cm.Type = mounttypes.TypeVolume
-			cm.Spec.Type = mounttypes.TypeVolume
-		} else {
-			if cm.Type != "" {
-				// already updated
-				continue
-			}
-
-			cm.Type = mounttypes.TypeBind
-			cm.Spec.Type = mounttypes.TypeBind
-			cm.Spec.Source = cm.Source
-			if cm.Propagation != "" {
-				cm.Spec.BindOptions = &mounttypes.BindOptions{
-					Propagation: cm.Propagation,
-				}
-			}
-		}
-
-		cm.Spec.Target = cm.Destination
-		cm.Spec.ReadOnly = !cm.RW
-	}
-}
-
 // VolumesService is used to perform volume operations
 func (daemon *Daemon) VolumesService() *service.VolumesService {
 	return daemon.volumes
 }
 
 type volumeMounter interface {
-	Mount(ctx context.Context, v *types.Volume, ref string) (string, error)
-	Unmount(ctx context.Context, v *types.Volume, ref string) error
+	Mount(ctx context.Context, v *volumetypes.Volume, ref string) (string, error)
+	Unmount(ctx context.Context, v *volumetypes.Volume, ref string) error
+	LiveRestoreVolume(ctx context.Context, v *volumetypes.Volume, ref string) error
 }
 
 type volumeWrapper struct {
-	v *types.Volume
+	v *volumetypes.Volume
 	s volumeMounter
 }
 
@@ -417,6 +323,10 @@ func (v *volumeWrapper) CreatedAt() (time.Time, error) {
 	return time.Time{}, errors.New("not implemented")
 }
 
-func (v *volumeWrapper) Status() map[string]interface{} {
+func (v *volumeWrapper) Status() map[string]any {
 	return v.v.Status
+}
+
+func (v *volumeWrapper) LiveRestoreVolume(ctx context.Context, ref string) error {
+	return v.s.LiveRestoreVolume(ctx, v.v, ref)
 }

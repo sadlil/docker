@@ -1,13 +1,11 @@
-package container // import "github.com/docker/docker/daemon/cluster/executor/container"
+package container
 
 import (
 	"testing"
-
-	"context"
 	"time"
 
-	"github.com/docker/docker/daemon"
-	"github.com/docker/swarmkit/api"
+	"github.com/moby/moby/v2/daemon"
+	"github.com/moby/swarmkit/v2/api"
 )
 
 // TestWaitNodeAttachment tests that the waitNodeAttachment method successfully
@@ -20,7 +18,7 @@ func TestWaitNodeAttachment(t *testing.T) {
 	// and add some attachments to it
 	attachmentStore := emptyDaemon.GetAttachmentStore()
 
-	// create a set of attachments to put into the attahcment store
+	// create a set of attachments to put into the attachment store
 	attachments := map[string]string{
 		"network1": "10.1.2.3/24",
 	}
@@ -35,35 +33,29 @@ func TestWaitNodeAttachment(t *testing.T) {
 	// actually; only the networkAttachments are needed.
 	container := &containerConfig{
 		task: nil,
-		networksAttachments: map[string]*api.NetworkAttachment{
+		networks: map[string]*api.Network{
 			// network1 is already present in the attachment store.
 			"network1": {
-				Network: &api.Network{
-					ID: "network1",
-					DriverState: &api.Driver{
-						Name: "overlay",
-					},
+				ID: "network1",
+				DriverState: &api.Driver{
+					Name: "overlay",
 				},
 			},
 			// network2 is not yet present in the attachment store, and we
 			// should block while waiting for it.
 			"network2": {
-				Network: &api.Network{
-					ID: "network2",
-					DriverState: &api.Driver{
-						Name: "overlay",
-					},
+				ID: "network2",
+				DriverState: &api.Driver{
+					Name: "overlay",
 				},
 			},
 			// localnetwork is not and will never be in the attachment store,
 			// but we should not block on it, because it is not an overlay
 			// network
 			"localnetwork": {
-				Network: &api.Network{
-					ID: "localnetwork",
-					DriverState: &api.Driver{
-						Name: "bridge",
-					},
+				ID: "localnetwork",
+				DriverState: &api.Driver{
+					Name: "bridge",
 				},
 			},
 		},
@@ -78,8 +70,7 @@ func TestWaitNodeAttachment(t *testing.T) {
 	}
 
 	// create a context to do call the method with
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	// create a channel to allow the goroutine that we run the method call in
 	// to signal that it's done.

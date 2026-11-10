@@ -1,24 +1,22 @@
-package session // import "github.com/docker/docker/integration/session"
+package session
 
 import (
 	"net/http"
 	"testing"
 
-	"github.com/docker/docker/api/types/versions"
-	req "github.com/docker/docker/testutil/request"
+	req "github.com/moby/moby/v2/internal/testutil/request"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
 )
 
 func TestSessionCreate(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows", "FIXME")
-	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.39"), "experimental in older versions")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 
-	defer setupTest(t)()
+	ctx := setupTest(t)
 	daemonHost := req.DaemonHost()
 
-	res, body, err := req.Post("/session",
+	res, body, err := req.Post(ctx, "/session",
 		req.Host(daemonHost),
 		req.With(func(r *http.Request) error {
 			r.Header.Set("X-Docker-Expose-Session-Uuid", "testsessioncreate") // so we don't block default name if something else is using it
@@ -33,20 +31,19 @@ func TestSessionCreate(t *testing.T) {
 }
 
 func TestSessionCreateWithBadUpgrade(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows", "FIXME")
-	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.39"), "experimental in older versions")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 
-	defer setupTest(t)()
+	ctx := setupTest(t)
 	daemonHost := req.DaemonHost()
 
-	res, body, err := req.Post("/session", req.Host(daemonHost))
+	res, body, err := req.Post(ctx, "/session", req.Host(daemonHost))
 	assert.NilError(t, err)
 	assert.Check(t, is.DeepEqual(res.StatusCode, http.StatusBadRequest))
 	buf, err := req.ReadBody(body)
 	assert.NilError(t, err)
 	assert.Check(t, is.Contains(string(buf), "no upgrade"))
 
-	res, body, err = req.Post("/session",
+	res, body, err = req.Post(ctx, "/session",
 		req.Host(daemonHost),
 		req.With(func(r *http.Request) error {
 			r.Header.Set("Upgrade", "foo")

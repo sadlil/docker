@@ -1,39 +1,47 @@
 package pb
 
 import (
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"slices"
+
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-func (p *Platform) Spec() specs.Platform {
-	return specs.Platform{
+func (p *Platform) Spec() ocispecs.Platform {
+	result := ocispecs.Platform{
 		OS:           p.OS,
 		Architecture: p.Architecture,
 		Variant:      p.Variant,
 		OSVersion:    p.OSVersion,
-		OSFeatures:   p.OSFeatures,
 	}
+	if p.OSFeatures != nil {
+		result.OSFeatures = slices.Clone(p.OSFeatures)
+	}
+	return result
 }
 
-func PlatformFromSpec(p specs.Platform) Platform {
-	return Platform{
+func PlatformFromSpec(p ocispecs.Platform) *Platform {
+	result := &Platform{
 		OS:           p.OS,
 		Architecture: p.Architecture,
 		Variant:      p.Variant,
 		OSVersion:    p.OSVersion,
-		OSFeatures:   p.OSFeatures,
 	}
+	if p.OSFeatures != nil {
+		result.OSFeatures = slices.Clone(p.OSFeatures)
+	}
+	return result
 }
 
-func ToSpecPlatforms(p []Platform) []specs.Platform {
-	out := make([]specs.Platform, 0, len(p))
+func ToSpecPlatforms(p []*Platform) []ocispecs.Platform {
+	out := make([]ocispecs.Platform, 0, len(p))
 	for _, pp := range p {
 		out = append(out, pp.Spec())
 	}
 	return out
 }
 
-func PlatformsFromSpec(p []specs.Platform) []Platform {
-	out := make([]Platform, 0, len(p))
+func PlatformsFromSpec(p []ocispecs.Platform) []*Platform {
+	out := make([]*Platform, 0, len(p))
 	for _, pp := range p {
 		out = append(out, PlatformFromSpec(pp))
 	}

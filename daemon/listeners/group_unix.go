@@ -1,19 +1,18 @@
 //go:build !windows
-// +build !windows
 
-package listeners // import "github.com/docker/docker/daemon/listeners"
+package listeners
 
 import (
 	"fmt"
 	"strconv"
 
-	"github.com/docker/docker/pkg/idtools"
+	"github.com/moby/moby/v2/daemon/internal/usergroup"
 )
 
 const defaultSocketGroup = "docker"
 
 func lookupGID(name string) (int, error) {
-	group, err := idtools.LookupGroup(name)
+	group, err := usergroup.LookupGroup(name)
 	if err == nil {
 		return group.Gid, nil
 	}

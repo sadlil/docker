@@ -1,18 +1,16 @@
-//go:build linux && seccomp
-// +build linux,seccomp
-
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
-	"github.com/containerd/containerd/containers"
-	coci "github.com/containerd/containerd/oci"
-	"github.com/docker/docker/container"
-	dconfig "github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/profiles/seccomp"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/core/containers"
+	coci "github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/log"
+	dconfig "github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/profiles/seccomp"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 const supportsSeccomp = true
@@ -24,17 +22,27 @@ func WithSeccomp(daemon *Daemon, c *container.Container) coci.SpecOpts {
 			return nil
 		}
 		if c.HostConfig.Privileged {
-			return nil
-		}
-		if !daemon.RawSysInfo().Seccomp {
-			if c.SeccompProfile != "" && c.SeccompProfile != dconfig.SeccompProfileDefault {
-				return fmt.Errorf("seccomp is not enabled in your kernel, cannot run a custom seccomp profile")
+			var err error
+			if c.SeccompProfile != "" {
+				s.Linux.Seccomp, err = seccomp.LoadProfile(c.SeccompProfile, s)
 			}
-			logrus.Warn("seccomp is not enabled in your kernel, running container without default profile")
+			return err
+		}
+		sysInfo, err := daemon.RawSysInfo()
+		if err != nil {
+			return err
+		}
+		if !sysInfo.Seccomp {
+			if c.SeccompProfile != "" && c.SeccompProfile != dconfig.SeccompProfileDefault {
+				return errors.New("seccomp is not enabled in your kernel, cannot run a custom seccomp profile")
+			}
+			log.G(ctx).Warn("seccomp is not enabled in your kernel, running container without default profile")
 			c.SeccompProfile = dconfig.SeccompProfileUnconfined
 			return nil
 		}
-		var err error
+		if s.Linux == nil {
+			s.Linux = &specs.Linux{}
+		}
 		switch {
 		case c.SeccompProfile == dconfig.SeccompProfileDefault:
 			s.Linux.Seccomp, err = seccomp.GetDefaultProfile(s)

@@ -1,7 +1,6 @@
 //go:build linux
-// +build linux
 
-package copy // import "github.com/docker/docker/daemon/graphdriver/copy"
+package copy
 
 import (
 	"fmt"
@@ -12,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/pkg/system"
+	"github.com/moby/moby/v2/daemon/internal/system"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -78,7 +77,7 @@ func TestCopyDir(t *testing.T) {
 }
 
 func randomMode(baseMode int) os.FileMode {
-	for i := 0; i < 7; i++ {
+	for i := range 7 {
 		baseMode = baseMode | (1&rand.Intn(2))<<uint(i)
 	}
 	return os.FileMode(baseMode)
@@ -91,18 +90,18 @@ func populateSrcDir(t *testing.T, srcDir string, remainingDepth int) {
 	aTime := time.Unix(rand.Int63(), 0)
 	mTime := time.Unix(rand.Int63(), 0)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		dirName := filepath.Join(srcDir, fmt.Sprintf("srcdir-%d", i))
 		// Owner all bits set
-		assert.NilError(t, os.Mkdir(dirName, randomMode(0700)))
+		assert.NilError(t, os.Mkdir(dirName, randomMode(0o700)))
 		populateSrcDir(t, dirName, remainingDepth-1)
 		assert.NilError(t, system.Chtimes(dirName, aTime, mTime))
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		fileName := filepath.Join(srcDir, fmt.Sprintf("srcfile-%d", i))
 		// Owner read bit set
-		assert.NilError(t, os.WriteFile(fileName, []byte{}, randomMode(0400)))
+		assert.NilError(t, os.WriteFile(fileName, []byte{}, randomMode(0o400)))
 		assert.NilError(t, system.Chtimes(fileName, aTime, mTime))
 	}
 }
@@ -118,7 +117,7 @@ func doCopyTest(t *testing.T, copyWithFileRange, copyWithFileClone *bool) {
 	buf := make([]byte, 1024)
 	_, err = r.Read(buf)
 	assert.NilError(t, err)
-	assert.NilError(t, os.WriteFile(srcFilename, buf, 0777))
+	assert.NilError(t, os.WriteFile(srcFilename, buf, 0o777))
 	fileinfo, err := os.Stat(srcFilename)
 	assert.NilError(t, err)
 
@@ -143,7 +142,7 @@ func TestCopyHardlink(t *testing.T) {
 	srcFile2 := filepath.Join(srcDir, "file2")
 	dstFile1 := filepath.Join(dstDir, "file1")
 	dstFile2 := filepath.Join(dstDir, "file2")
-	assert.NilError(t, os.WriteFile(srcFile1, []byte{}, 0777))
+	assert.NilError(t, os.WriteFile(srcFile1, []byte{}, 0o777))
 	assert.NilError(t, os.Link(srcFile1, srcFile2))
 
 	assert.Check(t, DirCopy(srcDir, dstDir, Content, false))

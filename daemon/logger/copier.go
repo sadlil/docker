@@ -1,14 +1,15 @@
-package logger // import "github.com/docker/docker/daemon/logger"
+package logger
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"sync"
 	"time"
 
-	types "github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/pkg/stringid"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+	"github.com/moby/moby/v2/daemon/internal/stringid"
+	types "github.com/moby/moby/v2/daemon/server/backend"
 )
 
 const (
@@ -77,17 +78,14 @@ func (c *Copier) copySrc(name string, src io.Reader) {
 			return
 		default:
 			// Work out how much more data we are okay with reading this time.
-			upto := n + readSize
-			if upto > cap(buf) {
-				upto = cap(buf)
-			}
+			upto := min(n+readSize, cap(buf))
 			// Try to read that data.
 			if upto > n {
 				read, err := src.Read(buf[n:upto])
 				if err != nil {
 					if err != io.EOF {
 						logReadsFailedCount.Inc(1)
-						logrus.Errorf("Error scanning log stream: %s", err)
+						log.G(context.TODO()).Errorf("Error scanning log stream: %s", err)
 						return
 					}
 					eof = true
@@ -127,6 +125,7 @@ func (c *Copier) copySrc(name string, src io.Reader) {
 
 					if logErr := c.dst.Log(msg); logErr != nil {
 						logDriverError(c.dst.Name(), string(msg.Line), logErr)
+						PutMessage(msg)
 					}
 				}
 				p += q + 1
@@ -159,6 +158,7 @@ func (c *Copier) copySrc(name string, src io.Reader) {
 
 					if logErr := c.dst.Log(msg); logErr != nil {
 						logDriverError(c.dst.Name(), string(msg.Line), logErr)
+						PutMessage(msg)
 					}
 					p = 0
 					n = 0

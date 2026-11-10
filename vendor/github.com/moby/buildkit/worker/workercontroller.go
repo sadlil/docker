@@ -1,7 +1,10 @@
 package worker
 
 import (
-	"github.com/containerd/containerd/filters"
+	stderrors "errors"
+
+	"github.com/containerd/containerd/v2/pkg/filters"
+	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
 	"github.com/pkg/errors"
 )
@@ -11,6 +14,16 @@ import (
 type Controller struct {
 	// TODO: define worker interface and support remote ones
 	workers []Worker
+}
+
+func (c *Controller) Close() error {
+	var errs []error
+	for _, w := range c.workers {
+		if err := w.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return stderrors.Join(errs...)
 }
 
 // Add adds a local worker.
@@ -40,7 +53,7 @@ func (c *Controller) List(filterStrings ...string) ([]Worker, error) {
 // GetDefault returns the default local worker
 func (c *Controller) GetDefault() (Worker, error) {
 	if len(c.workers) == 0 {
-		return nil, errors.Errorf("no default worker")
+		return nil, errors.New("no default worker")
 	}
 	return c.workers[0], nil
 }
@@ -62,10 +75,33 @@ func (c *Controller) WorkerInfos() []client.WorkerInfo {
 	out := make([]client.WorkerInfo, 0, len(c.workers))
 	for _, w := range c.workers {
 		out = append(out, client.WorkerInfo{
-			ID:        w.ID(),
-			Labels:    w.Labels(),
-			Platforms: w.Platforms(true),
+			ID:              w.ID(),
+			Labels:          w.Labels(),
+			Platforms:       w.Platforms(false),
+			BuildkitVersion: w.BuildkitVersion(),
 		})
 	}
 	return out
+}
+
+func (c *Controller) Infos() Infos {
+	return &infosController{c: c}
+}
+
+type infosController struct {
+	c *Controller
+}
+
+var _ Infos = &infosController{}
+
+func (c *infosController) DefaultCacheManager() (cache.Manager, error) {
+	w, err := c.c.GetDefault()
+	if err != nil {
+		return nil, err
+	}
+	return w.CacheManager(), nil
+}
+
+func (c *infosController) WorkerInfos() []client.WorkerInfo {
+	return c.c.WorkerInfos()
 }

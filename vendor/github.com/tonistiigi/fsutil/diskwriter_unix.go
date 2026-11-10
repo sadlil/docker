@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 package fsutil
 
@@ -13,7 +13,7 @@ import (
 
 func rewriteMetadata(p string, stat *types.Stat) error {
 	for key, value := range stat.Xattrs {
-		sysx.Setxattr(p, key, value, 0)
+		sysx.LSetxattr(p, key, value, 0)
 	}
 
 	if err := os.Lchown(p, int(stat.Uid), int(stat.Gid)); err != nil {
@@ -47,6 +47,13 @@ func handleTarTypeBlockCharFifo(path string, stat *types.Stat) error {
 
 	if err := createSpecialFile(path, mode, stat); err != nil {
 		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func renameFile(src, dst string) error {
+	if err := os.Rename(src, dst); err != nil {
+		return errors.Wrapf(err, "failed to rename %s to %s", src, dst)
 	}
 	return nil
 }

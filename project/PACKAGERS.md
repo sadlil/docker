@@ -1,7 +1,19 @@
-# Dear Packager,
+# For Users
+
+The Moby Project is widely packaged by many independent software distributors,
+generally under the name 'docker' or 'docker.io.'
+
+A non-exhuastive list of known software packagers and distributions includes:
+
+- [Docker Inc. - Docker CE](https://docs.docker.com/engine/)
+- [Mirantis - Mirantis Container Runtime](https://docs.mirantis.com/mcr/)
+- [Microsoft - CBL-Mariner Linux](https://microsoft.github.io/CBL-Mariner/docs/)
+- [AWS - Amazon Linux](https://aws.amazon.com/linux/)
+
+# For Packagers
 
 If you are looking to make Docker available on your favorite software
-distribution, this document is for you. It summarizes the requirements for
+distribution, the following is for you. It summarizes the requirements for
 building and running the Docker client and the Docker daemon.
 
 ## Package Name
@@ -27,12 +39,12 @@ The Dockerfile contains the most up-to-date list of build-time dependencies.
 
 ### Go Dependencies
 
-All Go dependencies are vendored under "./vendor". They are used by the official
-build, so the source of truth for the current version of each dependency is
-whatever is in "./vendor".
+All Go dependencies to build the daemon and related binaries are vendored
+under "./vendor". They are used by the official build, so the source of
+truth for the current version of each dependency is whatever is in "./vendor".
 
 If you would rather (or must, due to distro policy) package these dependencies
-yourself, take a look at "vendor.mod" for an easy-to-parse list of the
+yourself, take a look at "go.mod" for an easy-to-parse list of the
 exact version for each.
 
 ## Stripping Binaries
@@ -81,33 +93,22 @@ Please use our build script ("./hack/make.sh") for compilation.
 
 ### `DOCKER_BUILDTAGS`
 
-If you're building a binary that might be used on platforms that include
-seccomp, you will need to use the `seccomp` build tag:
-```bash
-export DOCKER_BUILDTAGS='seccomp'
-```
-
-There are build tags for disabling graphdrivers as well. By default, support
-for all graphdrivers are built in.
+There are build tags for disabling graphdrivers, if necessary. By default,
+support for all graphdrivers are built in.
 
 To disable btrfs:
 ```bash
 export DOCKER_BUILDTAGS='exclude_graphdriver_btrfs'
 ```
 
-To disable devicemapper:
+To disable zfs:
 ```bash
-export DOCKER_BUILDTAGS='exclude_graphdriver_devicemapper'
-```
-
-To disable aufs:
-```bash
-export DOCKER_BUILDTAGS='exclude_graphdriver_aufs'
+export DOCKER_BUILDTAGS='exclude_graphdriver_zfs'
 ```
 
 NOTE: if you need to set more than one build tag, space separate them:
 ```bash
-export DOCKER_BUILDTAGS='apparmor exclude_graphdriver_aufs'
+export DOCKER_BUILDTAGS='exclude_graphdriver_btrfs exclude_graphdriver_zfs'
 ```
 
 ## System Dependencies
@@ -117,6 +118,8 @@ export DOCKER_BUILDTAGS='apparmor exclude_graphdriver_aufs'
 To function properly, the Docker daemon needs the following software to be
 installed and available at runtime:
 
+* containerd version 1.6.22 or later
+  * containerd versions 1.7.0 through 1.7.2 are incompatible
 * iptables version 1.4 or later
 * procps (or similar provider of a "ps" executable)
 * e2fsprogs version 1.4.12 or later (in use: mkfs.ext4, tune2fs)
@@ -143,9 +146,7 @@ the client will even run on alternative platforms such as Mac OS X / Darwin.
 Some of Docker's features are activated by using optional command-line flags or
 by having support for them in the kernel or userspace. A few examples include:
 
-* AUFS graph driver (requires AUFS patches/support enabled in the kernel, and at
-  least the "auplink" utility from aufs-tools)
-* BTRFS graph driver (requires BTRFS support enabled in the kernel)
+* BTRFS graph driver (requires suitable kernel headers: `linux/btrfs.h` and `linux/btrfs_tree.h`, present in 4.12+; and BTRFS support enabled in the kernel)
 * ZFS graph driver (requires userspace zfs-utils and a corresponding kernel module)
 * Libseccomp to allow running seccomp profiles with containers
 

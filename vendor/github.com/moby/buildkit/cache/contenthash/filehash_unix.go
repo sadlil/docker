@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 package contenthash
 
@@ -19,8 +19,8 @@ func setUnixOpt(path string, fi os.FileInfo, stat *fstypes.Stat) error {
 	stat.Gid = s.Gid
 
 	if !fi.IsDir() {
-		if s.Mode&syscall.S_IFBLK != 0 ||
-			s.Mode&syscall.S_IFCHR != 0 {
+		if s.Mode&syscall.S_IFLNK == 0 && (s.Mode&syscall.S_IFBLK != 0 ||
+			s.Mode&syscall.S_IFCHR != 0) {
 			stat.Devmajor = int64(unix.Major(uint64(s.Rdev)))
 			stat.Devminor = int64(unix.Minor(uint64(s.Rdev)))
 		}

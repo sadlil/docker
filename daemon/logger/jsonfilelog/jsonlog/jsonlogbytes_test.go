@@ -1,4 +1,4 @@
-package jsonlog // import "github.com/docker/docker/daemon/logger/jsonfilelog/jsonlog"
+package jsonlog
 
 import (
 	"bytes"
@@ -38,7 +38,7 @@ func TestJSONLogsMarshalJSONBuf(t *testing.T) {
 		assert.NilError(t, err)
 
 		assert.Assert(t, regexP(buf.String(), expression))
-		assert.NilError(t, json.Unmarshal(buf.Bytes(), &map[string]interface{}{}))
+		assert.NilError(t, json.Unmarshal(buf.Bytes(), &map[string]any{}))
 	}
 }
 

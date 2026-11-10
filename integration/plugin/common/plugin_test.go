@@ -1,7 +1,6 @@
-package common // import "github.com/docker/docker/integration/plugin/common"
+package common
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,60 +13,97 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/testutil/daemon"
-	"github.com/docker/docker/testutil/fixtures/plugin"
-	"github.com/docker/docker/testutil/registry"
-	"github.com/docker/docker/testutil/request"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/moby/moby/api/types/jsonstream"
+	registrytypes "github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/jsonmessage"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
+	"github.com/moby/moby/v2/internal/testutil/fixtures/plugin"
+	"github.com/moby/moby/v2/internal/testutil/registry"
+	"github.com/moby/moby/v2/internal/testutil/request"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gotest.tools/v3/assert"
-	"gotest.tools/v3/assert/cmp"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
 )
 
+// TestPluginInvalidJSON tests that POST endpoints that expect a body return
+// the correct error when sending invalid JSON requests.
 func TestPluginInvalidJSON(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
-	endpoints := []string{"/plugins/foobar/set"}
+	// POST endpoints that accept / expect a JSON body;
+	endpoints := []string{
+		"/plugins/foobar/set",
+		"/plugins/foobar/upgrade",
+		"/plugins/pull",
+	}
 
 	for _, ep := range endpoints {
-		ep := ep
-		t.Run(ep, func(t *testing.T) {
+		t.Run(ep[1:], func(t *testing.T) {
 			t.Parallel()
 
-			res, body, err := request.Post(ep, request.RawString("{invalid json"), request.JSON)
-			assert.NilError(t, err)
-			assert.Equal(t, res.StatusCode, http.StatusBadRequest)
+			ctx := testutil.StartSpan(ctx, t)
 
-			buf, err := request.ReadBody(body)
-			assert.NilError(t, err)
-			assert.Check(t, is.Contains(string(buf), "invalid character 'i' looking for beginning of object key string"))
+			t.Run("invalid content type", func(t *testing.T) {
+				ctx := testutil.StartSpan(ctx, t)
+				res, body, err := request.Post(ctx, ep, request.RawString("[]"), request.ContentType("text/plain"))
+				assert.NilError(t, err)
+				assert.Check(t, is.Equal(res.StatusCode, http.StatusBadRequest))
 
-			res, body, err = request.Post(ep, request.JSON)
-			assert.NilError(t, err)
-			assert.Equal(t, res.StatusCode, http.StatusBadRequest)
+				buf, err := request.ReadBody(body)
+				assert.NilError(t, err)
+				assert.Check(t, is.Contains(string(buf), "unsupported Content-Type header (text/plain): must be 'application/json'"))
+			})
 
-			buf, err = request.ReadBody(body)
-			assert.NilError(t, err)
-			assert.Check(t, is.Contains(string(buf), "got EOF while reading request body"))
+			t.Run("invalid JSON", func(t *testing.T) {
+				ctx := testutil.StartSpan(ctx, t)
+				res, body, err := request.Post(ctx, ep, request.RawString("{invalid json"), request.JSON)
+				assert.NilError(t, err)
+				assert.Check(t, is.Equal(res.StatusCode, http.StatusBadRequest))
+
+				buf, err := request.ReadBody(body)
+				assert.NilError(t, err)
+				assert.Check(t, is.Contains(string(buf), "invalid JSON: invalid character 'i' looking for beginning of object key string"))
+			})
+
+			t.Run("extra content after JSON", func(t *testing.T) {
+				ctx := testutil.StartSpan(ctx, t)
+				res, body, err := request.Post(ctx, ep, request.RawString(`[] trailing content`), request.JSON)
+				assert.NilError(t, err)
+				assert.Check(t, is.Equal(res.StatusCode, http.StatusBadRequest))
+
+				buf, err := request.ReadBody(body)
+				assert.NilError(t, err)
+				assert.Check(t, is.Contains(string(buf), "unexpected content after JSON"))
+			})
+
+			t.Run("empty body", func(t *testing.T) {
+				ctx := testutil.StartSpan(ctx, t)
+				// empty body should not produce an 500 internal server error, or
+				// any 5XX error (this is assuming the request does not produce
+				// an internal server error for another reason, but it shouldn't)
+				res, _, err := request.Post(ctx, ep, request.RawString(``), request.JSON)
+				assert.NilError(t, err)
+				assert.Check(t, res.StatusCode < http.StatusInternalServerError)
+			})
 		})
 	}
 }
 
 func TestPluginInstall(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
-	skip.If(t, testEnv.OSType == "windows")
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of localhost")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	ctx := context.Background()
-	client := testEnv.APIClient()
+	ctx := testutil.StartSpan(baseContext, t)
+	apiclient := testEnv.APIClient()
 
 	t.Run("no auth", func(t *testing.T) {
-		defer setupTest(t)()
+		ctx := setupTest(t)
 
 		reg := registry.NewV2(t)
 		defer reg.Close()
@@ -76,32 +112,85 @@ func TestPluginInstall(t *testing.T) {
 		repo := path.Join(registry.DefaultURL, name+":latest")
 		assert.NilError(t, plugin.CreateInRegistry(ctx, repo, nil))
 
-		rdr, err := client.PluginInstall(ctx, repo, types.PluginInstallOptions{Disabled: true, RemoteRef: repo})
+		rdr, err := apiclient.PluginInstall(ctx, repo, client.PluginInstallOptions{Disabled: true, RemoteRef: repo})
 		assert.NilError(t, err)
 		defer rdr.Close()
 
 		_, err = io.Copy(io.Discard, rdr)
 		assert.NilError(t, err)
 
-		_, _, err = client.PluginInspectWithRaw(ctx, repo)
+		_, err = apiclient.PluginInspect(ctx, repo, client.PluginInspectOptions{})
+		assert.NilError(t, err)
+	})
+
+	t.Run("with digest", func(t *testing.T) {
+		ctx := setupTest(t)
+
+		reg := registry.NewV2(t)
+		defer reg.Close()
+
+		name := "test-" + strings.ToLower(t.Name())
+		repo := path.Join(registry.DefaultURL, name+":latest")
+		err := plugin.Create(ctx, apiclient, repo)
+		assert.NilError(t, err)
+
+		res, err := apiclient.PluginPush(ctx, repo, client.PluginPushOptions{})
+		assert.NilError(t, err)
+		defer res.Close()
+
+		var digest string
+
+		// PushResult contains the tag, manifest digest, and manifest size from the
+		// push. It's used to signal this information to the trust code in the client
+		// so it can sign the manifest if necessary.
+		//
+		// TODO(thaJeztah): this aux-type is only present for docker content trust, which is deprecated.
+		type pushResult struct {
+			Tag    string
+			Digest string
+			Size   int
+		}
+		var buf strings.Builder
+		assert.NilError(t, jsonmessage.DisplayStream(res, &buf, jsonmessage.WithAuxCallback(func(j jsonstream.Message) {
+			if j.Aux != nil {
+				var r pushResult
+				assert.NilError(t, json.Unmarshal(*j.Aux, &r))
+				digest = r.Digest
+			}
+		})), buf)
+
+		_, err = apiclient.PluginRemove(ctx, repo, client.PluginRemoveOptions{Force: true})
+		assert.NilError(t, err)
+
+		installResult, err := apiclient.PluginInstall(ctx, repo, client.PluginInstallOptions{
+			Disabled:  true,
+			RemoteRef: repo + "@" + digest,
+		})
+		assert.NilError(t, err)
+		defer installResult.Close()
+
+		_, err = io.Copy(io.Discard, installResult)
+		assert.NilError(t, err)
+
+		_, err = apiclient.PluginInspect(ctx, repo, client.PluginInspectOptions{})
 		assert.NilError(t, err)
 	})
 
 	t.Run("with htpasswd", func(t *testing.T) {
-		defer setupTest(t)()
+		ctx := setupTest(t)
 
 		reg := registry.NewV2(t, registry.Htpasswd)
 		defer reg.Close()
 
 		name := "test-" + strings.ToLower(t.Name())
 		repo := path.Join(registry.DefaultURL, name+":latest")
-		auth := &types.AuthConfig{ServerAddress: registry.DefaultURL, Username: "testuser", Password: "testpassword"}
+		auth := &registrytypes.AuthConfig{ServerAddress: registry.DefaultURL, Username: "testuser", Password: "testpassword"}
 		assert.NilError(t, plugin.CreateInRegistry(ctx, repo, auth))
 
-		authEncoded, err := json.Marshal(auth)
+		authEncoded, err := json.Marshal(auth) // #nosec G117 -- struct intentionally contains password.
 		assert.NilError(t, err)
 
-		rdr, err := client.PluginInstall(ctx, repo, types.PluginInstallOptions{
+		rdr, err := apiclient.PluginInstall(ctx, repo, client.PluginInstallOptions{
 			RegistryAuth: base64.URLEncoding.EncodeToString(authEncoded),
 			Disabled:     true,
 			RemoteRef:    repo,
@@ -112,11 +201,13 @@ func TestPluginInstall(t *testing.T) {
 		_, err = io.Copy(io.Discard, rdr)
 		assert.NilError(t, err)
 
-		_, _, err = client.PluginInspectWithRaw(ctx, repo)
+		_, err = apiclient.PluginInspect(ctx, repo, client.PluginInspectOptions{})
 		assert.NilError(t, err)
 	})
 	t.Run("with insecure", func(t *testing.T) {
 		skip.If(t, !testEnv.IsLocalDaemon())
+
+		ctx := testutil.StartSpan(ctx, t)
 
 		addrs, err := net.InterfaceAddrs()
 		assert.NilError(t, err)
@@ -152,15 +243,15 @@ func TestPluginInstall(t *testing.T) {
 		repo := path.Join(regURL, name+":latest")
 		assert.NilError(t, plugin.CreateInRegistry(ctx, repo, nil, plugin.WithInsecureRegistry(regURL)))
 
-		client := d.NewClientT(t)
-		rdr, err := client.PluginInstall(ctx, repo, types.PluginInstallOptions{Disabled: true, RemoteRef: repo})
+		apiClient := d.NewClientT(t)
+		rdr, err := apiClient.PluginInstall(ctx, repo, client.PluginInstallOptions{Disabled: true, RemoteRef: repo})
 		assert.NilError(t, err)
 		defer rdr.Close()
 
 		_, err = io.Copy(io.Discard, rdr)
 		assert.NilError(t, err)
 
-		_, _, err = client.PluginInspectWithRaw(ctx, repo)
+		_, err = apiClient.PluginInspect(ctx, repo, client.PluginInspectOptions{})
 		assert.NilError(t, err)
 	})
 	// TODO: test insecure registry with https
@@ -169,7 +260,9 @@ func TestPluginInstall(t *testing.T) {
 func TestPluginsWithRuntimes(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	skip.If(t, testEnv.IsRootless, "Test not supported on rootless due to buggy daemon setup in rootless mode due to daemon restart")
-	skip.If(t, testEnv.OSType == "windows")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
+
+	ctx := testutil.StartSpan(baseContext, t)
 
 	dir, err := os.MkdirTemp("", t.Name())
 	assert.NilError(t, err)
@@ -181,13 +274,15 @@ func TestPluginsWithRuntimes(t *testing.T) {
 	d.Start(t)
 	defer d.Stop(t)
 
-	ctx := context.Background()
-	client := d.NewClientT(t)
+	apiclient := d.NewClientT(t)
 
-	assert.NilError(t, plugin.Create(ctx, client, "test:latest"))
-	defer client.PluginRemove(ctx, "test:latest", types.PluginRemoveOptions{Force: true})
+	assert.NilError(t, plugin.Create(ctx, apiclient, "test:latest"))
+	defer func() {
+		_, _ = apiclient.PluginRemove(ctx, "test:latest", client.PluginRemoveOptions{Force: true})
+	}()
 
-	assert.NilError(t, client.PluginEnable(ctx, "test:latest", types.PluginEnableOptions{Timeout: 30}))
+	_, err = apiclient.PluginEnable(ctx, "test:latest", client.PluginEnableOptions{Timeout: 30})
+	assert.NilError(t, err)
 
 	p := filepath.Join(dir, "myrt")
 	script := fmt.Sprintf(`#!/bin/sh
@@ -201,28 +296,30 @@ func TestPluginsWithRuntimes(t *testing.T) {
 	exec runc $@
 	`, dir)
 
-	assert.NilError(t, os.WriteFile(p, []byte(script), 0777))
+	assert.NilError(t, os.WriteFile(p, []byte(script), 0o777))
 
 	type config struct {
-		Runtimes map[string]types.Runtime `json:"runtimes"`
+		Runtimes map[string]system.Runtime `json:"runtimes"`
 	}
 
 	cfg, err := json.Marshal(config{
-		Runtimes: map[string]types.Runtime{
+		Runtimes: map[string]system.Runtime{
 			"myrt":     {Path: p},
 			"myrtArgs": {Path: p, Args: []string{"someArg"}},
 		},
 	})
 	configPath := filepath.Join(dir, "config.json")
-	os.WriteFile(configPath, cfg, 0644)
+	os.WriteFile(configPath, cfg, 0o644)
 
 	t.Run("No Args", func(t *testing.T) {
+		_ = testutil.StartSpan(ctx, t)
 		d.Restart(t, "--default-runtime=myrt", "--config-file="+configPath)
 		_, err = os.Stat(filepath.Join(dir, "success"))
 		assert.NilError(t, err)
 	})
 
 	t.Run("With Args", func(t *testing.T) {
+		_ = testutil.StartSpan(ctx, t)
 		d.Restart(t, "--default-runtime=myrtArgs", "--config-file="+configPath)
 		_, err = os.Stat(filepath.Join(dir, "success_someArg"))
 		assert.NilError(t, err)
@@ -231,10 +328,9 @@ func TestPluginsWithRuntimes(t *testing.T) {
 
 func TestPluginBackCompatMediaTypes(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
-	skip.If(t, testEnv.OSType == "windows")
-	skip.If(t, testEnv.IsRootless, "Rootless has a different view of localhost (needed for test registry access)")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
 	reg := registry.NewV2(t)
 	defer reg.Close()
@@ -242,24 +338,23 @@ func TestPluginBackCompatMediaTypes(t *testing.T) {
 
 	repo := path.Join(registry.DefaultURL, strings.ToLower(t.Name())+":latest")
 
-	client := testEnv.APIClient()
+	apiclient := testEnv.APIClient()
 
-	ctx := context.Background()
-	assert.NilError(t, plugin.Create(ctx, client, repo))
+	assert.NilError(t, plugin.Create(ctx, apiclient, repo))
 
-	rdr, err := client.PluginPush(ctx, repo, "")
+	res, err := apiclient.PluginPush(ctx, repo, client.PluginPushOptions{})
 	assert.NilError(t, err)
-	defer rdr.Close()
+	defer res.Close()
 
-	buf := &strings.Builder{}
-	assert.NilError(t, jsonmessage.DisplayJSONMessagesStream(rdr, buf, 0, false, nil), buf)
+	var buf strings.Builder
+	assert.NilError(t, jsonmessage.DisplayStream(res, &buf), buf)
 
 	// Use custom header here because older versions of the registry do not
 	// parse the accept header correctly and does not like the accept header
 	// that the default resolver code uses. "Older registries" here would be
 	// like the one currently included in the test suite.
 	headers := http.Header{}
-	headers.Add("Accept", images.MediaTypeDockerSchema2Manifest)
+	headers.Add("Accept", c8dimages.MediaTypeDockerSchema2Manifest)
 
 	resolver := docker.NewResolver(docker.ResolverOptions{
 		Headers: headers,
@@ -272,13 +367,13 @@ func TestPluginBackCompatMediaTypes(t *testing.T) {
 	fetcher, err := resolver.Fetcher(ctx, n)
 	assert.NilError(t, err)
 
-	rdr, err = fetcher.Fetch(ctx, desc)
+	rdr, err := fetcher.Fetch(ctx, desc)
 	assert.NilError(t, err)
 	defer rdr.Close()
 
-	var m v1.Manifest
+	var m ocispec.Manifest
 	assert.NilError(t, json.NewDecoder(rdr).Decode(&m))
-	assert.Check(t, cmp.Equal(m.MediaType, images.MediaTypeDockerSchema2Manifest))
-	assert.Check(t, cmp.Len(m.Layers, 1))
-	assert.Check(t, cmp.Equal(m.Layers[0].MediaType, images.MediaTypeDockerSchema2LayerGzip))
+	assert.Check(t, is.Equal(m.MediaType, c8dimages.MediaTypeDockerSchema2Manifest))
+	assert.Check(t, is.Len(m.Layers, 1))
+	assert.Check(t, is.Equal(m.Layers[0].MediaType, c8dimages.MediaTypeDockerSchema2LayerGzip))
 }

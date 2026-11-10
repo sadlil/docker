@@ -1,33 +1,46 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
 	"net/url"
 
-	"github.com/docker/docker/api/types/filters"
-	volumetypes "github.com/docker/docker/api/types/volume"
+	"github.com/moby/moby/api/types/volume"
 )
 
+// VolumeListOptions holds parameters to list volumes.
+type VolumeListOptions struct {
+	Filters Filters
+}
+
+// VolumeListResult holds the result from the [Client.VolumeList] method.
+type VolumeListResult struct {
+	// List of volumes.
+	Items []volume.Volume
+
+	// Warnings that occurred when fetching the list of volumes.
+	Warnings []string
+}
+
 // VolumeList returns the volumes configured in the docker host.
-func (cli *Client) VolumeList(ctx context.Context, filter filters.Args) (volumetypes.VolumeListOKBody, error) {
-	var volumes volumetypes.VolumeListOKBody
+func (cli *Client) VolumeList(ctx context.Context, options VolumeListOptions) (VolumeListResult, error) {
 	query := url.Values{}
 
-	if filter.Len() > 0 {
-		//nolint:staticcheck // ignore SA1019 for old code
-		filterJSON, err := filters.ToParamWithVersion(cli.version, filter)
-		if err != nil {
-			return volumes, err
-		}
-		query.Set("filters", filterJSON)
-	}
+	options.Filters.updateURLValues(query)
 	resp, err := cli.get(ctx, "/volumes", query, nil)
 	defer ensureReaderClosed(resp)
 	if err != nil {
-		return volumes, err
+		return VolumeListResult{}, err
 	}
 
-	err = json.NewDecoder(resp.body).Decode(&volumes)
-	return volumes, err
+	var apiResp volume.ListResponse
+	err = json.NewDecoder(resp.Body).Decode(&apiResp)
+	if err != nil {
+		return VolumeListResult{}, err
+	}
+
+	return VolumeListResult{
+		Items:    apiResp.Volumes,
+		Warnings: apiResp.Warnings,
+	}, nil
 }

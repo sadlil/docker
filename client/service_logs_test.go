@@ -1,51 +1,69 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"os"
-	"strings"
 	"testing"
-	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestServiceLogsError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ServiceLogs(context.Background(), "service_id", types.ContainerLogsOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
-	_, err = client.ServiceLogs(context.Background(), "service_id", types.ContainerLogsOptions{
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
+	_, err = client.ServiceLogs(t.Context(), "service_id", ServiceLogsOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ServiceLogs(t.Context(), "service_id", ServiceLogsOptions{
 		Since: "2006-01-02TZ",
 	})
 	assert.Check(t, is.ErrorContains(err, `parsing time "2006-01-02TZ"`))
+
+	_, err = client.ServiceLogs(t.Context(), "", ServiceLogsOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ServiceLogs(t.Context(), "    ", ServiceLogsOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestServiceLogs(t *testing.T) {
-	expectedURL := "/services/service_id/logs"
+	const expectedURL = "/services/service_id/logs"
 	cases := []struct {
-		options             types.ContainerLogsOptions
+		doc                 string
+		options             ServiceLogsOptions
 		expectedQueryParams map[string]string
 		expectedError       string
 	}{
 		{
-			expectedQueryParams: map[string]string{
-				"tail": "",
+			doc: "no options",
+		},
+		{
+			// magic "all" value that's used as default in docker/cli
+			// is equivalent to "don't send a tail option".
+			doc: "tail all",
+			options: ServiceLogsOptions{
+				Tail: "all",
 			},
 		},
 		{
-			options: types.ContainerLogsOptions{
+			// TODO(thaJeztah): tail=0 currently means: "return zero lines"; perhaps we should just make it "all"
+			//   or error, similar to "service logs"; https://github.com/moby/moby/blob/4d20b6fe56dfb2b06f4a5dd1f32913215a9c317b/daemon/cluster/services.go#L425-L449
+			doc: "tail 0",
+			options: ServiceLogsOptions{
+				Tail: "0",
+			},
+			expectedQueryParams: map[string]string{
+				"tail": "0",
+			},
+		},
+		{
+			doc: "tail",
+			options: ServiceLogsOptions{
 				Tail: "any",
 			},
 			expectedQueryParams: map[string]string{
@@ -53,7 +71,8 @@ func TestServiceLogs(t *testing.T) {
 			},
 		},
 		{
-			options: types.ContainerLogsOptions{
+			doc: "all options",
+			options: ServiceLogsOptions{
 				ShowStdout: true,
 				ShowStderr: true,
 				Timestamps: true,
@@ -61,7 +80,6 @@ func TestServiceLogs(t *testing.T) {
 				Follow:     true,
 			},
 			expectedQueryParams: map[string]string{
-				"tail":       "",
 				"stdout":     "1",
 				"stderr":     "1",
 				"timestamps": "1",
@@ -70,68 +88,51 @@ func TestServiceLogs(t *testing.T) {
 			},
 		},
 		{
-			options: types.ContainerLogsOptions{
-				// timestamp will be passed as is
+			doc: "since",
+			options: ServiceLogsOptions{
+				// timestamp is passed as-is
 				Since: "1136073600.000000001",
 			},
 			expectedQueryParams: map[string]string{
-				"tail":  "",
 				"since": "1136073600.000000001",
 			},
 		},
 		{
-			options: types.ContainerLogsOptions{
-				// An complete invalid date will not be passed
+			doc: "invalid since",
+			options: ServiceLogsOptions{
+				// invalid dates are not passed.
 				Since: "invalid value",
 			},
 			expectedError: `invalid value for "since": failed to parse value as time or duration: "invalid value"`,
 		},
 	}
-	for _, logCase := range cases {
-		client := &Client{
-			client: newMockClient(func(r *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(r.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("expected URL '%s', got '%s'", expectedURL, r.URL)
+	for _, tc := range cases {
+		t.Run(tc.doc, func(t *testing.T) {
+			client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+				if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+					return nil, err
 				}
 				// Check query parameters
-				query := r.URL.Query()
-				for key, expected := range logCase.expectedQueryParams {
+				query := req.URL.Query()
+				for key, expected := range tc.expectedQueryParams {
 					actual := query.Get(key)
 					if actual != expected {
 						return nil, fmt.Errorf("%s not set in URL query properly. Expected '%s', got %s", key, expected, actual)
 					}
 				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte("response"))),
-				}, nil
-			}),
-		}
-		body, err := client.ServiceLogs(context.Background(), "service_id", logCase.options)
-		if logCase.expectedError != "" {
-			assert.Check(t, is.Error(err, logCase.expectedError))
-			continue
-		}
-		assert.NilError(t, err)
-		defer body.Close()
-		content, err := io.ReadAll(body)
-		assert.NilError(t, err)
-		assert.Check(t, is.Contains(string(content), "response"))
-	}
-}
-
-func ExampleClient_ServiceLogs_withTimeout() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	client, _ := NewClientWithOpts(FromEnv)
-	reader, err := client.ServiceLogs(ctx, "service_id", types.ContainerLogsOptions{})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	_, err = io.Copy(os.Stdout, reader)
-	if err != nil && err != io.EOF {
-		log.Fatal(err)
+				return mockResponse(http.StatusOK, nil, "response")(req)
+			}))
+			assert.NilError(t, err)
+			res, err := client.ServiceLogs(t.Context(), "service_id", tc.options)
+			if tc.expectedError != "" {
+				assert.Check(t, is.Error(err, tc.expectedError))
+				return
+			}
+			assert.NilError(t, err)
+			defer func() { _ = res.Close() }()
+			content, err := io.ReadAll(res)
+			assert.NilError(t, err)
+			assert.Check(t, is.Contains(string(content), "response"))
+		})
 	}
 }

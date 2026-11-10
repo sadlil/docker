@@ -7,8 +7,7 @@ about Moby's test infrastructure.
 
 This section describes tests you can run in the `dry-run-test` branch of your Docker
 fork. If you have followed along in this guide, you already have this branch.
-If you don't have this branch, you can create it or simply use another of your
-branches.
+If you don't have this branch, you can create it or simply use another branch.
 
 ## Understand how to test Moby
 
@@ -108,10 +107,10 @@ Try this now.
 2.  Start a Moby development image.
 
     If you are following along with this guide, you should have a
-    `docker-dev:dry-run-test` image.
+    `docker-dev:latest` image.
 
     ```bash
-    $ docker run --privileged --rm -ti -v `pwd`:/go/src/github.com/docker/docker docker-dev:dry-run-test /bin/bash
+    $ docker run --privileged --rm -ti -v `pwd`:/go/src/github.com/docker/docker docker-dev:latest /bin/bash
     ```
 
 3.  Run the unit tests using the `hack/test/unit` script.
@@ -123,7 +122,7 @@ Try this now.
 4.  Run the tests using the `hack/make.sh` script.
 
     ```bash
-    # hack/make.sh dynbinary binary cross test-integration test-docker-py
+    # hack/make.sh dynbinary binary test-integration test-docker-py
     ```
 
     The tests run just as they did within your local host.
@@ -132,11 +131,11 @@ Try this now.
     just the integration tests:
 
     ```bash
-    # hack/make.sh dynbinary binary cross test-integration
+    # hack/make.sh dynbinary binary test-integration
     ```
 
     Most test targets require that you build these precursor targets first:
-    `dynbinary binary cross`
+    `dynbinary binary`
 
 
 ## Run unit tests
@@ -148,7 +147,7 @@ You can use the `TESTDIRS` environment variable to run unit tests for
 a single package.
 
 ```bash
-$ TESTDIRS='github.com/docker/docker/opts' make test-unit
+$ TESTDIRS='github.com/moby/moby/v2/opts' make test-unit
 ```
 
 You can also use the `TESTFLAGS` environment variable to run a single test. The
@@ -163,7 +162,7 @@ On unit tests, it's better to use `TESTFLAGS` in combination with
 `TESTDIRS` to make it quicker to run a specific test.
 
 ```bash
-$ TESTDIRS='github.com/docker/docker/opts' TESTFLAGS='-test.run ^TestValidateIPAddress$' make test-unit
+$ TESTDIRS='github.com/moby/moby/v2/opts' TESTFLAGS='-test.run ^TestValidateIPAddress$' make test-unit
 ```
 
 ## Run integration tests
@@ -171,17 +170,79 @@ $ TESTDIRS='github.com/docker/docker/opts' TESTFLAGS='-test.run ^TestValidateIPA
 We use [gocheck](https://labix.org/gocheck) for our integration-cli tests.
 You can use the `TESTFLAGS` environment variable to run a single test. The
 flag's value is passed as arguments to the `go test` command. For example, from
-your local host you can run the `TestBuild` test with this command:
+your local host you can run the `TestDockerCLIBuildSuite` test with this command:
 
 ```bash
-$ TESTFLAGS='-test.run TestDockerSuite/TestBuild*' make test-integration
+$ TESTFLAGS='-test.run TestDockerCLIBuildSuite' make test-integration
 ```
 
 To run the same test inside your Docker development container, you do this:
 
 ```bash
-# TESTFLAGS='-test.run TestDockerSuite/TestBuild*' hack/make.sh binary test-integration
+# TESTFLAGS='-test.run TestDockerCLIBuildSuite' hack/make.sh binary test-integration
 ```
+
+### Run integration tests directly in a Linux VM
+
+The `vm` workflow runs the daemon and integration tests directly in a Lima
+guest, using the guest's systemd, networking tools, and kernel. Docker is only
+used on the build host to prepare the pinned runtime binaries, Go toolchain,
+test reporter, and frozen test images:
+
+```bash
+docker buildx bake test-integration-deps
+chmod 0755 bundles
+```
+
+BuildKit creates the parent `bundles/` directory with mode `0700` when it does
+not exist. Make it accessible before copying the checkout so rootless daemons
+and remapped container users can traverse the binary and data directories.
+
+Build this target for the same architecture as the guest. Copy the contents of
+`bundles/test-integration-deps/` into the guest's root directory, preserving the
+ownership and permissions of existing guest directories. For example, with Lima:
+
+```bash
+tar -C bundles/test-integration-deps -c . | lima sudo tar -C / -x --no-same-owner --no-overwrite-dir
+```
+
+The local exporter creates its output directory with mode `0700` and assigns
+files to the build host's user. The extraction flags keep this metadata from
+overwriting the guest's `/` directory and install the dependencies as root.
+
+Provision a dedicated RHEL-compatible or SUSE-compatible guest with the scripts in
+[`hack/host/`](../../hack/host/). They load kernel modules, install native build
+and runtime packages, and set up the rootless test account and cgroup delegation.
+Run them from the build host:
+
+```bash
+lima sudo bash < hack/host/load-kernel-modules.sh
+lima sudo bash < hack/host/provision.sh
+```
+
+Copy the source checkout into a writable directory in the guest. Then, from the
+guest's source directory, run:
+
+```bash
+sudo git config --global --add safe.directory "$PWD"
+sudo env \
+  PATH=/usr/local/go/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin \
+  DOCKER_GITCOMMIT="$(git rev-parse HEAD)" \
+  TEST_SKIP_INTEGRATION_CLI=1 \
+  TEST_INTEGRATION_DIR='./integration/container ./integration/build ./integration/system' \
+  TEST_INTEGRATION_USE_GRAPHDRIVER=1 \
+  DOCKER_GRAPHDRIVER=overlay2 \
+  TIMEOUT=15m \
+  hack/make.sh dynbinary test-integration
+```
+
+Use a dedicated test VM with no other Docker daemon running: tests start
+additional daemons and modify host networking and other system configuration.
+For rootless coverage, add `DOCKER_ROOTLESS=1` to the command. The test runner
+still runs as root and starts the rootless daemons as `unprivilegeduser`, which
+the provisioning script creates. Use `DOCKER_GRAPHDRIVER=fuse-overlayfs` when
+the kernel predates 5.11. Reports and daemon logs are
+written under `bundles/test-integration/`.
 
 ## Test the Windows binary against a Linux daemon
 
@@ -240,7 +301,7 @@ make any changes, just run these commands again.
 
 ## [Public CI infrastructure](ci.docker.com/public)
 
-The current infrastructure is maintained here: [Moby ci job](https://ci.docker.com/public/job/moby).  The Jenkins infrastructure is for the Moby project is maintained and
+The current infrastructure is maintained here: [Moby ci job](https://ci.docker.com/public/job/moby).  The Jenkins infrastructure for the Moby project is maintained and
 managed by Docker Inc.  All contributions against the Jenkinsfile are
 appreciated and welcomed!  However we might not be able to fully provide the
 infrastructure to test against various architectures in our CI pipelines.  All
@@ -250,3 +311,4 @@ jobs can be triggered and re-ran by the Moby maintainers
 
 Congratulations, you have successfully completed the basics you need to
 understand the Moby test framework.
+In the next section you'll [learn how to debug Docker daemon, running inside the development container](debug.md).

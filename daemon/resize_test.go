@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package daemon
 
@@ -7,98 +6,103 @@ import (
 	"context"
 	"testing"
 
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/exec"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/libcontainerd/types"
 	"gotest.tools/v3/assert"
 )
 
 // This test simply verify that when a wrong ID used, a specific error should be returned for exec resize.
 func TestExecResizeNoSuchExec(t *testing.T) {
-	n := "TestExecResize"
+	n := t.Name()
+	const (
+		width  = 24
+		height = 8
+	)
 	d := &Daemon{
-		execCommands: exec.NewStore(),
+		execCommands: container.NewExecStore(),
 	}
 	c := &container.Container{
-		ExecCommands: exec.NewStore(),
+		ExecCommands: container.NewExecStore(),
 	}
-	ec := &exec.Config{
-		ID: n,
+	ec := &container.ExecConfig{
+		ID:        n,
+		Container: c,
 	}
 	d.registerExecCommand(c, ec)
-	err := d.ContainerExecResize("nil", 24, 8)
+	err := d.ContainerExecResize(t.Context(), "no-such-exec", height, width)
 	assert.ErrorContains(t, err, "No such exec instance")
 }
 
-type execResizeMockContainerdClient struct {
-	MockContainerdClient
-	ProcessID   string
-	ContainerID string
-	Width       int
-	Height      int
+type execResizeMockProcess struct {
+	types.Process
+	Width, Height int
 }
 
-func (c *execResizeMockContainerdClient) ResizeTerminal(ctx context.Context, containerID, processID string, width, height int) error {
-	c.ProcessID = processID
-	c.ContainerID = containerID
-	c.Width = width
-	c.Height = height
+func (p *execResizeMockProcess) Resize(ctx context.Context, width, height uint32) error {
+	p.Width = int(width)
+	p.Height = int(height)
 	return nil
 }
 
 // This test is to make sure that when exec context is ready, resize should call ResizeTerminal via containerd client.
 func TestExecResize(t *testing.T) {
-	n := "TestExecResize"
-	width := 24
-	height := 8
-	ec := &exec.Config{
-		ID:          n,
-		ContainerID: n,
-		Started:     make(chan struct{}),
-	}
-	close(ec.Started)
-	mc := &execResizeMockContainerdClient{}
+	n := t.Name()
+	const (
+		width  = 24
+		height = 8
+	)
+	mp := &execResizeMockProcess{}
 	d := &Daemon{
-		execCommands: exec.NewStore(),
-		containerd:   mc,
+		execCommands: container.NewExecStore(),
 		containers:   container.NewMemoryStore(),
 	}
 	c := &container.Container{
-		ExecCommands: exec.NewStore(),
+		ID:           n,
+		ExecCommands: container.NewExecStore(),
 		State:        &container.State{Running: true},
 	}
+	ec := &container.ExecConfig{
+		ID:        n,
+		Container: c,
+		Process:   mp,
+		Started:   make(chan struct{}),
+	}
+	close(ec.Started)
 	d.containers.Add(n, c)
 	d.registerExecCommand(c, ec)
-	err := d.ContainerExecResize(n, height, width)
+	err := d.ContainerExecResize(t.Context(), n, height, width)
 	assert.NilError(t, err)
-	assert.Equal(t, mc.Width, width)
-	assert.Equal(t, mc.Height, height)
-	assert.Equal(t, mc.ProcessID, n)
-	assert.Equal(t, mc.ContainerID, n)
+	assert.Equal(t, mp.Width, width)
+	assert.Equal(t, mp.Height, height)
 }
 
 // This test is to make sure that when exec context is not ready, a timeout error should happen.
+//
 // TODO: the expect running time for this test is 10s, which would be too long for unit test.
 func TestExecResizeTimeout(t *testing.T) {
-	n := "TestExecResize"
-	width := 24
-	height := 8
-	ec := &exec.Config{
-		ID:          n,
-		ContainerID: n,
-		Started:     make(chan struct{}),
-	}
-	mc := &execResizeMockContainerdClient{}
+	n := t.Name()
+	const (
+		width  = 24
+		height = 8
+	)
+	mp := &execResizeMockProcess{}
 	d := &Daemon{
-		execCommands: exec.NewStore(),
-		containerd:   mc,
+		execCommands: container.NewExecStore(),
 		containers:   container.NewMemoryStore(),
 	}
 	c := &container.Container{
-		ExecCommands: exec.NewStore(),
+		ID:           t.Name(),
+		ExecCommands: container.NewExecStore(),
 		State:        &container.State{Running: true},
+	}
+	ec := &container.ExecConfig{
+		ID:        n,
+		Container: c,
+		Process:   mp,
+		Started:   make(chan struct{}),
 	}
 	d.containers.Add(n, c)
 	d.registerExecCommand(c, ec)
-	err := d.ContainerExecResize(n, height, width)
+	err := d.ContainerExecResize(t.Context(), n, height, width)
 	assert.ErrorContains(t, err, "timeout waiting for exec session ready")
 }

@@ -1,15 +1,15 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
 	"net/url"
 
-	"github.com/docker/docker/api/types"
+	"github.com/moby/moby/api/types/image"
 )
 
 // ImageRemove removes an image from the docker host.
-func (cli *Client) ImageRemove(ctx context.Context, imageID string, options types.ImageRemoveOptions) ([]types.ImageDeleteResponseItem, error) {
+func (cli *Client) ImageRemove(ctx context.Context, imageID string, options ImageRemoveOptions) (ImageRemoveResult, error) {
 	query := url.Values{}
 
 	if options.Force {
@@ -19,13 +19,21 @@ func (cli *Client) ImageRemove(ctx context.Context, imageID string, options type
 		query.Set("noprune", "1")
 	}
 
-	var dels []types.ImageDeleteResponseItem
+	if len(options.Platforms) > 0 {
+		p, err := encodePlatforms(options.Platforms...)
+		if err != nil {
+			return ImageRemoveResult{}, err
+		}
+		query["platforms"] = p
+	}
+
 	resp, err := cli.delete(ctx, "/images/"+imageID, query, nil)
 	defer ensureReaderClosed(resp)
 	if err != nil {
-		return dels, wrapResponseError(err, resp, "image", imageID)
+		return ImageRemoveResult{}, err
 	}
 
-	err = json.NewDecoder(resp.body).Decode(&dels)
-	return dels, err
+	var dels []image.DeleteResponse
+	err = json.NewDecoder(resp.Body).Decode(&dels)
+	return ImageRemoveResult{Items: dels}, err
 }

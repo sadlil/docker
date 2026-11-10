@@ -1,99 +1,68 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	volumetypes "github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/volume"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestVolumeListError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	_, err := client.VolumeList(context.Background(), filters.NewArgs())
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.VolumeList(t.Context(), VolumeListOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestVolumeList(t *testing.T) {
-	expectedURL := "/volumes"
-
-	noDanglingFilters := filters.NewArgs()
-	noDanglingFilters.Add("dangling", "false")
-
-	danglingFilters := filters.NewArgs()
-	danglingFilters.Add("dangling", "true")
-
-	labelFilters := filters.NewArgs()
-	labelFilters.Add("label", "label1")
-	labelFilters.Add("label", "label2")
+	const expectedURL = "/volumes"
 
 	listCases := []struct {
-		filters         filters.Args
+		filters         Filters
 		expectedFilters string
 	}{
 		{
-			filters:         filters.NewArgs(),
 			expectedFilters: "",
 		}, {
-			filters:         noDanglingFilters,
+			filters:         make(Filters).Add("dangling", "false"),
 			expectedFilters: `{"dangling":{"false":true}}`,
 		}, {
-			filters:         danglingFilters,
+			filters:         make(Filters).Add("dangling", "true"),
 			expectedFilters: `{"dangling":{"true":true}}`,
 		}, {
-			filters:         labelFilters,
+			filters:         make(Filters).Add("label", "label1", "label2"),
 			expectedFilters: `{"label":{"label1":true,"label2":true}}`,
 		},
 	}
 
 	for _, listCase := range listCases {
-		client := &Client{
-			client: newMockClient(func(req *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(req.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-				}
-				query := req.URL.Query()
-				actualFilters := query.Get("filters")
-				if actualFilters != listCase.expectedFilters {
-					return nil, fmt.Errorf("filters not set in URL query properly. Expected '%s', got %s", listCase.expectedFilters, actualFilters)
-				}
-				content, err := json.Marshal(volumetypes.VolumeListOKBody{
-					Volumes: []*types.Volume{
-						{
-							Name:   "volume",
-							Driver: "local",
-						},
+		client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+				return nil, err
+			}
+			query := req.URL.Query()
+			actualFilters := query.Get("filters")
+			if actualFilters != listCase.expectedFilters {
+				return nil, fmt.Errorf("filters not set in URL query properly. Expected '%s', got %s", listCase.expectedFilters, actualFilters)
+			}
+			return mockJSONResponse(http.StatusOK, nil, volume.ListResponse{
+				Volumes: []volume.Volume{
+					{
+						Name:   "volume",
+						Driver: "local",
 					},
-				})
-				if err != nil {
-					return nil, err
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader(content)),
-				}, nil
-			}),
-		}
+				},
+			})(req)
+		}))
+		assert.NilError(t, err)
 
-		volumeResponse, err := client.VolumeList(context.Background(), listCase.filters)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(volumeResponse.Volumes) != 1 {
-			t.Fatalf("expected 1 volume, got %v", volumeResponse.Volumes)
-		}
+		result, err := client.VolumeList(t.Context(), VolumeListOptions{Filters: listCase.filters})
+		assert.NilError(t, err)
+		assert.Check(t, is.Len(result.Items, 1))
 	}
 }

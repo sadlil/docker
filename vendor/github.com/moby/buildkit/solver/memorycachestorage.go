@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/util/bkmaps"
+	"github.com/moby/buildkit/util/compression"
 	"github.com/pkg/errors"
 )
 
@@ -278,11 +280,11 @@ func (s *inMemoryStore) WalkBacklinks(id string, fn func(id string, link CacheIn
 }
 
 func NewInMemoryResultStorage() CacheResultStorage {
-	return &inMemoryResultStore{m: &sync.Map{}}
+	return &inMemoryResultStore{m: &bkmaps.SyncMap[string, Result]{}}
 }
 
 type inMemoryResultStore struct {
-	m *sync.Map
+	m *bkmaps.SyncMap[string, Result]
 }
 
 func (s *inMemoryResultStore) Save(r Result, createdAt time.Time) (CacheResult, error) {
@@ -295,14 +297,14 @@ func (s *inMemoryResultStore) Load(ctx context.Context, res CacheResult) (Result
 	if !ok {
 		return nil, errors.WithStack(ErrNotFound)
 	}
-	return v.(Result), nil
+	return v, nil
 }
 
-func (s *inMemoryResultStore) LoadRemote(_ context.Context, _ CacheResult, _ session.Group) (*Remote, error) {
+func (s *inMemoryResultStore) LoadRemotes(_ context.Context, _ CacheResult, _ *compression.Config, _ session.Group) ([]*Remote, error) {
 	return nil, nil
 }
 
-func (s *inMemoryResultStore) Exists(id string) bool {
+func (s *inMemoryResultStore) Exists(ctx context.Context, id string) bool {
 	_, ok := s.m.Load(id)
 	return ok
 }

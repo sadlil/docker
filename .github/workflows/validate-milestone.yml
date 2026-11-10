@@ -1,0 +1,91 @@
+name: validate-milestone
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  issues: read
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize, milestoned, demilestoned]
+
+jobs:
+  validate-milestone:
+    if: ${{ github.repository == 'moby/moby' && github.event.pull_request.state == 'open' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate milestone matches docker next version
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          MILESTONE: ${{ github.event.pull_request.milestone.title }}
+          # Pinned "[Branch status]" issue with a "json docker-versions" block
+          # mapping each branch to its next and last version.
+          BRANCH_STATUS_ISSUE: 50221
+        with:
+          script: |
+            const issueNumber = Number(process.env.BRANCH_STATUS_ISSUE);
+            const source = `issue #${issueNumber}`;
+            const baseBranch = context.payload.pull_request.base.ref;
+            core.info(`Base branch: ${baseBranch}`);
+
+            const {data: issue} = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+            const lines = (issue.body ?? '').split('\n').map(line => line.trimEnd());
+            const start = lines.indexOf('```json docker-versions') + 1;
+            const end = lines.indexOf('```', start);
+            if (start === 0 || end === -1) {
+              core.setFailed(`Could not find a 'json docker-versions' block in ${source}`);
+              return;
+            }
+
+            // For example: {"master": {"next": "29.10.0", "last": "29.9.1"}}
+            let versions;
+            try {
+              versions = JSON.parse(lines.slice(start, end).join('\n'));
+            } catch (err) {
+              core.setFailed(`Invalid 'json docker-versions' block in ${source}: ${err.message}`);
+              return;
+            }
+            core.info(`Versions: ${JSON.stringify(versions)}`);
+
+            const expected = versions?.[baseBranch]?.next;
+            if (!expected) {
+              core.setFailed(`Could not find the next version for branch '${baseBranch}' in ${source}`);
+              return;
+            }
+            const milestone = process.env.MILESTONE;
+
+            if (!milestone) {
+              core.setFailed(`PR must have a milestone set (expected: ${expected})`);
+              return;
+            }
+            if (milestone !== expected) {
+              const guidance =
+                'This check prevents the PR from being merged accidentally before it is appropriate ' +
+                'for its milestone. If the milestone is intentional, no action is needed.';
+              await core.summary
+                .addHeading('This PR is intentionally blocked from merging for now')
+                .addTable([
+                  [
+                    {data: 'Milestone', header: true},
+                    {data: 'Expected next version', header: true},
+                  ],
+                  [milestone, expected],
+                ])
+                .addRaw(`The expected version for the '${baseBranch}' branch comes from ${source}.`)
+                .addEOL()
+                .addRaw(guidance)
+                .write();
+              core.setFailed(
+                `This PR cannot be merged yet because milestone '${milestone}' does not match ` +
+                `the next version '${expected}'. ${guidance}`
+              );
+              return;
+            }
+            core.info(`Milestone: ${milestone} ✓`);

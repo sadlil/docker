@@ -1,5 +1,7 @@
 package etw
 
+import "fmt"
+
 // Channel represents the ETW logging channel that is used. It can be used by
 // event consumers to give an event special treatment.
 type Channel uint8
@@ -17,7 +19,11 @@ const (
 // will always be collected.
 type Level uint8
 
+var _ fmt.Stringer = Level(0)
+
 // Predefined ETW log levels from winmeta.xml in the Windows SDK.
+//
+//go:generate go tool stringer -type=Level -trimprefix=Level
 const (
 	LevelAlways Level = iota
 	LevelCritical
@@ -30,7 +36,11 @@ const (
 // Opcode represents the operation that the event indicates is being performed.
 type Opcode uint8
 
+var _ fmt.Stringer = Opcode(0)
+
 // Predefined ETW opcodes from winmeta.xml in the Windows SDK.
+//
+//go:generate go tool stringer -type=Opcode -trimprefix=Opcode
 const (
 	// OpcodeInfo indicates an informational event.
 	OpcodeInfo Opcode = iota
@@ -44,7 +54,9 @@ const (
 	OpcodeDCStop
 )
 
-// EventDescriptor represents various metadata for an ETW event.
+// eventDescriptor represents various metadata for an ETW event.
+//
+//nolint:unused,nolintlint // only used on Windows.
 type eventDescriptor struct {
 	id      uint16
 	version uint8
@@ -55,8 +67,10 @@ type eventDescriptor struct {
 	keyword uint64
 }
 
-// NewEventDescriptor returns an EventDescriptor initialized for use with
+// newEventDescriptor returns an EventDescriptor initialized for use with
 // TraceLogging.
+//
+//nolint:unused,nolintlint // only used on Windows.
 func newEventDescriptor() *eventDescriptor {
 	// Standard TraceLogging events default to the TraceLogging channel, and
 	// verbose level.
@@ -66,18 +80,22 @@ func newEventDescriptor() *eventDescriptor {
 	}
 }
 
-// Identity returns the identity of the event. If the identity is not 0, it
+// identity returns the identity of the event. If the identity is not 0, it
 // should uniquely identify the other event metadata (contained in
 // EventDescriptor, and field metadata). Only the lower 24 bits of this value
 // are relevant.
+//
+//nolint:unused // keep for future use
 func (ed *eventDescriptor) identity() uint32 {
 	return (uint32(ed.version) << 16) | uint32(ed.id)
 }
 
-// SetIdentity sets the identity of the event. If the identity is not 0, it
+// setIdentity sets the identity of the event. If the identity is not 0, it
 // should uniquely identify the other event metadata (contained in
 // EventDescriptor, and field metadata). Only the lower 24 bits of this value
 // are relevant.
+//
+//nolint:unused // keep for future use
 func (ed *eventDescriptor) setIdentity(identity uint32) {
 	ed.id = uint16(identity)
 	ed.version = uint8(identity >> 16)

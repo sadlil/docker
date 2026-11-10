@@ -1,41 +1,23 @@
-package jsonfilelog // import "github.com/docker/docker/daemon/logger/jsonfilelog"
+package jsonfilelog
 
 import (
 	"context"
 	"encoding/json"
 	"io"
 
-	"github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/jsonfilelog/jsonlog"
-	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/docker/docker/pkg/tailfile"
-	"github.com/sirupsen/logrus"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/jsonfilelog/jsonlog"
+	"github.com/moby/moby/v2/daemon/logger/loggerutils"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/pkg/tailfile"
 )
 
-const maxJSONDecodeRetry = 20000
+var _ logger.LogReader = (*JSONFileLogger)(nil)
 
 // ReadLogs implements the logger's LogReader interface for the logs
 // created by this driver.
-func (l *JSONFileLogger) ReadLogs(config logger.ReadConfig) *logger.LogWatcher {
-	logWatcher := logger.NewLogWatcher()
-
-	go l.readLogs(logWatcher, config)
-	return logWatcher
-}
-
-func (l *JSONFileLogger) readLogs(watcher *logger.LogWatcher, config logger.ReadConfig) {
-	defer close(watcher.Msg)
-
-	l.mu.Lock()
-	l.readers[watcher] = struct{}{}
-	l.mu.Unlock()
-
-	l.writer.ReadLogs(config, watcher)
-
-	l.mu.Lock()
-	delete(l.readers, watcher)
-	l.mu.Unlock()
+func (l *JSONFileLogger) ReadLogs(ctx context.Context, config logger.ReadConfig) *logger.LogWatcher {
+	return l.writer.ReadLogs(ctx, config)
 }
 
 func decodeLogLine(dec *json.Decoder, l *jsonlog.JSONLog) (*logger.Message, error) {
@@ -61,10 +43,9 @@ func decodeLogLine(dec *json.Decoder, l *jsonlog.JSONLog) (*logger.Message, erro
 }
 
 type decoder struct {
-	rdr      io.Reader
-	dec      *json.Decoder
-	jl       *jsonlog.JSONLog
-	maxRetry int
+	rdr io.Reader
+	dec *json.Decoder
+	jl  *jsonlog.JSONLog
 }
 
 func (d *decoder) Reset(rdr io.Reader) {
@@ -81,81 +62,14 @@ func (d *decoder) Close() {
 	d.jl = nil
 }
 
-func (d *decoder) Decode() (msg *logger.Message, err error) {
+func (d *decoder) Decode() (*logger.Message, error) {
 	if d.dec == nil {
 		d.dec = json.NewDecoder(d.rdr)
 	}
 	if d.jl == nil {
 		d.jl = &jsonlog.JSONLog{}
 	}
-	if d.maxRetry == 0 {
-		// We aren't using maxJSONDecodeRetry directly so we can give a custom value for testing.
-		d.maxRetry = maxJSONDecodeRetry
-	}
-	for retries := 0; retries < d.maxRetry; retries++ {
-		msg, err = decodeLogLine(d.dec, d.jl)
-		if err == nil || err == io.EOF {
-			break
-		}
-
-		logrus.WithError(err).WithField("retries", retries).Warn("got error while decoding json")
-		// try again, could be due to a an incomplete json object as we read
-		if _, ok := err.(*json.SyntaxError); ok {
-			d.dec = json.NewDecoder(d.rdr)
-			continue
-		}
-
-		// io.ErrUnexpectedEOF is returned from json.Decoder when there is
-		// remaining data in the parser's buffer while an io.EOF occurs.
-		// If the json logger writes a partial json log entry to the disk
-		// while at the same time the decoder tries to decode it, the race condition happens.
-		if err == io.ErrUnexpectedEOF {
-			d.rdr = combineReaders(d.dec.Buffered(), d.rdr)
-			d.dec = json.NewDecoder(d.rdr)
-			continue
-		}
-	}
-	return msg, err
-}
-
-func combineReaders(pre, rdr io.Reader) io.Reader {
-	return &combinedReader{pre: pre, rdr: rdr}
-}
-
-// combinedReader is a reader which is like `io.MultiReader` where except it does not cache a full EOF.
-// Once `io.MultiReader` returns EOF, it is always EOF.
-//
-// For this usecase we have an underlying reader which is a file which may reach EOF but have more data written to it later.
-// As such, io.MultiReader does not work for us.
-type combinedReader struct {
-	pre io.Reader
-	rdr io.Reader
-}
-
-func (r *combinedReader) Read(p []byte) (int, error) {
-	var read int
-	if r.pre != nil {
-		n, err := r.pre.Read(p)
-		if err != nil {
-			if err != io.EOF {
-				return n, err
-			}
-			r.pre = nil
-		}
-		read = n
-	}
-
-	if read < len(p) {
-		n, err := r.rdr.Read(p[read:])
-		if n > 0 {
-			read += n
-		}
-		if err != nil {
-			return read, err
-		}
-	}
-
-	return read, nil
+	return decodeLogLine(d.dec, d.jl)
 }
 
 // decodeFunc is used to create a decoder for the log file reader
@@ -167,6 +81,6 @@ func decodeFunc(rdr io.Reader) loggerutils.Decoder {
 	}
 }
 
-func getTailReader(ctx context.Context, r loggerutils.SizeReaderAt, req int) (io.Reader, int, error) {
+func getTailReader(ctx context.Context, r loggerutils.SizeReaderAt, req int) (loggerutils.SizeReaderAt, int, error) {
 	return tailfile.NewTailReader(ctx, r, req)
 }

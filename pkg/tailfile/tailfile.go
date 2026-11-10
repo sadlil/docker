@@ -1,6 +1,6 @@
 // Package tailfile provides helper functions to read the nth lines of any
 // ReadSeeker.
-package tailfile // import "github.com/docker/docker/pkg/tailfile"
+package tailfile
 
 import (
 	"bufio"
@@ -32,10 +32,10 @@ func TailFile(f *os.File, n int) ([][]byte, error) {
 	}
 
 	buf := make([][]byte, 0, nLines)
-	scanner := bufio.NewScanner(r)
+	s := bufio.NewScanner(r)
 
-	for scanner.Scan() {
-		buf = append(buf, scanner.Bytes())
+	for s.Scan() {
+		buf = append(buf, s.Bytes())
 	}
 	return buf, nil
 }
@@ -48,7 +48,7 @@ type SizeReaderAt interface {
 }
 
 // NewTailReader scopes the passed in reader to just the last N lines passed in
-func NewTailReader(ctx context.Context, r SizeReaderAt, reqLines int) (io.Reader, int, error) {
+func NewTailReader(ctx context.Context, r SizeReaderAt, reqLines int) (*io.SectionReader, int, error) {
 	return NewTailReaderWithDelimiter(ctx, r, reqLines, eol)
 }
 
@@ -56,7 +56,7 @@ func NewTailReader(ctx context.Context, r SizeReaderAt, reqLines int) (io.Reader
 // In this case a "line" is defined by the passed in delimiter.
 //
 // Delimiter lengths should be generally small, no more than 12 bytes
-func NewTailReaderWithDelimiter(ctx context.Context, r SizeReaderAt, reqLines int, delimiter []byte) (io.Reader, int, error) {
+func NewTailReaderWithDelimiter(ctx context.Context, r SizeReaderAt, reqLines int, delimiter []byte) (*io.SectionReader, int, error) {
 	if reqLines < 1 {
 		return nil, 0, ErrNonPositiveLinesNumber
 	}
@@ -71,28 +71,28 @@ func NewTailReaderWithDelimiter(ctx context.Context, r SizeReaderAt, reqLines in
 	)
 
 	if int64(len(delimiter)) >= size {
-		return bytes.NewReader(nil), 0, nil
+		return io.NewSectionReader(bytes.NewReader(nil), 0, 0), 0, nil
 	}
 
-	scanner := newScanner(r, delimiter)
-	for scanner.Scan(ctx) {
-		if err := scanner.Err(); err != nil {
-			return nil, 0, scanner.Err()
+	s := newScanner(r, delimiter)
+	for s.Scan(ctx) {
+		if err := s.Err(); err != nil {
+			return nil, 0, s.Err()
 		}
 
 		found++
 		if found == 1 {
-			tailEnd = scanner.End()
+			tailEnd = s.End()
 		}
 		if found == reqLines {
 			break
 		}
 	}
 
-	tailStart = scanner.Start(ctx)
+	tailStart = s.Start(ctx)
 
 	if found == 0 {
-		return bytes.NewReader(nil), 0, nil
+		return io.NewSectionReader(bytes.NewReader(nil), 0, 0), 0, nil
 	}
 
 	if found < reqLines && tailStart != 0 {
@@ -103,10 +103,7 @@ func NewTailReaderWithDelimiter(ctx context.Context, r SizeReaderAt, reqLines in
 
 func newScanner(r SizeReaderAt, delim []byte) *scanner {
 	size := r.Size()
-	readSize := blockSize
-	if readSize > int(size) {
-		readSize = int(size)
-	}
+	readSize := min(blockSize, int(size))
 	// silly case...
 	if len(delim) >= readSize/2 {
 		readSize = len(delim)*2 + 2
@@ -178,10 +175,7 @@ func (s *scanner) Scan(ctx context.Context) bool {
 
 		idx := s.idx - len(s.delim)
 		if idx < 0 {
-			readSize := int(s.pos)
-			if readSize > len(s.buf) {
-				readSize = len(s.buf)
-			}
+			readSize := min(int(s.pos), len(s.buf))
 
 			if readSize < len(s.delim) {
 				return false
@@ -189,7 +183,7 @@ func (s *scanner) Scan(ctx context.Context) bool {
 
 			offset := s.pos - int64(readSize)
 			n, err := s.r.ReadAt(s.buf[:readSize], offset)
-			if err != nil && err != io.EOF {
+			if err != nil && !errors.Is(err, io.EOF) {
 				s.err = err
 				return false
 			}
@@ -216,6 +210,5 @@ func (s *scanner) Scan(ctx context.Context) bool {
 			// It's much simpler and cleaner to just re-read `len(delimiter)-1` bytes again.
 			s.pos += int64(len(s.delim)) - 1
 		}
-
 	}
 }

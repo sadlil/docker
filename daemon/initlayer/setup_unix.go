@@ -1,15 +1,13 @@
 //go:build linux || freebsd
-// +build linux freebsd
 
-package initlayer // import "github.com/docker/docker/daemon/initlayer"
+package initlayer
 
 import (
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/docker/docker/pkg/containerfs"
-	"github.com/docker/docker/pkg/idtools"
+	"github.com/moby/sys/user"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,9 +16,9 @@ import (
 //
 // This extra layer is used by all containers as the top-most ro layer. It protects
 // the container from unwanted side-effects on the rw layer.
-func Setup(initLayerFs containerfs.ContainerFS, rootIdentity idtools.Identity) error {
+func Setup(initLayerFs string, uid int, gid int) error {
 	// Since all paths are local to the container, we can just extract initLayerFs.Path()
-	initLayer := initLayerFs.Path()
+	initLayer := initLayerFs
 
 	for pth, typ := range map[string]string{
 		"/dev/pts":         "dir",
@@ -43,20 +41,20 @@ func Setup(initLayerFs containerfs.ContainerFS, rootIdentity idtools.Identity) e
 
 		if _, err := os.Stat(filepath.Join(initLayer, pth)); err != nil {
 			if os.IsNotExist(err) {
-				if err := idtools.MkdirAllAndChownNew(filepath.Join(initLayer, filepath.Dir(pth)), 0755, rootIdentity); err != nil {
+				if err := user.MkdirAllAndChown(filepath.Join(initLayer, filepath.Dir(pth)), 0o755, uid, gid, user.WithOnlyNew); err != nil {
 					return err
 				}
 				switch typ {
 				case "dir":
-					if err := idtools.MkdirAllAndChownNew(filepath.Join(initLayer, pth), 0755, rootIdentity); err != nil {
+					if err := user.MkdirAllAndChown(filepath.Join(initLayer, pth), 0o755, uid, gid, user.WithOnlyNew); err != nil {
 						return err
 					}
 				case "file":
-					f, err := os.OpenFile(filepath.Join(initLayer, pth), os.O_CREATE, 0755)
+					f, err := os.OpenFile(filepath.Join(initLayer, pth), os.O_CREATE, 0o755)
 					if err != nil {
 						return err
 					}
-					f.Chown(rootIdentity.UID, rootIdentity.GID)
+					f.Chown(uid, gid)
 					f.Close()
 				default:
 					if err := os.Symlink(typ, filepath.Join(initLayer, pth)); err != nil {

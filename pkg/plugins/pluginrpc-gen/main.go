@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"go/format"
@@ -22,6 +23,7 @@ func (s stringSet) Set(value string) error {
 	s.values[value] = struct{}{}
 	return nil
 }
+
 func (s stringSet) GetValues() map[string]struct{} {
 	return s.values
 }
@@ -48,10 +50,10 @@ func errorOut(msg string, err error) {
 
 func checkFlags() error {
 	if *outputFile == "" {
-		return fmt.Errorf("missing required flag `-o`")
+		return errors.New("missing required flag `-o`")
 	}
 	if *inputFile == "" {
-		return fmt.Errorf("missing required flag `-i`")
+		return errors.New("missing required flag `-i`")
 	}
 	return nil
 }
@@ -65,9 +67,9 @@ func main() {
 	errorOut("error", checkFlags())
 
 	pkg, err := Parse(*inputFile, *typeName)
-	errorOut(fmt.Sprintf("error parsing requested type %s", *typeName), err)
+	errorOut("error parsing requested type "+*typeName, err)
 
-	var analysis = struct {
+	analysis := struct {
 		InterfaceType string
 		RPCName       string
 		BuildTags     map[string]struct{}
@@ -78,7 +80,7 @@ func main() {
 	errorOut("parser error", generatedTempl.Execute(&buf, analysis))
 	src, err := format.Source(buf.Bytes())
 	errorOut("error formatting generated source:\n"+buf.String(), err)
-	errorOut("error writing file", os.WriteFile(*outputFile, src, 0644))
+	errorOut("error writing file", os.WriteFile(*outputFile, src, 0o644))
 }
 
 func toLower(s string) string {

@@ -1,21 +1,26 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	types "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/daemon/cluster/executor/container"
-	lncluster "github.com/docker/docker/libnetwork/cluster"
-	swarmapi "github.com/docker/swarmkit/api"
-	swarmallocator "github.com/docker/swarmkit/manager/allocator/cnmallocator"
-	swarmnode "github.com/docker/swarmkit/node"
+	"github.com/containerd/log"
+	types "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/daemon/cluster/convert"
+	"github.com/moby/moby/v2/daemon/cluster/executor/container"
+	lncluster "github.com/moby/moby/v2/daemon/libnetwork/cluster"
+	"github.com/moby/moby/v2/daemon/libnetwork/cnmallocator"
+	"github.com/moby/moby/v2/internal/sliceutil"
+	swarmapi "github.com/moby/swarmkit/v2/api"
+	"github.com/moby/swarmkit/v2/manager/allocator/networkallocator"
+	swarmnode "github.com/moby/swarmkit/v2/node"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,7 +37,7 @@ type nodeRunner struct {
 
 	repeatedRun     bool
 	cancelReconnect func()
-	stopping        bool
+	stopped         bool
 	cluster         *Cluster // only for accessing config helpers, never call any methods. TODO: change to config struct
 }
 
@@ -53,7 +58,7 @@ type nodeStartConfig struct {
 	// DataPathAddr is the address that has to be used for the data path
 	DataPathAddr string
 	// DefaultAddressPool contains list of subnets
-	DefaultAddressPool []string
+	DefaultAddressPool []netip.Prefix
 	// SubnetSize contains subnet size of DefaultAddressPool
 	SubnetSize uint32
 	// DataPathPort contains Data path port (VXLAN UDP port) number that is used for data traffic.
@@ -103,7 +108,7 @@ func (n *nodeRunner) Start(conf nodeStartConfig) error {
 
 func (n *nodeRunner) start(conf nodeStartConfig) error {
 	var control string
-	if isWindows {
+	if runtime.GOOS == "windows" {
 		control = `\\.\pipe\` + controlSocket
 	} else {
 		control = filepath.Join(n.cluster.runtimeRoot, controlSocket)
@@ -123,13 +128,13 @@ func (n *nodeRunner) start(conf nodeStartConfig) error {
 		ListenControlAPI:   control,
 		ListenRemoteAPI:    conf.ListenAddr,
 		AdvertiseRemoteAPI: conf.AdvertiseAddr,
-		NetworkConfig: &swarmallocator.NetworkConfig{
-			DefaultAddrPool: conf.DefaultAddressPool,
+		NetworkConfig: &networkallocator.Config{
+			DefaultAddrPool: sliceutil.Map(conf.DefaultAddressPool, (netip.Prefix).String),
 			SubnetSize:      conf.SubnetSize,
 			VXLANUDPPort:    conf.DataPathPort,
 		},
 		JoinAddr:  joinAddr,
-		StateDir:  n.cluster.root,
+		StateDir:  n.cluster.stateDir,
 		JoinToken: conf.joinToken,
 		Executor: container.NewExecutor(
 			n.cluster.config.Backend,
@@ -144,7 +149,8 @@ func (n *nodeRunner) start(conf nodeStartConfig) error {
 		ElectionTick:     n.cluster.config.RaftElectionTick,
 		UnlockKey:        conf.lockKey,
 		AutoLockManagers: conf.autolock,
-		PluginGetter:     n.cluster.config.Backend.PluginGetter(),
+		PluginGetter:     convert.SwarmPluginGetter(n.cluster.config.Backend.PluginGetter()),
+		NetworkProvider:  cnmallocator.NewProvider(n.cluster.config.Backend.PluginGetter()),
 	}
 	if conf.availability != "" {
 		avail, ok := swarmapi.NodeSpec_Availability_value[strings.ToUpper(string(conf.availability))]
@@ -168,7 +174,7 @@ func (n *nodeRunner) start(conf nodeStartConfig) error {
 		conf.JoinInProgress = true
 	}
 	n.config = conf
-	savePersistentState(n.cluster.root, conf)
+	savePersistentState(n.cluster.stateDir, conf)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -231,7 +237,7 @@ func (n *nodeRunner) watchClusterEvents(ctx context.Context, conn *grpc.ClientCo
 		IncludeOldObject: true,
 	})
 	if err != nil {
-		logrus.WithError(err).Error("failed to watch cluster store")
+		log.G(ctx).WithError(err).Error("failed to watch cluster store")
 		return
 	}
 	for {
@@ -240,7 +246,7 @@ func (n *nodeRunner) watchClusterEvents(ctx context.Context, conn *grpc.ClientCo
 			// store watch is broken
 			errStatus, ok := status.FromError(err)
 			if !ok || errStatus.Code() != codes.Canceled {
-				logrus.WithError(err).Error("failed to receive changes from store watch API")
+				log.G(ctx).WithError(err).Error("failed to receive changes from store watch API")
 			}
 			return
 		}
@@ -259,7 +265,7 @@ func (n *nodeRunner) handleReadyEvent(ctx context.Context, node *swarmnode.Node,
 		n.err = nil
 		if n.config.JoinInProgress {
 			n.config.JoinInProgress = false
-			savePersistentState(n.cluster.root, n.config)
+			savePersistentState(n.cluster.stateDir, n.config)
 		}
 		n.mu.Unlock()
 		close(ready)
@@ -271,7 +277,7 @@ func (n *nodeRunner) handleReadyEvent(ctx context.Context, node *swarmnode.Node,
 func (n *nodeRunner) handleNodeExit(node *swarmnode.Node) {
 	err := detectLockedError(node.Err(context.Background()))
 	if err != nil {
-		logrus.Errorf("cluster exited with error: %v", err)
+		log.G(context.TODO()).Errorf("cluster exited with error: %v", err)
 	}
 	n.mu.Lock()
 	n.swarmNode = nil
@@ -279,6 +285,19 @@ func (n *nodeRunner) handleNodeExit(node *swarmnode.Node) {
 	close(n.done)
 	select {
 	case <-n.ready:
+		// there is a case where a node can be promoted to manager while
+		// another node is leaving the cluster. the node being promoted, by
+		// random chance, picks the IP of the node being demoted as the one it
+		// tries to connect to. in this case, the promotion will fail, and the
+		// whole swarm Node object packs it in.
+		//
+		// when the Node object is relaunched by this code, because it has
+		// joinAddr in the config, it attempts again to connect to the same
+		// no-longer-manager node, and crashes again. this continues forever.
+		//
+		// to avoid this case, in this block, we remove JoinAddr from the
+		// config.
+		n.config.joinAddr = ""
 		n.enableReconnectWatcher()
 	default:
 		if n.repeatedRun {
@@ -292,6 +311,7 @@ func (n *nodeRunner) handleNodeExit(node *swarmnode.Node) {
 // Stop stops the current swarm node if it is running.
 func (n *nodeRunner) Stop() error {
 	n.mu.Lock()
+	n.stopped = true
 	if n.cancelReconnect != nil { // between restarts
 		n.cancelReconnect()
 		n.cancelReconnect = nil
@@ -305,15 +325,18 @@ func (n *nodeRunner) Stop() error {
 		n.mu.Unlock()
 		return nil
 	}
-	n.stopping = true
+	swarmNode := n.swarmNode
+	done := n.done
+	n.mu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	n.mu.Unlock()
-	if err := n.swarmNode.Stop(ctx); err != nil && !strings.Contains(err.Error(), "context canceled") {
+
+	if err := swarmNode.Stop(ctx); err != nil && !strings.Contains(err.Error(), "context canceled") {
 		return err
 	}
 	n.cluster.SendClusterEvent(lncluster.EventNodeLeave)
-	<-n.done
+	<-done
 	return nil
 }
 
@@ -345,14 +368,14 @@ func (n *nodeRunner) State() nodeState {
 }
 
 func (n *nodeRunner) enableReconnectWatcher() {
-	if n.stopping {
+	if n.stopped {
 		return
 	}
 	n.reconnectDelay *= 2
 	if n.reconnectDelay > maxReconnectDelay {
 		n.reconnectDelay = maxReconnectDelay
 	}
-	logrus.Warnf("Restarting swarm in %.2f seconds", n.reconnectDelay.Seconds())
+	log.G(context.TODO()).Warnf("Restarting swarm in %.2f seconds", n.reconnectDelay.Seconds())
 	delayCtx, cancel := context.WithTimeout(context.Background(), n.reconnectDelay)
 	n.cancelReconnect = cancel
 
@@ -363,7 +386,7 @@ func (n *nodeRunner) enableReconnectWatcher() {
 		}
 		n.mu.Lock()
 		defer n.mu.Unlock()
-		if n.stopping {
+		if n.stopped {
 			return
 		}
 

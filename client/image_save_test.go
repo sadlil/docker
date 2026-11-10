@@ -1,58 +1,82 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"fmt"
 	"io"
 	"net/http"
-	"reflect"
-	"strings"
+	"net/url"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestImageSaveError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ImageSave(context.Background(), []string{"nothing"})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
+	armv64 := ocispec.Platform{Architecture: "arm64", OS: "linux", Variant: "v8"}
+	_, err = client.ImageSave(t.Context(), []string{"nothing"}, ImageSaveWithPlatforms(armv64))
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestImageSave(t *testing.T) {
-	expectedURL := "/images/get"
-	client := &Client{
-		client: newMockClient(func(r *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(r.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, r.URL)
-			}
-			query := r.URL.Query()
-			names := query["names"]
-			expectedNames := []string{"image_id1", "image_id2"}
-			if !reflect.DeepEqual(names, expectedNames) {
-				return nil, fmt.Errorf("names not set in URL query properly. Expected %v, got %v", names, expectedNames)
-			}
+	const (
+		expectedURL    = "/images/get"
+		expectedOutput = "outputBody"
+	)
+	tests := []struct {
+		doc                 string
+		options             []ImageSaveOption
+		expectedQueryParams url.Values
+	}{
+		{
+			doc: "no platform",
+			expectedQueryParams: url.Values{
+				"names": {"image_id1", "image_id2"},
+			},
+		},
+		{
+			doc: "platform",
+			options: []ImageSaveOption{
+				ImageSaveWithPlatforms(ocispec.Platform{Architecture: "arm64", OS: "linux", Variant: "v8"}),
+			},
+			expectedQueryParams: url.Values{
+				"names":    {"image_id1", "image_id2"},
+				"platform": {`{"architecture":"arm64","os":"linux","variant":"v8"}`},
+			},
+		},
+		{
+			doc: "multiple platforms",
+			options: []ImageSaveOption{
+				ImageSaveWithPlatforms(
+					ocispec.Platform{Architecture: "arm64", OS: "linux", Variant: "v8"},
+					ocispec.Platform{Architecture: "amd64", OS: "linux"},
+				),
+			},
+			expectedQueryParams: url.Values{
+				"names":    {"image_id1", "image_id2"},
+				"platform": {`{"architecture":"arm64","os":"linux","variant":"v8"}`, `{"architecture":"amd64","os":"linux"}`},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.doc, func(t *testing.T) {
+			client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+				assert.Check(t, assertRequest(req, http.MethodGet, expectedURL))
+				assert.Check(t, is.DeepEqual(req.URL.Query(), tc.expectedQueryParams))
+				return mockResponse(http.StatusOK, nil, expectedOutput)(req)
+			}))
+			assert.NilError(t, err)
+			resp, err := client.ImageSave(t.Context(), []string{"image_id1", "image_id2"}, tc.options...)
+			assert.NilError(t, err)
+			defer func() {
+				assert.NilError(t, resp.Close())
+			}()
 
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader([]byte("response"))),
-			}, nil
-		}),
-	}
-	saveResponse, err := client.ImageSave(context.Background(), []string{"image_id1", "image_id2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	response, err := io.ReadAll(saveResponse)
-	if err != nil {
-		t.Fatal(err)
-	}
-	saveResponse.Close()
-	if string(response) != "response" {
-		t.Fatalf("expected response to contain 'response', got %s", string(response))
+			body, err := io.ReadAll(resp)
+			assert.NilError(t, err)
+			assert.Check(t, is.Equal(string(body), expectedOutput))
+		})
 	}
 }

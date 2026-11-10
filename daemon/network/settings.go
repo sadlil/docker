@@ -1,31 +1,24 @@
-package network // import "github.com/docker/docker/daemon/network"
+package network
 
 import (
 	"net"
+	"slices"
 	"sync"
 
-	networktypes "github.com/docker/docker/api/types/network"
-	clustertypes "github.com/docker/docker/daemon/cluster/provider"
-	"github.com/docker/go-connections/nat"
+	networktypes "github.com/moby/moby/api/types/network"
+	clustertypes "github.com/moby/moby/v2/daemon/cluster/provider"
 	"github.com/pkg/errors"
 )
 
 // Settings stores configuration details about the daemon network config
 // TODO Windows. Many of these fields can be factored out.,
 type Settings struct {
-	Bridge                 string
-	SandboxID              string
-	HairpinMode            bool
-	LinkLocalIPv6Address   string
-	LinkLocalIPv6PrefixLen int
-	Networks               map[string]*EndpointSettings
-	Service                *clustertypes.ServiceConfig
-	Ports                  nat.PortMap
-	SandboxKey             string
-	SecondaryIPAddresses   []networktypes.Address
-	SecondaryIPv6Addresses []networktypes.Address
-	IsAnonymousEndpoint    bool
-	HasSwarmEndpoint       bool
+	SandboxID        string
+	SandboxKey       string
+	Networks         map[string]*EndpointSettings
+	Service          *clustertypes.ServiceConfig
+	Ports            networktypes.PortMap
+	HasSwarmEndpoint bool
 }
 
 // EndpointSettings is a package local wrapper for
@@ -34,6 +27,20 @@ type Settings struct {
 type EndpointSettings struct {
 	*networktypes.EndpointSettings
 	IPAMOperational bool
+	// DesiredMacAddress is the configured value, it's copied from MacAddress (the
+	// API param field) when the container is created.
+	DesiredMacAddress networktypes.HardwareAddr
+}
+
+// Copy returns a deep copy of es.
+func (es *EndpointSettings) Copy() *EndpointSettings {
+	if es == nil {
+		return nil
+	}
+	esCopy := *es
+	esCopy.EndpointSettings = es.EndpointSettings.Copy()
+	esCopy.DesiredMacAddress = slices.Clone(es.DesiredMacAddress)
+	return &esCopy
 }
 
 // AttachmentStore stores the load balancer IP address for a network id.

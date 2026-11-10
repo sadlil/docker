@@ -1,75 +1,66 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"runtime"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/api/types/versions/v1p20"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/ioutils"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/pkg/errors"
 )
 
 // ContainerStats writes information about the container to the stream
 // given in the config object.
 func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, config *backend.ContainerStatsConfig) error {
-	// Engine API version (used for backwards compatibility)
-	apiVersion := config.Version
-
-	if isWindows && versions.LessThan(apiVersion, "1.21") {
-		return errors.New("API versions pre v1.21 do not support stats on Windows")
-	}
-
 	ctr, err := daemon.GetContainer(prefixOrName)
 	if err != nil {
 		return err
 	}
 
-	if config.Stream && config.OneShot {
-		return errdefs.InvalidParameter(errors.New("cannot have stream=true and one-shot=true"))
+	// We take two samples for the first non-streaming result if OneShot
+	// is disabled (OneShot=false), to populate the PreRead and PreCPUStats
+	// fields.
+	var needPrevSample bool
+	if !config.Stream {
+		if !ctr.State.IsRunning() || ctr.State.IsRestarting() {
+			// The container is either not running or restarting, return an empty stats.
+			return json.NewEncoder(config.OutStream()).Encode(&containertypes.StatsResponse{
+				ID:     ctr.ID,
+				Name:   ctr.Name,
+				OSType: runtime.GOOS,
+			})
+		}
+		if config.OneShot {
+			// In OneShot-mode, we only collect a single sample, return immediately.
+			//
+			// In streaming mode, OneShot has no effect, as we never populate
+			// the Pre* fields for the first result.
+			stats, err := daemon.GetContainerStats(ctr)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(config.OutStream()).Encode(stats)
+		}
+
+		// Non-streaming and not OneShot; need two samples to populate Pre*.
+		needPrevSample = true
 	}
 
-	// If the container is either not running or restarting and requires no stream, return an empty stats.
-	if (!ctr.IsRunning() || ctr.IsRestarting()) && !config.Stream {
-		return json.NewEncoder(config.OutStream).Encode(&types.StatsJSON{
-			Name: ctr.Name,
-			ID:   ctr.ID,
-		})
-	}
+	updates, cancel := daemon.subscribeToContainerStats(ctr)
+	defer cancel()
 
-	outStream := config.OutStream
-	if config.Stream {
-		wf := ioutils.NewWriteFlusher(outStream)
-		defer wf.Close()
-		wf.Flush()
-		outStream = wf
-	}
+	var (
+		previousRead     time.Time               // Previous Read time to populate the PreRead field.
+		previousCPUStats containertypes.CPUStats // Previous CPUStats to populate the PreCPUStats field.
+	)
 
-	var preCPUStats types.CPUStats
-	var preRead time.Time
-	getStatJSON := func(v interface{}) *types.StatsJSON {
-		ss := v.(types.StatsJSON)
-		ss.Name = ctr.Name
-		ss.ID = ctr.ID
-		ss.PreCPUStats = preCPUStats
-		ss.PreRead = preRead
-		preCPUStats = ss.CPUStats
-		preRead = ss.Read
-		return &ss
-	}
-
-	enc := json.NewEncoder(outStream)
-
-	updates := daemon.subscribeToContainerStats(ctr)
-	defer daemon.unsubscribeToContainerStats(ctr, updates)
-
-	noStreamFirstFrame := !config.OneShot
+	enc := json.NewEncoder(config.OutStream())
+	enc.SetEscapeHTML(false)
 	for {
 		select {
 		case v, ok := <-updates:
@@ -77,86 +68,97 @@ func (daemon *Daemon) ContainerStats(ctx context.Context, prefixOrName string, c
 				return nil
 			}
 
-			var statsJSON interface{}
-			statsJSONPost120 := getStatJSON(v)
-			if versions.LessThan(apiVersion, "1.21") {
-				var (
-					rxBytes   uint64
-					rxPackets uint64
-					rxErrors  uint64
-					rxDropped uint64
-					txBytes   uint64
-					txPackets uint64
-					txErrors  uint64
-					txDropped uint64
-				)
-				for _, v := range statsJSONPost120.Networks {
-					rxBytes += v.RxBytes
-					rxPackets += v.RxPackets
-					rxErrors += v.RxErrors
-					rxDropped += v.RxDropped
-					txBytes += v.TxBytes
-					txPackets += v.TxPackets
-					txErrors += v.TxErrors
-					txDropped += v.TxDropped
-				}
-				statsJSON = &v1p20.StatsJSON{
-					Stats: statsJSONPost120.Stats,
-					Network: types.NetworkStats{
-						RxBytes:   rxBytes,
-						RxPackets: rxPackets,
-						RxErrors:  rxErrors,
-						RxDropped: rxDropped,
-						TxBytes:   txBytes,
-						TxPackets: txPackets,
-						TxErrors:  txErrors,
-						TxDropped: txDropped,
-					},
-				}
-			} else {
-				statsJSON = statsJSONPost120
+			statsJSON, ok := v.(containertypes.StatsResponse)
+			if !ok {
+				return cerrdefs.ErrInternal.WithMessage("stats: unexpected value type")
 			}
 
-			if !config.Stream && noStreamFirstFrame {
-				// prime the cpu stats so they aren't 0 in the final output
-				noStreamFirstFrame = false
+			if needPrevSample {
+				// Take first sample only to populate Pre* for the next one.
+				previousRead = statsJSON.Read
+				previousCPUStats = statsJSON.CPUStats
+				needPrevSample = false
 				continue
 			}
 
-			if err := enc.Encode(statsJSON); err != nil {
+			statsJSON.PreRead = previousRead
+			statsJSON.PreCPUStats = previousCPUStats
+			if err := enc.Encode(&statsJSON); err != nil {
 				return err
 			}
 
 			if !config.Stream {
 				return nil
 			}
+
+			previousRead = statsJSON.Read
+			previousCPUStats = statsJSON.CPUStats
 		case <-ctx.Done():
 			return nil
 		}
 	}
 }
 
-func (daemon *Daemon) subscribeToContainerStats(c *container.Container) chan interface{} {
-	return daemon.statsCollector.Collect(c)
-}
-
-func (daemon *Daemon) unsubscribeToContainerStats(c *container.Container, ch chan interface{}) {
-	daemon.statsCollector.Unsubscribe(c, ch)
+// subscribeToContainerStats starts collecting stats for the given container.
+// It returns a channel containing [containertypes.StatsResponse] records,
+// and a cancel function to unsubscribe and stop collecting stats.
+func (daemon *Daemon) subscribeToContainerStats(c *container.Container) (updates chan any, cancel func()) {
+	ch := daemon.statsCollector.Collect(c)
+	cancel = func() {
+		daemon.statsCollector.Unsubscribe(c, ch)
+	}
+	return ch, cancel
 }
 
 // GetContainerStats collects all the stats published by a container
-func (daemon *Daemon) GetContainerStats(container *container.Container) (*types.StatsJSON, error) {
-	stats, err := daemon.stats(container)
+func (daemon *Daemon) GetContainerStats(ctr *container.Container) (*containertypes.StatsResponse, error) {
+	stats, err := daemon.stats(ctr)
 	if err != nil {
+		goto done
+	}
+
+	// Sample system CPU usage close to container usage to avoid
+	// noise in metric calculations.
+	// FIXME: move to containerd on Linux (not Windows)
+	stats.CPUStats.SystemUsage, stats.CPUStats.OnlineCPUs, err = getSystemCPUUsage()
+	if err != nil {
+		goto done
+	}
+
+	// On Windows, the builtin (HCS) runtime already provides network stats
+	// embedded in the stats above; the containerd runtime does not, so query
+	// them separately when they're missing.
+	if !ctr.Config.NetworkDisabled && (runtime.GOOS != "windows" || len(stats.Networks) == 0) {
+		stats.Networks, err = daemon.getNetworkStats(ctr)
+	}
+
+done:
+	if err != nil {
+		if cerrdefs.IsNotFound(err) || cerrdefs.IsConflict(err) {
+			// return empty stats containing only name and ID if not running or not found
+			return &containertypes.StatsResponse{
+				ID:     ctr.ID,
+				Name:   ctr.Name,
+				OSType: runtime.GOOS,
+			}, nil
+		}
+		log.G(context.TODO()).Errorf("collecting stats for container %s: %v", ctr.Name, err)
 		return nil, err
 	}
-
-	// We already have the network stats on Windows directly from HCS.
-	if !container.Config.NetworkDisabled && runtime.GOOS != "windows" {
-		if stats.Networks, err = daemon.getNetworkStats(container); err != nil {
-			return nil, err
-		}
-	}
-
 	return stats, nil
+}
+
+// getNetworkSandboxID resolves the network SandboxID, following the chain in
+// case the container reuses another container's network stack.
+func (daemon *Daemon) getNetworkSandboxID(c *container.Container) (string, error) {
+	curr := c
+	for curr.HostConfig.NetworkMode.IsContainer() {
+		containerID := curr.HostConfig.NetworkMode.ConnectedContainer()
+		connected, err := daemon.GetContainer(containerID)
+		if err != nil {
+			return "", errors.Wrapf(err, "Could not get container for %s", containerID)
+		}
+		curr = connected
+	}
+	return curr.NetworkSettings.SandboxID, nil
 }

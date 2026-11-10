@@ -1,2 +1,13 @@
-vendor.mod linguist-language=Go-Module
-vendor.sum linguist-language=Go-Checksums
+Dockerfile* linguist-language=Dockerfile
+
+*.c    diff=cpp
+*.h    diff=cpp
+*.go   diff=golang
+*.md   diff=markdown
+*.py   diff=python
+*.sh   diff=bash
+
+*.pb.go linguist-generated=true
+
+/extpoints/**/*.proto linguist-generated=true
+/extpoints/**/protogen/** linguist-generated=true

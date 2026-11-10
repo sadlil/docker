@@ -1,9 +1,10 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 import (
+	"errors"
 	"fmt"
 	"net"
-	"strings"
+	"net/netip"
 )
 
 const (
@@ -20,13 +21,13 @@ const (
 func resolveListenAddr(specifiedAddr string) (string, string, error) {
 	specifiedHost, specifiedPort, err := net.SplitHostPort(specifiedAddr)
 	if err != nil {
-		return "", "", fmt.Errorf("could not parse listen address %s", specifiedAddr)
+		return "", "", configError("could not parse listen address " + specifiedAddr)
 	}
 	// Does the host component match any of the interface names on the
 	// system? If so, use the address from that interface.
 	specifiedIP, err := resolveInputIPAddr(specifiedHost, true)
 	if err != nil {
-		if err == errBadNetworkIdentifier {
+		if errors.Is(err, errBadNetworkIdentifier) {
 			err = errBadListenAddr
 		}
 		return "", "", err
@@ -57,7 +58,7 @@ func (c *Cluster) resolveAdvertiseAddr(advertiseAddr, listenAddrPort string) (st
 		// system? If so, use the address from that interface.
 		advertiseIP, err := resolveInputIPAddr(advertiseHost, false)
 		if err != nil {
-			if err == errBadNetworkIdentifier {
+			if errors.Is(err, errBadNetworkIdentifier) {
 				err = errBadAdvertiseAddr
 			}
 			return "", "", err
@@ -72,7 +73,7 @@ func (c *Cluster) resolveAdvertiseAddr(advertiseAddr, listenAddrPort string) (st
 		// that interface.
 		defaultAdvertiseIP, err := resolveInputIPAddr(c.config.DefaultAdvertiseAddr, false)
 		if err != nil {
-			if err == errBadNetworkIdentifier {
+			if errors.Is(err, errBadNetworkIdentifier) {
 				err = errBadDefaultAdvertiseAddr
 			}
 			return "", "", err
@@ -90,7 +91,7 @@ func (c *Cluster) resolveAdvertiseAddr(advertiseAddr, listenAddrPort string) (st
 
 // validateDefaultAddrPool validates default address pool
 // it also strips white space from the string before validation
-func validateDefaultAddrPool(defaultAddrPool []string, size uint32) error {
+func validateDefaultAddrPool(defaultAddrPool []netip.Prefix, size uint32) error {
 	if defaultAddrPool == nil {
 		// defaultAddrPool is not defined
 		return nil
@@ -107,16 +108,9 @@ func validateDefaultAddrPool(defaultAddrPool []string, size uint32) error {
 	if size > 29 {
 		return fmt.Errorf("subnet size is out of range: %d", size)
 	}
-	for i := range defaultAddrPool {
-		// trim leading and trailing white spaces
-		defaultAddrPool[i] = strings.TrimSpace(defaultAddrPool[i])
-		_, b, err := net.ParseCIDR(defaultAddrPool[i])
-		if err != nil {
-			return fmt.Errorf("invalid base pool %s: %v", defaultAddrPool[i], err)
-		}
-		ones, _ := b.Mask.Size()
-		if size < uint32(ones) {
-			return fmt.Errorf("invalid CIDR: %q. Subnet size is too small for pool: %d", defaultAddrPool[i], size)
+	for _, a := range defaultAddrPool {
+		if size < uint32(a.Bits()) {
+			return fmt.Errorf("invalid CIDR: %q. Subnet size is too small for pool: %d", a, size)
 		}
 	}
 
@@ -142,6 +136,7 @@ func getDataPathPort(portNum uint32) (uint32, error) {
 	}
 	return portNum, nil
 }
+
 func resolveDataPathAddr(dataPathAddr string) (string, error) {
 	if dataPathAddr == "" {
 		// dataPathAddr is not defined
@@ -150,7 +145,7 @@ func resolveDataPathAddr(dataPathAddr string) (string, error) {
 	// If a data path flag is specified try to resolve the IP address.
 	dataPathIP, err := resolveInputIPAddr(dataPathAddr, false)
 	if err != nil {
-		if err == errBadNetworkIdentifier {
+		if errors.Is(err, errBadNetworkIdentifier) {
 			err = errBadDataPathAddr
 		}
 		return "", err
@@ -205,9 +200,9 @@ func resolveInterfaceAddr(specifiedInterface string) (net.IP, error) {
 }
 
 // resolveInputIPAddr tries to resolve the IP address from the string passed as input
-// - tries to match the string as an interface name, if so returns the IP address associated with it
-// - on failure of previous step tries to parse the string as an IP address itself
-//	 if succeeds returns the IP address
+//   - tries to match the string as an interface name, if so returns the IP address associated with it
+//   - on failure of previous step tries to parse the string as an IP address itself
+//     if succeeds returns the IP address
 func resolveInputIPAddr(input string, isUnspecifiedValid bool) (net.IP, error) {
 	// Try to see if it is an interface name
 	interfaceAddr, err := resolveInterfaceAddr(input)
@@ -215,7 +210,7 @@ func resolveInputIPAddr(input string, isUnspecifiedValid bool) (net.IP, error) {
 		return interfaceAddr, nil
 	}
 	// String matched interface but there is a potential ambiguity to be resolved
-	if err != errNoSuchInterface {
+	if !errors.Is(err, errNoSuchInterface) {
 		return nil, err
 	}
 

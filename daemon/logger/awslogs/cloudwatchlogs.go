@@ -1,30 +1,38 @@
 // Package awslogs provides the logdriver for forwarding container logs to Amazon CloudWatch Logs
-package awslogs // import "github.com/docker/docker/daemon/logger/awslogs"
+package awslogs
 
 import (
+	"bytes"
+	"cmp"
+	"context"
+	"encoding/csv"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
-	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials/endpointcreds"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/docker/docker/dockerversion"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/endpointcreds"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+	"github.com/aws/smithy-go"
+	smithymiddleware "github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/containerd/log"
+	"github.com/moby/moby/v2/daemon/internal/lazyregexp"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/loggerutils"
+	"github.com/moby/moby/v2/daemon/logger/templates"
+	"github.com/moby/moby/v2/dockerversion"
 )
 
 const (
@@ -36,16 +44,24 @@ const (
 	logStreamKey           = "awslogs-stream"
 	logCreateGroupKey      = "awslogs-create-group"
 	logCreateStreamKey     = "awslogs-create-stream"
-	tagKey                 = "tag"
 	datetimeFormatKey      = "awslogs-datetime-format"
 	multilinePatternKey    = "awslogs-multiline-pattern"
-	credentialsEndpointKey = "awslogs-credentials-endpoint" //nolint:gosec // G101: Potential hardcoded credentials
+	credentialsEndpointKey = "awslogs-credentials-endpoint" // #nosec G101 -- Potential hardcoded credentials
 	forceFlushIntervalKey  = "awslogs-force-flush-interval-seconds"
 	maxBufferedEventsKey   = "awslogs-max-buffered-events"
 	logFormatKey           = "awslogs-format"
+	entityServiceNameKey   = "awslogs-entity-service-name"
+	entityEnvironmentKey   = "awslogs-entity-environment"
+	entityAttributesKey    = "awslogs-entity-attributes"
 
 	defaultForceFlushInterval = 5 * time.Second
 	defaultMaxBufferedEvents  = 4096
+
+	// See: https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_Entity.html
+	entityTypeService   = "Service"
+	maxEntityAttributes = 10
+	maxAttributeKey     = 256
+	maxEntityValue      = 512
 
 	// See: http://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html
 	perEventBytes          = 26
@@ -59,14 +75,7 @@ const (
 	// this replacement happens.
 	maximumBytesPerEvent = 262144 - perEventBytes
 
-	resourceAlreadyExistsCode = "ResourceAlreadyExistsException"
-	dataAlreadyAcceptedCode   = "DataAlreadyAcceptedException"
-	invalidSequenceTokenCode  = "InvalidSequenceTokenException"
-	resourceNotFoundCode      = "ResourceNotFoundException"
-
-	credentialsEndpoint = "http://169.254.170.2" //nolint:gosec // G101: Potential hardcoded credentials
-
-	userAgentHeader = "User-Agent"
+	credentialsEndpoint = "http://169.254.170.2" // #nosec G101 -- Potential hardcoded credentials
 
 	// See: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html
 	logsFormatHeader = "x-amzn-logs-format"
@@ -78,14 +87,15 @@ type logStream struct {
 	logGroupName       string
 	logCreateGroup     bool
 	logCreateStream    bool
-	logNonBlocking     bool
 	forceFlushInterval time.Duration
 	multilinePattern   *regexp.Regexp
+	entity             *types.Entity
 	client             api
-	messages           chan *logger.Message
-	lock               sync.RWMutex
-	closed             bool
-	sequenceToken      *string
+
+	messages *loggerutils.MessageQueue
+	closed   atomic.Bool
+
+	sequenceToken *string
 }
 
 type logStreamConfig struct {
@@ -93,38 +103,27 @@ type logStreamConfig struct {
 	logGroupName       string
 	logCreateGroup     bool
 	logCreateStream    bool
-	logNonBlocking     bool
 	forceFlushInterval time.Duration
 	maxBufferedEvents  int
 	multilinePattern   *regexp.Regexp
+	entity             *types.Entity
 }
 
 var _ logger.SizedLogger = &logStream{}
 
 type api interface {
-	CreateLogGroup(*cloudwatchlogs.CreateLogGroupInput) (*cloudwatchlogs.CreateLogGroupOutput, error)
-	CreateLogStream(*cloudwatchlogs.CreateLogStreamInput) (*cloudwatchlogs.CreateLogStreamOutput, error)
-	PutLogEvents(*cloudwatchlogs.PutLogEventsInput) (*cloudwatchlogs.PutLogEventsOutput, error)
+	CreateLogGroup(context.Context, *cloudwatchlogs.CreateLogGroupInput, ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.CreateLogGroupOutput, error)
+	CreateLogStream(context.Context, *cloudwatchlogs.CreateLogStreamInput, ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.CreateLogStreamOutput, error)
+	PutLogEvents(context.Context, *cloudwatchlogs.PutLogEventsInput, ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutLogEventsOutput, error)
 }
 
 type regionFinder interface {
-	Region() (string, error)
+	GetRegion(context.Context, *imds.GetRegionInput, ...func(*imds.Options)) (*imds.GetRegionOutput, error)
 }
 
 type wrappedEvent struct {
-	inputLogEvent *cloudwatchlogs.InputLogEvent
+	inputLogEvent types.InputLogEvent
 	insertOrder   int
-}
-type byTimestamp []wrappedEvent
-
-// init registers the awslogs driver
-func init() {
-	if err := logger.RegisterLogDriver(name, New); err != nil {
-		logrus.Fatal(err)
-	}
-	if err := logger.RegisterLogOptValidator(name, ValidateLogOpt); err != nil {
-		logrus.Fatal(err)
-	}
 }
 
 // eventBatch holds the events that are batched for submission and the
@@ -141,7 +140,8 @@ type eventBatch struct {
 // New creates an awslogs logger using the configuration passed in on the
 // context.  Supported context configuration variables are awslogs-region,
 // awslogs-endpoint, awslogs-group, awslogs-stream, awslogs-create-group,
-// awslogs-multiline-pattern and awslogs-datetime-format.
+// awslogs-multiline-pattern, awslogs-datetime-format, awslogs-entity-service-name,
+// awslogs-entity-environment and awslogs-entity-attributes.
 // When available, configuration is also taken from environment variables
 // AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, the shared credentials
 // file (~/.aws/credentials), and the EC2 Instance Metadata Service.
@@ -155,33 +155,28 @@ func New(info logger.Info) (logger.Logger, error) {
 		return nil, err
 	}
 
+	logNonBlocking := info.Config["mode"] == "non-blocking"
+
 	containerStream := &logStream{
 		logStreamName:      containerStreamConfig.logStreamName,
 		logGroupName:       containerStreamConfig.logGroupName,
 		logCreateGroup:     containerStreamConfig.logCreateGroup,
 		logCreateStream:    containerStreamConfig.logCreateStream,
-		logNonBlocking:     containerStreamConfig.logNonBlocking,
 		forceFlushInterval: containerStreamConfig.forceFlushInterval,
 		multilinePattern:   containerStreamConfig.multilinePattern,
+		entity:             containerStreamConfig.entity,
 		client:             client,
-		messages:           make(chan *logger.Message, containerStreamConfig.maxBufferedEvents),
+		messages:           loggerutils.NewMessageQueue(containerStreamConfig.maxBufferedEvents),
 	}
 
 	creationDone := make(chan bool)
-	if containerStream.logNonBlocking {
+	if logNonBlocking {
+		const maxBackoff = 32
 		go func() {
 			backoff := 1
-			maxBackoff := 32
-			for {
-				// If logger is closed we are done
-				containerStream.lock.RLock()
-				if containerStream.closed {
-					containerStream.lock.RUnlock()
-					break
-				}
-				containerStream.lock.RUnlock()
-				err := containerStream.create()
-				if err == nil {
+			// We're done when the logger is closed
+			for !containerStream.closed.Load() {
+				if err := containerStream.create(); err == nil {
 					break
 				}
 
@@ -189,11 +184,11 @@ func New(info logger.Info) (logger.Logger, error) {
 				if backoff < maxBackoff {
 					backoff *= 2
 				}
-				logrus.
-					WithError(err).
-					WithField("container-id", info.ContainerID).
-					WithField("container-name", info.ContainerName).
-					Error("Error while trying to initialize awslogs. Retrying in: ", backoff, " seconds")
+				log.G(context.TODO()).WithFields(log.Fields{
+					"error":          err,
+					"container-id":   info.ContainerID,
+					"container-name": info.ContainerName,
+				}).Error("Error while trying to initialize awslogs. Retrying in: ", backoff, " seconds")
 			}
 			close(creationDone)
 		}()
@@ -223,8 +218,6 @@ func newStreamConfig(info logger.Info) (*logStreamConfig, error) {
 			return nil, err
 		}
 	}
-
-	logNonBlocking := info.Config["mode"] == "non-blocking"
 
 	forceFlushInterval := defaultForceFlushInterval
 	if info.Config[forceFlushIntervalKey] != "" {
@@ -259,19 +252,140 @@ func newStreamConfig(info logger.Info) (*logStreamConfig, error) {
 		return nil, err
 	}
 
-	containerStreamConfig := &logStreamConfig{
+	entity, err := parseEntity(info)
+	if err != nil {
+		return nil, err
+	}
+
+	return &logStreamConfig{
 		logStreamName:      logStreamName,
 		logGroupName:       logGroupName,
 		logCreateGroup:     logCreateGroup,
 		logCreateStream:    logCreateStream,
-		logNonBlocking:     logNonBlocking,
 		forceFlushInterval: forceFlushInterval,
 		maxBufferedEvents:  maxBufferedEvents,
 		multilinePattern:   multilinePattern,
+		entity:             entity,
+	}, nil
+}
+
+// parseEntity builds a CloudWatch Entity from the awslogs-entity-* log options.
+// It returns a nil entity when none of the entity options are set.
+// The service name and environment values support the same Go-template
+// placeholders as the awslogs-stream and tag options (for example {{.Name}}).
+func parseEntity(info logger.Info) (*types.Entity, error) {
+	serviceNameTmpl := info.Config[entityServiceNameKey]
+	environmentTmpl := info.Config[entityEnvironmentKey]
+	attributesRaw := info.Config[entityAttributesKey]
+
+	if serviceNameTmpl == "" && environmentTmpl == "" && attributesRaw == "" {
+		return nil, nil
+	}
+	if serviceNameTmpl == "" || environmentTmpl == "" {
+		return nil, fmt.Errorf("log opts '%s' and '%s' must both be specified to set a CloudWatch entity", entityServiceNameKey, entityEnvironmentKey)
 	}
 
-	return containerStreamConfig, nil
+	serviceName, err := expandEntityTemplate(info, entityServiceNameKey, serviceNameTmpl)
+	if err != nil {
+		return nil, err
+	}
+	environment, err := expandEntityTemplate(info, entityEnvironmentKey, environmentTmpl)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateKeyAttributeValue(entityServiceNameKey, serviceName); err != nil {
+		return nil, err
+	}
+	if err := validateKeyAttributeValue(entityEnvironmentKey, environment); err != nil {
+		return nil, err
+	}
+
+	attributes, err := parseEntityAttributes(attributesRaw)
+	if err != nil {
+		return nil, err
+	}
+
+	return &types.Entity{
+		KeyAttributes: map[string]string{
+			"Type":        entityTypeService,
+			"Name":        serviceName,
+			"Environment": environment,
+		},
+		Attributes: attributes,
+	}, nil
 }
+
+// validateKeyAttributeValue checks a resolved entity KeyAttribute value against
+// the CloudWatch Entity limits.
+func validateKeyAttributeValue(optKey, val string) error {
+	if val == "" {
+		return fmt.Errorf("log opt '%s' resolved to an empty value", optKey)
+	}
+	if utf8.RuneCountInString(val) > maxEntityValue {
+		return fmt.Errorf("log opt '%s' value exceeds the CloudWatch limit of %d characters", optKey, maxEntityValue)
+	}
+	return nil
+}
+
+// expandEntityTemplate runs an entity log-opt value through the container-aware
+// template engine, the same one used by ParseLogTag.
+func expandEntityTemplate(info logger.Info, optKey, tmplText string) (string, error) {
+	tmpl, err := templates.NewParse(optKey, tmplText)
+	if err != nil {
+		return "", fmt.Errorf("awslogs could not parse log opt %q: %w", optKey, err)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, &info); err != nil {
+		return "", fmt.Errorf("awslogs could not expand log opt %q: %w", optKey, err)
+	}
+	return buf.String(), nil
+}
+
+// parseEntityAttributes parses a comma-separated key=value list into a map,
+// enforcing the CloudWatch Entity attribute limits. Quoting a complete pair
+// preserves commas in its value. Empty entries, such as a trailing comma, are
+// ignored.
+func parseEntityAttributes(raw string) (map[string]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	reader := csv.NewReader(strings.NewReader(raw))
+	reader.TrimLeadingSpace = true
+	records, err := reader.ReadAll()
+	if err != nil || len(records) != 1 {
+		return nil, fmt.Errorf("log opt '%s' must be a comma-separated CSV list of key=value pairs", entityAttributesKey)
+	}
+
+	attributes := map[string]string{}
+	for _, pair := range records[0] {
+		if strings.TrimSpace(pair) == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(pair, "=")
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if !ok || k == "" || v == "" {
+			return nil, fmt.Errorf("log opt '%s' must be a comma-separated list of key=value pairs", entityAttributesKey)
+		}
+		if _, exists := attributes[k]; exists {
+			return nil, fmt.Errorf("log opt '%s' has a duplicate key %q", entityAttributesKey, k)
+		}
+		if utf8.RuneCountInString(k) > maxAttributeKey || utf8.RuneCountInString(v) > maxEntityValue {
+			return nil, fmt.Errorf("log opt '%s' entry %q exceeds CloudWatch limits (key <= %d chars, value <= %d chars)", entityAttributesKey, k, maxAttributeKey, maxEntityValue)
+		}
+		attributes[k] = v
+	}
+	if len(attributes) == 0 {
+		return nil, nil
+	}
+	if len(attributes) > maxEntityAttributes {
+		return nil, fmt.Errorf("log opt '%s' supports at most %d attributes", entityAttributesKey, maxEntityAttributes)
+	}
+	return attributes, nil
+}
+
+// formatSequences matches each strftime format sequence.
+var formatSequences = lazyregexp.New("%.")
 
 // Parses awslogs-multiline-pattern and awslogs-datetime-format options
 // If awslogs-datetime-format is present, convert the format from strftime
@@ -279,23 +393,22 @@ func newStreamConfig(info logger.Info) (*logStreamConfig, error) {
 // If awslogs-multiline-pattern is present, compile regexp and return
 func parseMultilineOptions(info logger.Info) (*regexp.Regexp, error) {
 	dateTimeFormat := info.Config[datetimeFormatKey]
-	multilinePatternKey := info.Config[multilinePatternKey]
+	multilinePattern := info.Config[multilinePatternKey]
 	// strftime input is parsed into a regular expression
 	if dateTimeFormat != "" {
-		// %. matches each strftime format sequence and ReplaceAllStringFunc
+		// match each strftime format sequence and ReplaceAllStringFunc
 		// looks up each format sequence in the conversion table strftimeToRegex
 		// to replace with a defined regular expression
-		r := regexp.MustCompile("%.")
-		multilinePatternKey = r.ReplaceAllStringFunc(dateTimeFormat, func(s string) string {
+		multilinePattern = formatSequences.ReplaceAllStringFunc(dateTimeFormat, func(s string) string {
 			return strftimeToRegex[s]
 		})
 	}
-	if multilinePatternKey != "" {
-		multilinePattern, err := regexp.Compile(multilinePatternKey)
+	if multilinePattern != "" {
+		multilinePatternRe, err := regexp.Compile(multilinePattern)
 		if err != nil {
-			return nil, errors.Wrapf(err, "awslogs could not parse multiline pattern key %q", multilinePatternKey)
+			return nil, fmt.Errorf("awslogs could not parse multiline pattern key %q: %w", multilinePatternRe, err)
 		}
-		return multilinePattern, nil
+		return multilinePatternRe, nil
 	}
 	return nil, nil
 }
@@ -325,12 +438,14 @@ var strftimeToRegex = map[string]string{
 
 // newRegionFinder is a variable such that the implementation
 // can be swapped out for unit tests.
-var newRegionFinder = func() (regionFinder, error) {
-	s, err := session.NewSession()
+var newRegionFinder = func(ctx context.Context) (regionFinder, error) {
+	cfg, err := config.LoadDefaultConfig(ctx) // default config, because we don't yet know the region
 	if err != nil {
 		return nil, err
 	}
-	return ec2metadata.New(s), nil
+
+	client := imds.NewFromConfig(cfg)
+	return client, nil
 }
 
 // newSDKEndpoint is a variable such that the implementation
@@ -341,7 +456,8 @@ var newSDKEndpoint = credentialsEndpoint
 // Customizations to the default client from the SDK include a Docker-specific
 // User-Agent string and automatic region detection using the EC2 Instance
 // Metadata Service when region is otherwise unspecified.
-func newAWSLogsClient(info logger.Info) (api, error) {
+func newAWSLogsClient(info logger.Info, configOpts ...func(*config.LoadOptions) error) (*cloudwatchlogs.Client, error) {
+	ctx := context.TODO()
 	var region, endpoint *string
 	if os.Getenv(regionEnvKey) != "" {
 		region = aws.String(os.Getenv(regionEnvKey))
@@ -353,73 +469,71 @@ func newAWSLogsClient(info logger.Info) (api, error) {
 		endpoint = aws.String(info.Config[endpointKey])
 	}
 	if region == nil || *region == "" {
-		logrus.Info("Trying to get region from EC2 Metadata")
-		ec2MetadataClient, err := newRegionFinder()
+		log.G(ctx).Info("Trying to get region from IMDS")
+		regFinder, err := newRegionFinder(context.TODO())
 		if err != nil {
-			logrus.WithError(err).Error("could not create EC2 metadata client")
-			return nil, errors.Wrap(err, "could not create EC2 metadata client")
+			log.G(ctx).WithError(err).Error("could not create regionFinder")
+			return nil, fmt.Errorf("could not create regionFinder: %w", err)
 		}
 
-		r, err := ec2MetadataClient.Region()
+		r, err := regFinder.GetRegion(context.TODO(), &imds.GetRegionInput{})
 		if err != nil {
-			logrus.WithError(err).Error("Could not get region from EC2 metadata, environment, or log option")
-			return nil, errors.New("Cannot determine region for awslogs driver")
+			log.G(ctx).WithError(err).Error("Could not get region from IMDS, environment, or log option")
+			return nil, fmt.Errorf("cannot determine region for awslogs driver: %w", err)
 		}
-		region = &r
+		region = &r.Region
 	}
 
-	sess, err := session.NewSession()
-	if err != nil {
-		return nil, errors.New("Failed to create a service client session for awslogs driver")
-	}
-
-	// attach region to cloudwatchlogs config
-	sess.Config.Region = region
-
-	// attach endpoint to cloudwatchlogs config
-	if endpoint != nil {
-		sess.Config.Endpoint = endpoint
-	}
+	configOpts = append(configOpts, config.WithRegion(*region))
 
 	if uri, ok := info.Config[credentialsEndpointKey]; ok {
-		logrus.Debugf("Trying to get credentials from awslogs-credentials-endpoint")
+		log.G(ctx).Debugf("Trying to get credentials from awslogs-credentials-endpoint")
 
-		endpoint := fmt.Sprintf("%s%s", newSDKEndpoint, uri)
-		creds := endpointcreds.NewCredentialsClient(*sess.Config, sess.Handlers, endpoint,
-			func(p *endpointcreds.Provider) {
-				p.ExpiryWindow = 5 * time.Minute
-			})
-
-		// attach credentials to cloudwatchlogs config
-		sess.Config.Credentials = creds
+		ep := newSDKEndpoint + uri
+		configOpts = append(configOpts, config.WithCredentialsProvider(endpointcreds.New(ep)))
 	}
 
-	logrus.WithFields(logrus.Fields{
+	cfg, err := config.LoadDefaultConfig(context.TODO(), configOpts...)
+	if err != nil {
+		log.G(ctx).WithError(err).Error("Could not initialize AWS SDK config")
+		return nil, fmt.Errorf("could not initialize AWS SDK config: %w", err)
+	}
+
+	log.G(ctx).WithFields(log.Fields{
 		"region": *region,
 	}).Debug("Created awslogs client")
 
-	client := cloudwatchlogs.New(sess)
-
-	client.Handlers.Build.PushBackNamed(request.NamedHandler{
-		Name: "DockerUserAgentHandler",
-		Fn: func(r *request.Request) {
-			currentAgent := r.HTTPRequest.Header.Get(userAgentHeader)
-			r.HTTPRequest.Header.Set(userAgentHeader,
-				fmt.Sprintf("Docker %s (%s) %s",
-					dockerversion.Version, runtime.GOOS, currentAgent))
-		},
-	})
+	var clientOpts []func(*cloudwatchlogs.Options)
 
 	if info.Config[logFormatKey] != "" {
-		client.Handlers.Build.PushBackNamed(request.NamedHandler{
-			Name: "LogFormatHeaderHandler",
-			Fn: func(req *request.Request) {
-				req.HTTPRequest.Header.Set(logsFormatHeader, info.Config[logFormatKey])
-			},
+		logFormatMiddleware := smithymiddleware.BuildMiddlewareFunc("logFormat", func(
+			ctx context.Context, in smithymiddleware.BuildInput, next smithymiddleware.BuildHandler,
+		) (
+			out smithymiddleware.BuildOutput, metadata smithymiddleware.Metadata, err error,
+		) {
+			switch v := in.Request.(type) {
+			case *smithyhttp.Request:
+				v.Header.Add(logsFormatHeader, jsonEmfLogFormat)
+			}
+			return next.HandleBuild(ctx, in)
 		})
+		clientOpts = append(
+			clientOpts,
+			cloudwatchlogs.WithAPIOptions(func(stack *smithymiddleware.Stack) error {
+				return stack.Build.Add(logFormatMiddleware, smithymiddleware.Before)
+			}),
+		)
 	}
 
-	return client, nil
+	clientOpts = append(
+		clientOpts,
+		cloudwatchlogs.WithAPIOptions(middleware.AddUserAgentKeyValue("Docker", dockerversion.Version)),
+		func(o *cloudwatchlogs.Options) {
+			o.BaseEndpoint = endpoint
+		},
+	)
+
+	return cloudwatchlogs.NewFromConfig(cfg, clientOpts...), nil
 }
 
 // Name returns the name of the awslogs logging driver
@@ -432,33 +546,26 @@ func (l *logStream) BufSize() int {
 	return maximumBytesPerEvent
 }
 
+var errClosed = errors.New("awslogs is closed")
+
 // Log submits messages for logging by an instance of the awslogs logging driver
 func (l *logStream) Log(msg *logger.Message) error {
-	l.lock.RLock()
-	defer l.lock.RUnlock()
-	if l.closed {
-		return errors.New("awslogs is closed")
-	}
-	if l.logNonBlocking {
-		select {
-		case l.messages <- msg:
-			return nil
-		default:
-			return errors.New("awslogs buffer is full")
+	// No need to check if we are closed here since the queue will be closed
+	// (i.e. returns false) in this case.
+	ctx := context.TODO()
+	if err := l.messages.Enqueue(ctx, msg); err != nil {
+		if errors.Is(err, loggerutils.ErrQueueClosed) {
+			return errClosed
 		}
+		return err
 	}
-	l.messages <- msg
 	return nil
 }
 
 // Close closes the instance of the awslogs logging driver
 func (l *logStream) Close() error {
-	l.lock.Lock()
-	defer l.lock.Unlock()
-	if !l.closed {
-		close(l.messages)
-	}
-	l.closed = true
+	l.closed.Store(true)
+	l.messages.Close()
 	return nil
 }
 
@@ -468,37 +575,37 @@ func (l *logStream) create() error {
 	if err == nil {
 		return nil
 	}
-	if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == resourceNotFoundCode && l.logCreateGroup {
+
+	if _, ok := errors.AsType[*types.ResourceNotFoundException](err); ok && l.logCreateGroup {
 		if err := l.createLogGroup(); err != nil {
-			return errors.Wrap(err, "failed to create Cloudwatch log group")
+			return fmt.Errorf("failed to create Cloudwatch log group: %w", err)
 		}
 		err = l.createLogStream()
 		if err == nil {
 			return nil
 		}
 	}
-	return errors.Wrap(err, "failed to create Cloudwatch log stream")
+	return fmt.Errorf("failed to create Cloudwatch log stream: %w", err)
 }
 
 // createLogGroup creates a log group for the instance of the awslogs logging driver
 func (l *logStream) createLogGroup() error {
-	if _, err := l.client.CreateLogGroup(&cloudwatchlogs.CreateLogGroupInput{
+	if _, err := l.client.CreateLogGroup(context.TODO(), &cloudwatchlogs.CreateLogGroupInput{
 		LogGroupName: aws.String(l.logGroupName),
 	}); err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			fields := logrus.Fields{
-				"errorCode":      awsErr.Code(),
-				"message":        awsErr.Message(),
-				"origError":      awsErr.OrigErr(),
+		if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+			logr := log.G(context.TODO()).WithFields(log.Fields{
+				"errorCode":      apiErr.ErrorCode(),
+				"message":        apiErr.ErrorMessage(),
 				"logGroupName":   l.logGroupName,
 				"logCreateGroup": l.logCreateGroup,
-			}
-			if awsErr.Code() == resourceAlreadyExistsCode {
+			})
+			if _, ok := apiErr.(*types.ResourceAlreadyExistsException); ok {
 				// Allow creation to succeed
-				logrus.WithFields(fields).Info("Log group already exists")
+				logr.Info("Log group already exists")
 				return nil
 			}
-			logrus.WithFields(fields).Error("Failed to create log group")
+			logr.Error("Failed to create log group")
 		}
 		return err
 	}
@@ -509,7 +616,7 @@ func (l *logStream) createLogGroup() error {
 func (l *logStream) createLogStream() error {
 	// Directly return if we do not want to create log stream.
 	if !l.logCreateStream {
-		logrus.WithFields(logrus.Fields{
+		log.G(context.TODO()).WithFields(log.Fields{
 			"logGroupName":    l.logGroupName,
 			"logStreamName":   l.logStreamName,
 			"logCreateStream": l.logCreateStream,
@@ -522,23 +629,21 @@ func (l *logStream) createLogStream() error {
 		LogStreamName: aws.String(l.logStreamName),
 	}
 
-	_, err := l.client.CreateLogStream(input)
-
+	_, err := l.client.CreateLogStream(context.TODO(), input)
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			fields := logrus.Fields{
-				"errorCode":     awsErr.Code(),
-				"message":       awsErr.Message(),
-				"origError":     awsErr.OrigErr(),
+		if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+			logr := log.G(context.TODO()).WithFields(log.Fields{
+				"errorCode":     apiErr.ErrorCode(),
+				"message":       apiErr.ErrorMessage(),
 				"logGroupName":  l.logGroupName,
 				"logStreamName": l.logStreamName,
-			}
-			if awsErr.Code() == resourceAlreadyExistsCode {
+			})
+			if _, ok := apiErr.(*types.ResourceAlreadyExistsException); ok {
 				// Allow creation to succeed
-				logrus.WithFields(fields).Info("Log stream already exists")
+				logr.Info("Log stream already exists")
 				return nil
 			}
-			logrus.WithFields(fields).Error("Failed to create log stream")
+			logr.Error("Failed to create log stream")
 		}
 	}
 	return err
@@ -557,8 +662,10 @@ var newTicker = func(freq time.Duration) *time.Ticker {
 // pattern match is found, at which point the messages in the event buffer are
 // pushed to CloudWatch logs as a single log event.  Multiline messages are processed
 // according to the maximumBytesPerPut constraint, and the implementation only
-// allows for messages to be buffered for a maximum of 2*batchPublishFrequency
-// seconds.  When events are ready to be processed for submission to CloudWatch
+// allows for messages to be buffered for a maximum of 2*l.forceFlushInterval
+// seconds.  If no forceFlushInterval is specified for the log stream, then the default
+// of 5 seconds will be used resulting in a maximum of 10 seconds buffer time for multiline
+// messages. When events are ready to be processed for submission to CloudWatch
 // Logs, the processEvents method is called.  If a multiline pattern is not
 // configured, log events are submitted to the processEvents method immediately.
 func (l *logStream) collectBatch(created chan bool) {
@@ -571,7 +678,9 @@ func (l *logStream) collectBatch(created chan bool) {
 	ticker := newTicker(flushInterval)
 	var eventBuffer []byte
 	var eventBufferTimestamp int64
-	var batch = newEventBatch()
+	batch := newEventBatch()
+
+	chLogs := l.messages.Receiver()
 	for {
 		select {
 		case t := <-ticker.C:
@@ -587,7 +696,7 @@ func (l *logStream) collectBatch(created chan bool) {
 			}
 			l.publishBatch(batch)
 			batch.reset()
-		case msg, more := <-l.messages:
+		case msg, more := <-chLogs:
 			if !more {
 				// Flush event buffer and release resources
 				l.processEvent(batch, eventBuffer, eventBufferTimestamp)
@@ -623,8 +732,8 @@ func (l *logStream) collectBatch(created chan bool) {
 }
 
 // processEvent processes log events that are ready for submission to CloudWatch
-// logs.  Batching is performed on time- and size-bases.  Time-based batching
-// occurs at a 5 second interval (defined in the batchPublishFrequency const).
+// logs.  Batching is performed on time- and size-bases.  Time-based batching occurs
+// at the interval defined by awslogs-force-flush-interval-seconds (defaults to 5 seconds).
 // Size-based batching is performed on the maximum number of events per batch
 // (defined in maximumLogEventsPerPut) and the maximum number of total bytes in a
 // batch (defined in maximumBytesPerPut).  Log messages are split by the maximum
@@ -642,7 +751,7 @@ func (l *logStream) processEvent(batch *eventBatch, bytes []byte, timestamp int6
 		splitOffset, lineBytes := findValidSplit(string(bytes), maximumBytesPerEvent)
 		line := bytes[:splitOffset]
 		event := wrappedEvent{
-			inputLogEvent: &cloudwatchlogs.InputLogEvent{
+			inputLogEvent: types.InputLogEvent{
 				Message:   aws.String(string(line)),
 				Timestamp: aws.Int64(timestamp),
 			},
@@ -666,8 +775,8 @@ func (l *logStream) processEvent(batch *eventBatch, bytes []byte, timestamp int6
 // utf8.RuneError)
 func effectiveLen(line string) int {
 	effectiveBytes := 0
-	for _, rune := range line {
-		effectiveBytes += utf8.RuneLen(rune)
+	for _, r := range line {
+		effectiveBytes += utf8.RuneLen(r)
 	}
 	return effectiveBytes
 }
@@ -679,15 +788,13 @@ func effectiveLen(line string) int {
 // UTF-8 encoded bytes with the Unicode replacement character (a 3-byte UTF-8
 // sequence, represented in Go as utf8.RuneError)
 func findValidSplit(line string, maxBytes int) (splitOffset, effectiveBytes int) {
-	for offset, rune := range line {
-		splitOffset = offset
-		if effectiveBytes+utf8.RuneLen(rune) > maxBytes {
-			return splitOffset, effectiveBytes
+	for offset, char := range line {
+		if effectiveBytes+utf8.RuneLen(char) > maxBytes {
+			return offset, effectiveBytes
 		}
-		effectiveBytes += utf8.RuneLen(rune)
+		effectiveBytes += utf8.RuneLen(char)
 	}
-	splitOffset = len(line)
-	return
+	return len(line), effectiveBytes
 }
 
 // publishBatch calls PutLogEvents for a given set of InputLogEvents,
@@ -700,77 +807,85 @@ func (l *logStream) publishBatch(batch *eventBatch) {
 	cwEvents := unwrapEvents(batch.events())
 
 	nextSequenceToken, err := l.putLogEvents(cwEvents, l.sequenceToken)
-
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			if awsErr.Code() == dataAlreadyAcceptedCode {
-				// already submitted, just grab the correct sequence token
-				parts := strings.Split(awsErr.Message(), " ")
-				nextSequenceToken = &parts[len(parts)-1]
-				logrus.WithFields(logrus.Fields{
-					"errorCode":     awsErr.Code(),
-					"message":       awsErr.Message(),
-					"logGroupName":  l.logGroupName,
-					"logStreamName": l.logStreamName,
-				}).Info("Data already accepted, ignoring error")
-				err = nil
-			} else if awsErr.Code() == invalidSequenceTokenCode {
-				// sequence code is bad, grab the correct one and retry
-				parts := strings.Split(awsErr.Message(), " ")
-				token := parts[len(parts)-1]
-				nextSequenceToken, err = l.putLogEvents(cwEvents, &token)
-			}
+		if apiErr := (*types.DataAlreadyAcceptedException)(nil); errors.As(err, &apiErr) {
+			// already submitted, just grab the correct sequence token
+			nextSequenceToken = apiErr.ExpectedSequenceToken
+			log.G(context.TODO()).WithFields(log.Fields{
+				"errorCode":     apiErr.ErrorCode(),
+				"message":       apiErr.ErrorMessage(),
+				"logGroupName":  l.logGroupName,
+				"logStreamName": l.logStreamName,
+			}).Info("Data already accepted, ignoring error")
+			err = nil
+		} else if apiErr := (*types.InvalidSequenceTokenException)(nil); errors.As(err, &apiErr) {
+			nextSequenceToken, err = l.putLogEvents(cwEvents, apiErr.ExpectedSequenceToken)
 		}
 	}
 	if err != nil {
-		logrus.Error(err)
+		log.G(context.TODO()).Error(err)
 	} else {
 		l.sequenceToken = nextSequenceToken
 	}
 }
 
 // putLogEvents wraps the PutLogEvents API
-func (l *logStream) putLogEvents(events []*cloudwatchlogs.InputLogEvent, sequenceToken *string) (*string, error) {
-	input := &cloudwatchlogs.PutLogEventsInput{
+func (l *logStream) putLogEvents(events []types.InputLogEvent, sequenceToken *string) (*string, error) {
+	resp, err := l.client.PutLogEvents(context.TODO(), &cloudwatchlogs.PutLogEventsInput{
 		LogEvents:     events,
 		SequenceToken: sequenceToken,
 		LogGroupName:  aws.String(l.logGroupName),
 		LogStreamName: aws.String(l.logStreamName),
-	}
-	resp, err := l.client.PutLogEvents(input)
+		Entity:        l.entity,
+	})
 	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok {
-			logrus.WithFields(logrus.Fields{
-				"errorCode":     awsErr.Code(),
-				"message":       awsErr.Message(),
-				"origError":     awsErr.OrigErr(),
+		if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+			log.G(context.TODO()).WithFields(log.Fields{
+				"errorCode":     apiErr.ErrorCode(),
+				"message":       apiErr.ErrorMessage(),
 				"logGroupName":  l.logGroupName,
 				"logStreamName": l.logStreamName,
 			}).Error("Failed to put log events")
 		}
 		return nil, err
 	}
+	if resp.RejectedEntityInfo != nil {
+		log.G(context.TODO()).WithFields(log.Fields{
+			"errorType":     resp.RejectedEntityInfo.ErrorType,
+			"logGroupName":  l.logGroupName,
+			"logStreamName": l.logStreamName,
+		}).Warn("CloudWatch rejected the entity metadata")
+		// Entity configuration is immutable for the stream, so do not keep
+		// sending metadata that the service has already rejected.
+		l.entity = nil
+	}
 	return resp.NextSequenceToken, nil
 }
 
 // ValidateLogOpt looks for awslogs-specific log options awslogs-region, awslogs-endpoint
-// awslogs-group, awslogs-stream, awslogs-create-group, awslogs-datetime-format,
-// awslogs-multiline-pattern
+// awslogs-group, awslogs-stream, awslogs-create-group, awslogs-create-stream, awslogs-datetime-format,
+// awslogs-multiline-pattern, awslogs-entity-service-name, awslogs-entity-environment and
+// awslogs-entity-attributes
 func ValidateLogOpt(cfg map[string]string) error {
 	for key := range cfg {
 		switch key {
+		case logger.AttrLogTag:
+			continue
 		case logGroupKey:
 		case logStreamKey:
 		case logCreateGroupKey:
+		case logCreateStreamKey:
 		case regionKey:
 		case endpointKey:
-		case tagKey:
 		case datetimeFormatKey:
 		case multilinePatternKey:
 		case credentialsEndpointKey:
 		case forceFlushIntervalKey:
 		case maxBufferedEventsKey:
 		case logFormatKey:
+		case entityServiceNameKey:
+		case entityEnvironmentKey:
+		case entityAttributesKey:
 		default:
 			return fmt.Errorf("unknown log opt '%s' for %s log driver", key, name)
 		}
@@ -781,6 +896,11 @@ func ValidateLogOpt(cfg map[string]string) error {
 	if cfg[logCreateGroupKey] != "" {
 		if _, err := strconv.ParseBool(cfg[logCreateGroupKey]); err != nil {
 			return fmt.Errorf("must specify valid value for log opt '%s': %v", logCreateGroupKey, err)
+		}
+	}
+	if cfg[logCreateStreamKey] != "" {
+		if _, err := strconv.ParseBool(cfg[logCreateStreamKey]); err != nil {
+			return fmt.Errorf("must specify valid value for log opt '%s': %v", logCreateStreamKey, err)
 		}
 	}
 	if cfg[forceFlushIntervalKey] != "" {
@@ -809,39 +929,21 @@ func ValidateLogOpt(cfg map[string]string) error {
 		}
 	}
 
+	serviceNameSet := cfg[entityServiceNameKey] != ""
+	environmentSet := cfg[entityEnvironmentKey] != ""
+	attributesSet := cfg[entityAttributesKey] != ""
+	if (serviceNameSet || environmentSet || attributesSet) && (!serviceNameSet || !environmentSet) {
+		return fmt.Errorf("log opts '%s' and '%s' must be configured together", entityServiceNameKey, entityEnvironmentKey)
+	}
+	if _, err := parseEntityAttributes(cfg[entityAttributesKey]); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-// Len returns the length of a byTimestamp slice.  Len is required by the
-// sort.Interface interface.
-func (slice byTimestamp) Len() int {
-	return len(slice)
-}
-
-// Less compares two values in a byTimestamp slice by Timestamp.  Less is
-// required by the sort.Interface interface.
-func (slice byTimestamp) Less(i, j int) bool {
-	iTimestamp, jTimestamp := int64(0), int64(0)
-	if slice != nil && slice[i].inputLogEvent.Timestamp != nil {
-		iTimestamp = *slice[i].inputLogEvent.Timestamp
-	}
-	if slice != nil && slice[j].inputLogEvent.Timestamp != nil {
-		jTimestamp = *slice[j].inputLogEvent.Timestamp
-	}
-	if iTimestamp == jTimestamp {
-		return slice[i].insertOrder < slice[j].insertOrder
-	}
-	return iTimestamp < jTimestamp
-}
-
-// Swap swaps two values in a byTimestamp slice with each other.  Swap is
-// required by the sort.Interface interface.
-func (slice byTimestamp) Swap(i, j int) {
-	slice[i], slice[j] = slice[j], slice[i]
-}
-
-func unwrapEvents(events []wrappedEvent) []*cloudwatchlogs.InputLogEvent {
-	cwEvents := make([]*cloudwatchlogs.InputLogEvent, len(events))
+func unwrapEvents(events []wrappedEvent) []types.InputLogEvent {
+	cwEvents := make([]types.InputLogEvent, len(events))
 	for i, input := range events {
 		cwEvents[i] = input.inputLogEvent
 	}
@@ -856,12 +958,25 @@ func newEventBatch() *eventBatch {
 }
 
 // events returns a slice of wrappedEvents sorted in order of their
-// timestamps and then by their insertion order (see `byTimestamp`).
+// timestamps and then by their insertion order.
 //
 // Warning: this method is not threadsafe and must not be used
 // concurrently.
 func (b *eventBatch) events() []wrappedEvent {
-	sort.Sort(byTimestamp(b.batch))
+	slices.SortFunc(b.batch, func(a, b wrappedEvent) int {
+		aTimestamp, bTimestamp := int64(0), int64(0)
+		if a.inputLogEvent.Timestamp != nil {
+			aTimestamp = *a.inputLogEvent.Timestamp
+		}
+		if b.inputLogEvent.Timestamp != nil {
+			bTimestamp = *b.inputLogEvent.Timestamp
+		}
+
+		if c := cmp.Compare(aTimestamp, bTimestamp); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.insertOrder, b.insertOrder)
+	})
 	return b.batch
 }
 
@@ -877,7 +992,7 @@ func (b *eventBatch) add(event wrappedEvent, size int) bool {
 
 	// verify we are still within service limits
 	switch {
-	case len(b.batch)+1 > maximumLogEventsPerPut:
+	case len(b.batch) >= maximumLogEventsPerPut:
 		return false
 	case b.bytes+addBytes > maximumBytesPerPut:
 		return false

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-export SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPTDIR}/.validate"
 
 adds=$(validate_diff --numstat | awk '{ s += $1 } END { print s }')
@@ -13,7 +13,7 @@ dels=$(validate_diff --numstat | awk '{ s += $2 } END { print s }')
 # "Username may only contain alphanumeric characters or dashes and cannot begin with a dash"
 githubUsernameRegex='[a-zA-Z0-9][a-zA-Z0-9-]+'
 
-# https://github.com/docker/docker/blob/master/CONTRIBUTING.md#sign-your-work
+# https://github.com/moby/moby/blob/master/CONTRIBUTING.md#sign-your-work
 dcoPrefix='Signed-off-by:'
 dcoRegex="^(Docker-DCO-1.1-)?$dcoPrefix ([^<]+) <([^<>@]+@[^<>]+)>( \\(github: ($githubUsernameRegex)\\))?$"
 
@@ -46,8 +46,8 @@ else
 			echo
 			echo 'Please amend each commit to include a properly formatted DCO marker.'
 			echo
-			echo 'Visit the following URL for information about the Docker DCO:'
-			echo ' https://github.com/docker/docker/blob/master/CONTRIBUTING.md#sign-your-work'
+			echo 'Visit the following URL for information about the DCO:'
+			echo ' https://github.com/moby/moby/blob/master/CONTRIBUTING.md#sign-your-work'
 			echo
 		} >&2
 		false

@@ -1,12 +1,12 @@
-package authorization // import "github.com/docker/docker/pkg/authorization"
+package authorization
 
 import (
 	"context"
 	"net/http"
 	"sync"
 
-	"github.com/docker/docker/pkg/plugingetter"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+	"github.com/moby/moby/v2/pkg/plugingetter"
 )
 
 // Middleware uses a list of plugins to
@@ -65,7 +65,7 @@ func (m *Middleware) WrapHandler(handler func(ctx context.Context, w http.Respon
 		// Default authorization using existing TLS connection credentials
 		// FIXME: Non trivial authorization mechanisms (such as advanced certificate validations, kerberos support
 		// and ldap) will be extracted using AuthN feature, which is tracked under:
-		// https://github.com/docker/docker/pull/20883
+		// https://github.com/moby/moby/pull/20883
 		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
 			user = r.TLS.PeerCertificates[0].Subject.CommonName
 			userAuthNMethod = "TLS"
@@ -74,7 +74,7 @@ func (m *Middleware) WrapHandler(handler func(ctx context.Context, w http.Respon
 		authCtx := NewCtx(plugins, user, userAuthNMethod, r.Method, r.RequestURI)
 
 		if err := authCtx.AuthZRequest(w, r); err != nil {
-			logrus.Errorf("AuthZRequest for %s %s returned error: %s", r.Method, r.RequestURI, err)
+			log.G(ctx).Errorf("AuthZRequest for %s %s returned error: %s", r.Method, r.RequestURI, err)
 			return err
 		}
 
@@ -83,21 +83,21 @@ func (m *Middleware) WrapHandler(handler func(ctx context.Context, w http.Respon
 		var errD error
 
 		if errD = handler(ctx, rw, r, vars); errD != nil {
-			logrus.Errorf("Handler for %s %s returned error: %s", r.Method, r.RequestURI, errD)
+			log.G(ctx).Errorf("Handler for %s %s returned error: %s", r.Method, r.RequestURI, errD)
 		}
 
 		// There's a chance that the authCtx.plugins was updated. One of the reasons
 		// this can happen is when an authzplugin is disabled.
 		plugins = m.getAuthzPlugins()
 		if len(plugins) == 0 {
-			logrus.Debug("There are no authz plugins in the chain")
+			log.G(ctx).Debug("There are no authz plugins in the chain")
 			return nil
 		}
 
 		authCtx.plugins = plugins
 
 		if err := authCtx.AuthZResponse(rw, r); errD == nil && err != nil {
-			logrus.Errorf("AuthZResponse for %s %s returned error: %s", r.Method, r.RequestURI, err)
+			log.G(ctx).Errorf("AuthZResponse for %s %s returned error: %s", r.Method, r.RequestURI, err)
 			return err
 		}
 

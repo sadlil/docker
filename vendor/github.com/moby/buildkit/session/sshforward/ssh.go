@@ -1,14 +1,13 @@
 package sshforward
 
 import (
-	"io/ioutil"
+	"context"
 	"net"
 	"os"
 	"path/filepath"
 
 	"github.com/moby/buildkit/session"
 	"github.com/pkg/errors"
-	context "golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/metadata"
 )
@@ -27,7 +26,7 @@ func (s *server) run(ctx context.Context, l net.Listener, id string) error {
 
 	eg.Go(func() error {
 		<-ctx.Done()
-		return ctx.Err()
+		return context.Cause(ctx)
 	})
 
 	eg.Go(func() error {
@@ -38,18 +37,19 @@ func (s *server) run(ctx context.Context, l net.Listener, id string) error {
 			}
 
 			client := NewSSHClient(s.caller.Conn())
+			rpcCtx := s.caller.Context(ctx)
 
 			opts := make(map[string][]string)
 			opts[KeySSHID] = []string{id}
-			ctx = metadata.NewOutgoingContext(ctx, opts)
+			rpcCtx = metadata.NewOutgoingContext(rpcCtx, opts)
 
-			stream, err := client.ForwardAgent(ctx)
+			stream, err := client.ForwardAgent(rpcCtx)
 			if err != nil {
 				conn.Close()
 				return err
 			}
 
-			go Copy(ctx, conn, stream, stream.CloseSend)
+			go Copy(rpcCtx, conn, stream, stream.CloseSend)
 		}
 	})
 
@@ -64,7 +64,7 @@ type SocketOpt struct {
 }
 
 func MountSSHSocket(ctx context.Context, c session.Caller, opt SocketOpt) (sockPath string, closer func() error, err error) {
-	dir, err := ioutil.TempDir("", ".buildkit-ssh-sock")
+	dir, err := os.MkdirTemp("", ".buildkit-ssh-sock")
 	if err != nil {
 		return "", nil, errors.WithStack(err)
 	}
@@ -81,7 +81,8 @@ func MountSSHSocket(ctx context.Context, c session.Caller, opt SocketOpt) (sockP
 
 	sockPath = filepath.Join(dir, "ssh_auth_sock")
 
-	l, err := net.Listen("unix", sockPath)
+	listener := net.ListenConfig{}
+	l, err := listener.Listen(context.TODO(), "unix", sockPath)
 	if err != nil {
 		return "", nil, errors.WithStack(err)
 	}
@@ -112,6 +113,7 @@ func MountSSHSocket(ctx context.Context, c session.Caller, opt SocketOpt) (sockP
 }
 
 func CheckSSHID(ctx context.Context, c session.Caller, id string) error {
+	ctx = c.Context(ctx)
 	client := NewSSHClient(c.Conn())
 	_, err := client.CheckAgent(ctx, &CheckAgentRequest{ID: id})
 	return errors.WithStack(err)

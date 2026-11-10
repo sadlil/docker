@@ -5,44 +5,60 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/internal/testutil"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
-func (s *DockerSuite) TestPluginLogDriver(c *testing.T) {
+type DockerCLIPluginLogDriverSuite struct {
+	ds *DockerSuite
+}
+
+func (s *DockerCLIPluginLogDriverSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
+}
+
+func (s *DockerCLIPluginLogDriverSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
+}
+
+func (s *DockerCLIPluginLogDriverSuite) TestPluginLogDriver(c *testing.T) {
 	testRequires(c, IsAmd64, DaemonIsLinux)
 
-	pluginName := "cpuguy83/docker-logdriver-test:latest"
+	const pluginName = "cpuguy83/docker-logdriver-test:latest"
 
-	dockerCmd(c, "plugin", "install", pluginName)
-	dockerCmd(c, "run", "--log-driver", pluginName, "--name=test", "busybox", "echo", "hello")
-	out, _ := dockerCmd(c, "logs", "test")
+	cli.DockerCmd(c, "plugin", "install", pluginName)
+	cli.DockerCmd(c, "run", "--log-driver", pluginName, "--name=test", "busybox", "echo", "hello")
+	out := cli.DockerCmd(c, "logs", "test").Combined()
 	assert.Equal(c, strings.TrimSpace(out), "hello")
 
-	dockerCmd(c, "start", "-a", "test")
-	out, _ = dockerCmd(c, "logs", "test")
-	assert.Equal(c, strings.TrimSpace(out), "hello\nhello")
+	cli.DockerCmd(c, "start", "-a", "test")
+	out = cli.DockerCmd(c, "logs", "test").Combined()
+	assert.Equal(c, strings.TrimSpace(out), "hello\nhello") //nolint:dupword
 
-	dockerCmd(c, "rm", "test")
-	dockerCmd(c, "plugin", "disable", pluginName)
-	dockerCmd(c, "plugin", "rm", pluginName)
+	cli.DockerCmd(c, "rm", "test")
+	cli.DockerCmd(c, "plugin", "disable", pluginName)
+	cli.DockerCmd(c, "plugin", "rm", pluginName)
 }
 
 // Make sure log drivers are listed in info, and v2 plugins are not.
-func (s *DockerSuite) TestPluginLogDriverInfoList(c *testing.T) {
+func (s *DockerCLIPluginLogDriverSuite) TestPluginLogDriverInfoList(c *testing.T) {
 	testRequires(c, IsAmd64, DaemonIsLinux)
-	pluginName := "cpuguy83/docker-logdriver-test"
+	const pluginName = "cpuguy83/docker-logdriver-test"
 
-	dockerCmd(c, "plugin", "install", pluginName)
+	cli.DockerCmd(c, "plugin", "install", pluginName)
 
-	cli, err := client.NewClientWithOpts(client.FromEnv)
+	apiClient, err := client.New(client.FromEnv)
 	assert.NilError(c, err)
-	defer cli.Close()
+	defer apiClient.Close()
 
-	info, err := cli.Info(context.Background())
+	result, err := apiClient.Info(testutil.GetContext(c), client.InfoOptions{})
 	assert.NilError(c, err)
+	info := result.Info
 
 	drivers := strings.Join(info.Plugins.Log, " ")
-	assert.Assert(c, strings.Contains(drivers, "json-file"))
+	assert.Assert(c, is.Contains(drivers, "json-file"))
 	assert.Assert(c, !strings.Contains(drivers, pluginName))
 }

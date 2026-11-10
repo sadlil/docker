@@ -3,10 +3,9 @@ package container
 import (
 	"bytes"
 	"context"
+	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/client"
 )
 
 // ExecResult represents a result returned from Exec()
@@ -17,70 +16,81 @@ type ExecResult struct {
 }
 
 // Stdout returns stdout output of a command run by Exec()
-func (res *ExecResult) Stdout() string {
+func (res ExecResult) Stdout() string {
 	return res.outBuffer.String()
 }
 
 // Stderr returns stderr output of a command run by Exec()
-func (res *ExecResult) Stderr() string {
+func (res ExecResult) Stderr() string {
 	return res.errBuffer.String()
 }
 
 // Combined returns combined stdout and stderr output of a command run by Exec()
-func (res *ExecResult) Combined() string {
+func (res ExecResult) Combined() string {
 	return res.outBuffer.String() + res.errBuffer.String()
+}
+
+// AssertSuccess fails the test and stops execution if the command exited with a
+// nonzero status code.
+func (res ExecResult) AssertSuccess(t testing.TB) {
+	t.Helper()
+	if res.ExitCode != 0 {
+		t.Logf("expected exit code 0, got %d", res.ExitCode)
+		t.Logf("stdout: %s", res.Stdout())
+		t.Logf("stderr: %s", res.Stderr())
+		t.FailNow()
+	}
 }
 
 // Exec executes a command inside a container, returning the result
 // containing stdout, stderr, and exit code. Note:
-//  - this is a synchronous operation;
-//  - cmd stdin is closed.
-func Exec(ctx context.Context, cli client.APIClient, id string, cmd []string) (ExecResult, error) {
+//   - this is a synchronous operation;
+//   - cmd stdin is closed.
+func Exec(ctx context.Context, apiClient client.APIClient, id string, cmd []string, ops ...func(*client.ExecCreateOptions)) (ExecResult, error) {
 	// prepare exec
-	execConfig := types.ExecConfig{
+	execOptions := client.ExecCreateOptions{
 		AttachStdout: true,
 		AttachStderr: true,
 		Cmd:          cmd,
 	}
-	cresp, err := cli.ContainerExecCreate(ctx, id, execConfig)
+
+	for _, op := range ops {
+		op(&execOptions)
+	}
+
+	res, err := apiClient.ExecCreate(ctx, id, execOptions)
 	if err != nil {
 		return ExecResult{}, err
 	}
-	execID := cresp.ID
+	execID := res.ID
 
 	// run it, with stdout/stderr attached
-	aresp, err := cli.ContainerExecAttach(ctx, execID, types.ExecStartCheck{})
+	aresp, err := apiClient.ExecAttach(ctx, execID, client.ExecAttachOptions{})
 	if err != nil {
 		return ExecResult{}, err
 	}
-	defer aresp.Close()
 
 	// read the output
-	var outBuf, errBuf bytes.Buffer
-	outputDone := make(chan error, 1)
-
-	go func() {
-		// StdCopy demultiplexes the stream into two buffers
-		_, err = stdcopy.StdCopy(&outBuf, &errBuf, aresp.Reader)
-		outputDone <- err
-	}()
-
-	select {
-	case err := <-outputDone:
-		if err != nil {
-			return ExecResult{}, err
-		}
-		break
-
-	case <-ctx.Done():
-		return ExecResult{}, ctx.Err()
+	s, err := demultiplexStreams(ctx, aresp.HijackedResponse)
+	if err != nil {
+		return ExecResult{}, err
 	}
 
 	// get the exit code
-	iresp, err := cli.ContainerExecInspect(ctx, execID)
+	inspect, err := apiClient.ExecInspect(ctx, execID, client.ExecInspectOptions{})
 	if err != nil {
 		return ExecResult{}, err
 	}
 
-	return ExecResult{ExitCode: iresp.ExitCode, outBuffer: &outBuf, errBuffer: &errBuf}, nil
+	return ExecResult{ExitCode: inspect.ExitCode, outBuffer: &s.stdout, errBuffer: &s.stderr}, nil
+}
+
+// ExecT calls Exec() and aborts the test if an error occurs.
+func ExecT(ctx context.Context, t testing.TB, apiClient client.APIClient, id string, cmd []string, ops ...func(*client.ExecCreateOptions)) ExecResult {
+	t.Helper()
+	res, err := Exec(ctx, apiClient, id, cmd, ops...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
 }

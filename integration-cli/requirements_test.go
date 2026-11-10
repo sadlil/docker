@@ -1,71 +1,45 @@
 package main
 
 import (
-	"context"
-	"fmt"
+	"errors"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/integration-cli/requirement"
-	"github.com/docker/docker/testutil/registry"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/internal/testutil/registry"
 )
 
-func ArchitectureIsNot(arch string) bool {
-	return os.Getenv("DOCKER_ENGINE_GOARCH") != arch
-}
-
 func DaemonIsWindows() bool {
-	return testEnv.OSType == "windows"
+	return testEnv.DaemonInfo.OSType == "windows"
 }
 
 func DaemonIsLinux() bool {
-	return testEnv.OSType == "linux"
-}
-
-func MinimumAPIVersion(version string) func() bool {
-	return func() bool {
-		return versions.GreaterThanOrEqualTo(testEnv.DaemonAPIVersion(), version)
-	}
-}
-
-func OnlyDefaultNetworks() bool {
-	cli, err := client.NewClientWithOpts(client.FromEnv)
-	if err != nil {
-		return false
-	}
-	networks, err := cli.NetworkList(context.TODO(), types.NetworkListOptions{})
-	if err != nil || len(networks) > 0 {
-		return false
-	}
-	return true
+	return testEnv.DaemonInfo.OSType == "linux"
 }
 
 func IsAmd64() bool {
-	return os.Getenv("DOCKER_ENGINE_GOARCH") == "amd64"
-}
-
-func NotArm() bool {
-	return ArchitectureIsNot("arm")
-}
-
-func NotArm64() bool {
-	return ArchitectureIsNot("arm64")
+	return testEnv.DaemonInfo.Architecture == "amd64"
 }
 
 func NotPpc64le() bool {
-	return ArchitectureIsNot("ppc64le")
+	return testEnv.DaemonInfo.Architecture != "ppc64le"
 }
 
 func UnixCli() bool {
 	return isUnixCli
+}
+
+func GitHubActions() bool {
+	return os.Getenv("GITHUB_ACTIONS") != ""
 }
 
 func Network() bool {
@@ -73,13 +47,13 @@ func Network() bool {
 	const timeout = 15 * time.Second
 	const url = "https://hub.docker.com"
 
-	client := http.Client{
+	c := http.Client{
 		Timeout: timeout,
 	}
 
-	resp, err := client.Get(url)
-	if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
-		panic(fmt.Sprintf("Timeout for GET request on %s", url))
+	resp, err := c.Get(url)
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		panic("Timeout for GET request on " + url)
 	}
 	if resp != nil {
 		resp.Body.Close()
@@ -88,20 +62,19 @@ func Network() bool {
 }
 
 func Apparmor() bool {
-	if strings.HasPrefix(testEnv.DaemonInfo.OperatingSystem, "SUSE Linux Enterprise Server ") {
-		return false
-	}
 	buf, err := os.ReadFile("/sys/module/apparmor/parameters/enabled")
 	return err == nil && len(buf) > 1 && buf[0] == 'Y'
 }
 
-func Devicemapper() bool {
-	return strings.HasPrefix(testEnv.DaemonInfo.Driver, "devicemapper")
-}
-
-func IPv6() bool {
-	cmd := exec.Command("test", "-f", "/proc/net/if_inet6")
-	return cmd.Run() != nil
+// containerdSnapshotterEnabled checks if the daemon in the test-environment is
+// configured with containerd-snapshotters enabled.
+func containerdSnapshotterEnabled() bool {
+	for _, v := range testEnv.DaemonInfo.DriverStatus {
+		if v[0] == "driver-type" {
+			return v[1] == string(plugins.SnapshotPlugin)
+		}
+	}
+	return false
 }
 
 func UserNamespaceROMount() bool {
@@ -141,7 +114,7 @@ func UserNamespaceInKernel() bool {
 }
 
 func IsPausable() bool {
-	if testEnv.OSType == "windows" {
+	if testEnv.DaemonInfo.OSType == "windows" {
 		return testEnv.DaemonInfo.Isolation.IsHyperV()
 	}
 	return true
@@ -156,8 +129,14 @@ func RegistryHosting() bool {
 	return err == nil
 }
 
+// RuntimeIsWindowsContainerd returns whether the containerd runtime is used on
+// Windows.
+// It is true when either the legacy DOCKER_WINDOWS_CONTAINERD_RUNTIME=1 env
+// var is set, or when the embedded-containerd feature is enabled via
+// TEST_INTEGRATION_CONTAINERD_EMBEDDED (which also uses containerd).
 func RuntimeIsWindowsContainerd() bool {
-	return os.Getenv("DOCKER_WINDOWS_CONTAINERD_RUNTIME") == "1"
+	return os.Getenv("DOCKER_WINDOWS_CONTAINERD_RUNTIME") == "1" ||
+		(runtime.GOOS == "windows" && os.Getenv("TEST_INTEGRATION_CONTAINERD_EMBEDDED") != "")
 }
 
 func SwarmInactive() bool {
@@ -168,18 +147,15 @@ func TODOBuildkit() bool {
 	return os.Getenv("DOCKER_BUILDKIT") == ""
 }
 
-func DockerCLIVersion(t testing.TB) string {
-	out, _ := dockerCmd(t, "--version")
-	version := strings.Fields(out)
-	if len(version) < 3 {
-		t.Fatal("unknown version output", version)
-	}
-	return version[2]
-}
-
 // testRequires checks if the environment satisfies the requirements
 // for the test to run or skips the tests.
-func testRequires(t *testing.T, requirements ...requirement.Test) {
+func testRequires(t *testing.T, requirements ...func() bool) {
 	t.Helper()
-	requirement.Is(t, requirements...)
+	for _, check := range requirements {
+		if !check() {
+			requirementFunc := runtime.FuncForPC(reflect.ValueOf(check).Pointer()).Name()
+			_, req, _ := strings.Cut(path.Base(requirementFunc), ".")
+			t.Skipf("unmatched requirement %s", req)
+		}
+	}
 }

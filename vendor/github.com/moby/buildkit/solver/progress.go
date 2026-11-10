@@ -2,13 +2,16 @@ package solver
 
 import (
 	"context"
+	"errors"
 	"io"
+	"slices"
 	"time"
+
+	"github.com/moby/buildkit/util/bklog"
 
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/util/progress"
 	digest "github.com/opencontainers/go-digest"
-	"github.com/sirupsen/logrus"
 )
 
 func (j *Job) Status(ctx context.Context, ch chan *client.SolveStatus) error {
@@ -24,7 +27,7 @@ func (j *Job) Status(ctx context.Context, ch chan *client.SolveStatus) error {
 	for {
 		p, err := pr.Read(ctx)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
@@ -38,7 +41,7 @@ func (j *Job) Status(ctx context.Context, ch chan *client.SolveStatus) error {
 			case progress.Status:
 				vtx, ok := p.Meta("vertex")
 				if !ok {
-					logrus.Warnf("progress %s status without vertex info", p.ID)
+					bklog.G(ctx).Warnf("progress %s status without vertex info", p.ID)
 					continue
 				}
 				vs := &client.VertexStatus{
@@ -55,17 +58,45 @@ func (j *Job) Status(ctx context.Context, ch chan *client.SolveStatus) error {
 			case client.VertexLog:
 				vtx, ok := p.Meta("vertex")
 				if !ok {
-					logrus.Warnf("progress %s log without vertex info", p.ID)
+					bklog.G(ctx).Warnf("progress %s log without vertex info", p.ID)
 					continue
 				}
-				v.Vertex = vtx.(digest.Digest)
+				if v.Vertex == "" {
+					v.Vertex = vtx.(digest.Digest)
+				}
 				v.Timestamp = p.Timestamp
 				ss.Logs = append(ss.Logs, &v)
+			case client.VertexWarning:
+				vtx, ok := p.Meta("vertex")
+				if !ok {
+					bklog.G(ctx).Warnf("progress %s warning without vertex info", p.ID)
+					continue
+				}
+				if v.Vertex == "" {
+					v.Vertex = vtx.(digest.Digest)
+				}
+				ss.Warnings = append(ss.Warnings, &v)
 			}
 		}
+		slices.SortFunc(ss.Vertexes, func(a, b *client.Vertex) int {
+			if a.Started == nil {
+				return -1
+			}
+			if b.Started == nil {
+				return 1
+			}
+			return a.Started.Compare(*b.Started)
+		})
+		slices.SortFunc(ss.Statuses, func(a, b *client.VertexStatus) int {
+			return a.Timestamp.Compare(b.Timestamp)
+		})
+		slices.SortFunc(ss.Logs, func(a, b *client.VertexLog) int {
+			return a.Timestamp.Compare(b.Timestamp)
+		})
+
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case ch <- ss:
 		}
 	}

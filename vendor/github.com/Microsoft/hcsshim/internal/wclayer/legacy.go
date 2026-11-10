@@ -1,3 +1,5 @@
+//go:build windows
+
 package wclayer
 
 import (
@@ -6,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,10 +29,20 @@ var mutatedUtilityVMFiles = map[string]bool{
 }
 
 const (
-	filesPath          = `Files`
-	hivesPath          = `Hives`
-	utilityVMPath      = `UtilityVM`
-	utilityVMFilesPath = `UtilityVM\Files`
+	filesPath           = `Files`
+	HivesPath           = `Hives`
+	UtilityVMPath       = `UtilityVM`
+	UtilityVMFilesPath  = `UtilityVM\Files`
+	RegFilesPath        = `Files\Windows\System32\config`
+	BootDirRelativePath = `\EFI\Microsoft\Boot`
+	BcdFilePath         = `UtilityVM\Files\EFI\Microsoft\Boot\BCD`
+	BootMgrFilePath     = `UtilityVM\Files\EFI\Microsoft\Boot\bootmgfw.efi`
+	ContainerBaseVhd    = `blank-base.vhdx`
+	ContainerScratchVhd = `blank.vhdx`
+	UtilityVMBaseVhd    = `SystemTemplateBase.vhdx`
+	UtilityVMScratchVhd = `SystemTemplate.vhdx`
+	LayoutFileName      = `layout`
+	UvmBuildFileName    = `uvmbuildversion`
 )
 
 func openFileOrDir(path string, mode uint32, createDisposition uint32) (file *os.File, err error) {
@@ -144,7 +155,7 @@ func (r *legacyLayerReader) walkUntilCancelled() error {
 		}
 		return nil
 	})
-	if err == errorIterationCanceled {
+	if err == errorIterationCanceled { //nolint:errorlint // explicitly returned
 		return nil
 	}
 	if err == nil {
@@ -183,16 +194,30 @@ func (r *legacyLayerReader) reset() {
 
 func findBackupStreamSize(r io.Reader) (int64, error) {
 	br := winio.NewBackupStreamReader(r)
+	var size int64
 	for {
 		hdr, err := br.Next()
 		if err != nil {
-			if err == io.EOF {
-				err = nil
+			if errors.Is(err, io.EOF) {
+				// With no inline data, sparse blocks provide the logical size.
+				return size, nil
 			}
 			return 0, err
 		}
-		if hdr.Id == winio.BackupData {
-			return hdr.Size, nil
+		switch hdr.Id {
+		case winio.BackupData:
+			// Non-sparse files and sparse files with inline data carry their
+			// logical size in BackupData.
+			if hdr.Size > 0 || hdr.Attributes&winio.StreamSparseAttributes == 0 {
+				return hdr.Size, nil
+			}
+			// A sparse BackupData stream without inline data is followed by
+			// sparse blocks that describe its logical size.
+		case winio.BackupSparseBlock:
+			// The terminal zero-length block has an offset at logical EOF.
+			if end := hdr.Offset + hdr.Size; end > size {
+				size = end
+			}
 		}
 	}
 }
@@ -242,11 +267,11 @@ func (r *legacyLayerReader) Next() (path string, size int64, fileInfo *winio.Fil
 	if !hasPathPrefix(path, filesPath) {
 		size = fe.fi.Size()
 		r.backupReader = winio.NewBackupFileReader(f, false)
-		if path == hivesPath || path == filesPath {
+		if path == HivesPath || path == filesPath {
 			// The Hives directory has a non-deterministic file time because of the
 			// nature of the import process. Use the times from System_Delta.
 			var g *os.File
-			g, err = os.Open(filepath.Join(r.root, hivesPath, `System_Delta`))
+			g, err = os.Open(filepath.Join(r.root, HivesPath, `System_Delta`))
 			if err != nil {
 				return
 			}
@@ -262,7 +287,6 @@ func (r *legacyLayerReader) Next() (path string, size int64, fileInfo *winio.Fil
 		// The creation time and access time get reset for files outside of the Files path.
 		fileInfo.CreationTime = fileInfo.LastWriteTime
 		fileInfo.LastAccessTime = fileInfo.LastWriteTime
-
 	} else {
 		// The file attributes are written before the backup stream.
 		var attr uint32
@@ -292,6 +316,18 @@ func (r *legacyLayerReader) Next() (path string, size int64, fileInfo *winio.Fil
 	r.currentFile = f
 	f = nil
 	return
+}
+
+func (r *legacyLayerReader) LinkInfo() (uint32, *winio.FileIDInfo, error) {
+	fileStandardInfo, err := winio.GetFileStandardInfo(r.currentFile)
+	if err != nil {
+		return 0, nil, err
+	}
+	fileIDInfo, err := winio.GetFileID(r.currentFile)
+	if err != nil {
+		return 0, nil, err
+	}
+	return fileStandardInfo.NumberOfLinks, fileIDInfo, nil
 }
 
 func (r *legacyLayerReader) Read(b []byte) (int, error) {
@@ -349,7 +385,7 @@ type legacyLayerWriter struct {
 	currentIsDir    bool
 }
 
-// newLegacyLayerWriter returns a LayerWriter that can write the contaler layer
+// newLegacyLayerWriter returns a LayerWriter that can write the container layer
 // transport format to disk.
 func newLegacyLayerWriter(root string, parentRoots []string, destRoot string) (w *legacyLayerWriter, err error) {
 	w = &legacyLayerWriter{
@@ -376,7 +412,7 @@ func newLegacyLayerWriter(root string, parentRoots []string, destRoot string) (w
 		}
 		w.parentRoots = append(w.parentRoots, f)
 	}
-	w.bufWriter = bufio.NewWriterSize(ioutil.Discard, 65536)
+	w.bufWriter = bufio.NewWriterSize(io.Discard, 65536)
 	return
 }
 
@@ -397,7 +433,7 @@ func (w *legacyLayerWriter) CloseRoots() {
 
 func (w *legacyLayerWriter) initUtilityVM() error {
 	if !w.HasUtilityVM {
-		err := safefile.MkdirRelative(utilityVMPath, w.destRoot)
+		err := safefile.MkdirRelative(UtilityVMPath, w.destRoot)
 		if err != nil {
 			return err
 		}
@@ -405,22 +441,41 @@ func (w *legacyLayerWriter) initUtilityVM() error {
 		// clone the utility VM from the parent layer into this layer. Use hard
 		// links to avoid unnecessary copying, since most of the files are
 		// immutable.
-		err = cloneTree(w.parentRoots[0], w.destRoot, utilityVMFilesPath, mutatedUtilityVMFiles)
+		err = cloneTree(w.parentRoots[0], w.destRoot, UtilityVMFilesPath, mutatedUtilityVMFiles)
 		if err != nil {
-			return fmt.Errorf("cloning the parent utility VM image failed: %s", err)
+			return fmt.Errorf("cloning the parent utility VM image failed: %w", err)
 		}
 		w.HasUtilityVM = true
 	}
 	return nil
 }
 
-func (w *legacyLayerWriter) reset() error {
-	err := w.bufWriter.Flush()
-	if err != nil {
+func (w *legacyLayerWriter) reset() (err error) {
+	// Always close the current backup writer and file handle, even if an error
+	// occurs below (e.g. bufWriter.Flush fails with ENOSPC when the disk is
+	// full). Leaving these handles open on Windows prevents the temporary
+	// import directory (defaults to SystemTemp, i.e. C:\Windows\SystemTemp\hcs*)
+	// from being removed by the deferred os.RemoveAll in legacyLayerWriterWrapper.Close,
+	// which leaks the directory and compounds disk-space exhaustion.
+	defer func() {
+		if w.backupWriter != nil {
+			w.backupWriter.Close()
+			w.backupWriter = nil
+		}
+		if w.currentFile != nil {
+			w.currentFile.Close()
+			w.currentFile = nil
+			w.currentFileName = ""
+			w.currentFileRoot = nil
+		}
+		w.currentIsDir = false
+	}()
+
+	if err = w.bufWriter.Flush(); err != nil {
 		return err
 	}
-	w.bufWriter.Reset(ioutil.Discard)
-	if w.currentIsDir {
+	w.bufWriter.Reset(io.Discard)
+	if w.currentIsDir && w.currentFile != nil {
 		r := w.currentFile
 		br := winio.NewBackupStreamReader(r)
 		// Seek to the beginning of the backup stream, skipping the fileattrs
@@ -430,7 +485,7 @@ func (w *legacyLayerWriter) reset() error {
 
 		for {
 			bhdr, err := br.Next()
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				// end of backupstream data
 				break
 			}
@@ -452,16 +507,6 @@ func (w *legacyLayerWriter) reset() error {
 			}
 		}
 		w.currentIsDir = false
-	}
-	if w.backupWriter != nil {
-		w.backupWriter.Close()
-		w.backupWriter = nil
-	}
-	if w.currentFile != nil {
-		w.currentFile.Close()
-		w.currentFile = nil
-		w.currentFileName = ""
-		w.currentFileRoot = nil
 	}
 	return nil
 }
@@ -580,7 +625,7 @@ func (w *legacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) erro
 		return err
 	}
 
-	if name == utilityVMPath {
+	if name == UtilityVMPath {
 		return w.initUtilityVM()
 	}
 
@@ -589,11 +634,11 @@ func (w *legacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) erro
 	}
 
 	name = filepath.Clean(name)
-	if hasPathPrefix(name, utilityVMPath) {
+	if hasPathPrefix(name, UtilityVMPath) {
 		if !w.HasUtilityVM {
 			return errors.New("missing UtilityVM directory")
 		}
-		if !hasPathPrefix(name, utilityVMFilesPath) && name != utilityVMFilesPath {
+		if !hasPathPrefix(name, UtilityVMFilesPath) && name != UtilityVMFilesPath {
 			return errors.New("invalid UtilityVM layer")
 		}
 		createDisposition := uint32(winapi.FILE_OPEN)
@@ -687,7 +732,7 @@ func (w *legacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) erro
 		return err
 	}
 
-	if hasPathPrefix(name, hivesPath) {
+	if hasPathPrefix(name, HivesPath) {
 		w.backupWriter = winio.NewBackupFileWriter(f, false)
 		w.bufWriter.Reset(w.backupWriter)
 	} else {
@@ -695,7 +740,7 @@ func (w *legacyLayerWriter) Add(name string, fileInfo *winio.FileBasicInfo) erro
 		// The file attributes are written before the stream.
 		err = binary.Write(w.bufWriter, binary.LittleEndian, uint32(fileInfo.FileAttributes))
 		if err != nil {
-			w.bufWriter.Reset(ioutil.Discard)
+			w.bufWriter.Reset(io.Discard)
 			return err
 		}
 	}
@@ -719,18 +764,18 @@ func (w *legacyLayerWriter) AddLink(name string, target string) error {
 		// Look for cross-layer hard link targets in the parent layers, since
 		// nothing is in the destination path yet.
 		roots = w.parentRoots
-	} else if hasPathPrefix(target, utilityVMFilesPath) {
+	} else if hasPathPrefix(target, UtilityVMFilesPath) {
 		// Since the utility VM is fully cloned into the destination path
 		// already, look for cross-layer hard link targets directly in the
 		// destination path.
 		roots = []*os.File{w.destRoot}
 	}
 
-	if roots == nil || (!hasPathPrefix(name, filesPath) && !hasPathPrefix(name, utilityVMFilesPath)) {
+	if roots == nil || (!hasPathPrefix(name, filesPath) && !hasPathPrefix(name, UtilityVMFilesPath)) {
 		return errors.New("invalid hard link in layer")
 	}
 
-	// Find to try the target of the link in a previously added file. If that
+	// Try to find the target of the link in a previously added file. If that
 	// fails, search in parent layers.
 	var selectedRoot *os.File
 	if _, ok := w.addedFiles[target]; ok {
@@ -765,7 +810,7 @@ func (w *legacyLayerWriter) Remove(name string) error {
 	name = filepath.Clean(name)
 	if hasPathPrefix(name, filesPath) {
 		w.Tombstones = append(w.Tombstones, name)
-	} else if hasPathPrefix(name, utilityVMFilesPath) {
+	} else if hasPathPrefix(name, UtilityVMFilesPath) {
 		err := w.initUtilityVM()
 		if err != nil {
 			return err

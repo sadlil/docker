@@ -1,30 +1,25 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestSwarmLeaveError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	err := client.SwarmLeave(context.Background(), false)
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.SwarmLeave(t.Context(), SwarmLeaveOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestSwarmLeave(t *testing.T) {
-	expectedURL := "/swarm/leave"
+	const expectedURL = "/swarm/leave"
 
 	leaveCases := []struct {
 		force         bool
@@ -40,28 +35,19 @@ func TestSwarmLeave(t *testing.T) {
 	}
 
 	for _, leaveCase := range leaveCases {
-		client := &Client{
-			client: newMockClient(func(req *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(req.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-				}
-				if req.Method != http.MethodPost {
-					return nil, fmt.Errorf("expected POST method, got %s", req.Method)
-				}
-				force := req.URL.Query().Get("force")
-				if force != leaveCase.expectedForce {
-					return nil, fmt.Errorf("force not set in URL query properly. expected '%s', got %s", leaveCase.expectedForce, force)
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte(""))),
-				}, nil
-			}),
-		}
+		client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+				return nil, err
+			}
+			force := req.URL.Query().Get("force")
+			if force != leaveCase.expectedForce {
+				return nil, fmt.Errorf("force not set in URL query properly. expected '%s', got %s", leaveCase.expectedForce, force)
+			}
+			return mockResponse(http.StatusOK, nil, "")(req)
+		}))
+		assert.NilError(t, err)
 
-		err := client.SwarmLeave(context.Background(), leaveCase.force)
-		if err != nil {
-			t.Fatal(err)
-		}
+		_, err = client.SwarmLeave(t.Context(), SwarmLeaveOptions{Force: leaveCase.force})
+		assert.NilError(t, err)
 	}
 }

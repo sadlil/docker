@@ -2,18 +2,20 @@ package local
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
-	"strings"
+	"slices"
 	"time"
 
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/exporter"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
+	"github.com/moby/buildkit/exporter/local"
+	"github.com/moby/buildkit/exporter/util/epoch"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/filesync"
-	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/util/progress"
+	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
 	fstypes "github.com/tonistiigi/fsutil/types"
 )
@@ -32,139 +34,160 @@ func New(opt Opt) (exporter.Exporter, error) {
 	return le, nil
 }
 
-func (e *localExporter) Resolve(ctx context.Context, opt map[string]string) (exporter.ExporterInstance, error) {
-	li := &localExporterInstance{localExporter: e}
+func (e *localExporter) Resolve(ctx context.Context, id int, opt map[string]string) (exporter.ExporterInstance, error) {
+	li := &localExporterInstance{
+		localExporter: e,
+		id:            id,
+		attrs:         opt,
+	}
+	_, err := li.opts.Load(opt)
+	if err != nil {
+		return nil, err
+	}
+	_ = opt
+
 	return li, nil
 }
 
 type localExporterInstance struct {
 	*localExporter
+	id    int
+	attrs map[string]string
+
+	opts local.CreateFSOpts
+}
+
+func (e *localExporterInstance) ID() int {
+	return e.id
 }
 
 func (e *localExporterInstance) Name() string {
-	return "exporting to client"
+	return "exporting to client tarball"
 }
 
-func (e *localExporterInstance) Export(ctx context.Context, inp exporter.Source, sessionID string) (map[string]string, error) {
-	var defers []func()
+func (e *localExporterInstance) Type() string {
+	return client.ExporterTar
+}
+
+func (e *localExporterInstance) Attrs() map[string]string {
+	return e.attrs
+}
+
+func (e *localExporterInstance) Config() *exporter.Config {
+	return exporter.NewConfig()
+}
+
+func (e *localExporterInstance) Export(ctx context.Context, inp *exporter.Source, buildInfo exporter.ExportBuildInfo) (map[string]string, exporter.FinalizeFunc, exporter.DescriptorReference, error) {
+	var defers []func() error
 
 	defer func() {
-		for i := len(defers) - 1; i >= 0; i-- {
-			defers[i]()
+		for _, f := range slices.Backward(defers) {
+			f()
 		}
 	}()
 
-	getDir := func(ctx context.Context, k string, ref cache.ImmutableRef) (*fsutil.Dir, error) {
-		var src string
-		var err error
-		var idmap *idtools.IdentityMapping
-		if ref == nil {
-			src, err = ioutil.TempDir("", "buildkit")
-			if err != nil {
-				return nil, err
-			}
-			defers = append(defers, func() { os.RemoveAll(src) })
-		} else {
-			mount, err := ref.Mount(ctx, true, session.NewGroup(sessionID))
-			if err != nil {
-				return nil, err
-			}
+	if e.opts.Epoch == nil {
+		if tm, err := epoch.ParseSource(inp, nil); err != nil {
+			return nil, nil, nil, err
+		} else if tm != nil {
+			e.opts.Epoch = &epoch.Epoch{Value: tm}
+		}
+	}
 
-			lm := snapshot.LocalMounter(mount)
+	now := time.Now().Truncate(time.Second)
+	isMap := len(inp.Refs) > 0
 
-			src, err = lm.Mount()
-			if err != nil {
-				return nil, err
-			}
-
-			idmap = mount.IdentityMapping()
-
-			defers = append(defers, func() { lm.Unmount() })
+	getDir := func(ctx context.Context, k string, ref cache.ImmutableRef, attestations []exporter.Attestation, opt local.CreateFSOpts) (*fsutil.Dir, error) {
+		outputFS, cleanup, err := local.CreateFS(ctx, buildInfo.SessionID, k, ref, attestations, now, isMap, opt)
+		if err != nil {
+			return nil, err
+		}
+		if cleanup != nil {
+			defers = append(defers, cleanup)
 		}
 
-		walkOpt := &fsutil.WalkOpt{}
-
-		if idmap != nil {
-			walkOpt.Map = func(p string, st *fstypes.Stat) bool {
-				uid, gid, err := idmap.ToContainer(idtools.Identity{
-					UID: int(st.Uid),
-					GID: int(st.Gid),
-				})
-				if err != nil {
-					return false
-				}
-				st.Uid = uint32(uid)
-				st.Gid = uint32(gid)
-				return true
-			}
+		st := &fstypes.Stat{
+			Mode: uint32(os.ModeDir | 0755),
+			Path: local.PlatformIDToPath(k),
+		}
+		if opt.Epoch != nil && opt.Epoch.Value != nil {
+			st.ModTime = opt.Epoch.Value.UnixNano()
 		}
 
 		return &fsutil.Dir{
-			FS: fsutil.NewFS(src, walkOpt),
-			Stat: fstypes.Stat{
-				Mode: uint32(os.ModeDir | 0755),
-				Path: strings.Replace(k, "/", "_", -1),
-			},
+			FS:   outputFS,
+			Stat: st,
 		}, nil
+	}
+
+	if _, ok := inp.Metadata[exptypes.ExporterPlatformsKey]; isMap && !ok {
+		return nil, nil, nil, errors.New("unable to export multiple refs, missing platforms mapping")
+	}
+	p, err := exptypes.ParsePlatforms(inp.Metadata)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !isMap && len(p.Platforms) > 1 {
+		return nil, nil, nil, errors.New("unable to export multiple platforms without map")
 	}
 
 	var fs fsutil.FS
 
-	if len(inp.Refs) > 0 {
-		dirs := make([]fsutil.Dir, 0, len(inp.Refs))
-		for k, ref := range inp.Refs {
-			d, err := getDir(ctx, k, ref)
+	if len(p.Platforms) > 0 {
+		dirs := make([]fsutil.Dir, 0, len(p.Platforms))
+		for _, p := range p.Platforms {
+			r, ok := inp.FindRef(p.ID)
+			if !ok {
+				return nil, nil, nil, errors.Errorf("failed to find ref for ID %s", p.ID)
+			}
+			opt := e.opts
+			if e.opts.Epoch == nil {
+				tm, err := epoch.ParseSource(inp, &p)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				opt.Epoch = &epoch.Epoch{Value: tm}
+			}
+			d, err := getDir(ctx, p.ID, r, inp.Attestations[p.ID], opt)
 			if err != nil {
-				return nil, err
+				return nil, nil, nil, err
 			}
 			dirs = append(dirs, *d)
 		}
-		var err error
-		fs, err = fsutil.SubDirFS(dirs)
-		if err != nil {
-			return nil, err
+		if isMap {
+			var err error
+			fs, err = fsutil.SubDirFS(dirs)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		} else {
+			fs = dirs[0].FS
 		}
 	} else {
-		d, err := getDir(ctx, "", inp.Ref)
+		d, err := getDir(ctx, "", inp.Ref, nil, e.opts)
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		fs = d.FS
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	timeoutCtx, cancel := context.WithCancelCause(ctx)
+	timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 5*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
-	caller, err := e.opt.SessionManager.Get(timeoutCtx, sessionID, false)
+	caller, err := e.opt.SessionManager.Get(timeoutCtx, buildInfo.SessionID, false)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
-	w, err := filesync.CopyFileWriter(ctx, nil, caller)
+	w, err := filesync.CopyFileWriter(ctx, nil, e.id, caller)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	report := oneOffProgress(ctx, "sending tarball")
-	if err := fsutil.WriteTar(ctx, fs, w); err != nil {
+	report := progress.OneOff(ctx, "sending tarball")
+	if err := writeTar(ctx, fs, w); err != nil {
 		w.Close()
-		return nil, report(err)
+		return nil, nil, nil, report(err)
 	}
-	return nil, report(w.Close())
-}
-
-func oneOffProgress(ctx context.Context, id string) func(err error) error {
-	pw, _, _ := progress.FromContext(ctx)
-	now := time.Now()
-	st := progress.Status{
-		Started: &now,
-	}
-	pw.Write(id, st)
-	return func(err error) error {
-		// TODO: set error on status
-		now := time.Now()
-		st.Completed = &now
-		pw.Write(id, st)
-		pw.Close()
-		return err
-	}
+	return nil, nil, nil, report(w.Close())
 }

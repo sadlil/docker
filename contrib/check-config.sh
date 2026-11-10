@@ -25,6 +25,10 @@ if ! command -v zgrep > /dev/null 2>&1; then
 	}
 fi
 
+useColor=true
+if [ "$NO_COLOR" = "1" ] || [ ! -t 1 ]; then
+	useColor=false
+fi
 kernelVersion="$(uname -r)"
 kernelMajor="${kernelVersion%%.*}"
 kernelMinor="${kernelVersion#$kernelMajor.}"
@@ -41,6 +45,10 @@ is_set_as_module() {
 }
 
 color() {
+	# if stdout is not a terminal, then don't do color codes.
+	if [ "$useColor" = "false" ]; then
+		return 0
+	fi
 	codes=
 	if [ "$1" = 'bold' ]; then
 		codes='1'
@@ -120,25 +128,14 @@ check_device() {
 	fi
 }
 
-check_distro_userns() {
-	if [ ! -e /etc/os-release ]; then
-		return
+check_sysctl() {
+	val=$(sysctl -n $1)
+	want=$2
+	if [ "$val" = "$want" ]; then
+		wrap_good "sysctl $1" "enabled"
+	else
+		wrap_bad "sysctl $1" "disabled"
 	fi
-	. /etc/os-release 2> /dev/null || /bin/true
-	case "$ID" in
-		centos | rhel)
-			case "$VERSION_ID" in
-				7*)
-					# this is a CentOS7 or RHEL7 system
-					grep -q 'user_namespace.enable=1' /proc/cmdline || {
-						# no user namespace support enabled
-						wrap_bad "  (RHEL7/CentOS7" "User namespaces disabled; add 'user_namespace.enable=1' to boot command line)"
-						EXITCODE=1
-					}
-					;;
-			esac
-			;;
-	esac
 }
 
 if [ ! -e "$CONFIG" ]; then
@@ -218,12 +215,14 @@ check_flags \
 	CGROUPS CGROUP_CPUACCT CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CPUSETS MEMCG \
 	KEYS \
 	VETH BRIDGE BRIDGE_NETFILTER \
-	IP_NF_FILTER IP_NF_TARGET_MASQUERADE \
+	IP_NF_FILTER IP_NF_MANGLE IP_NF_TARGET_MASQUERADE \
+	IP6_NF_FILTER IP6_NF_MANGLE IP6_NF_TARGET_MASQUERADE \
 	NETFILTER_XT_MATCH_ADDRTYPE \
 	NETFILTER_XT_MATCH_CONNTRACK \
 	NETFILTER_XT_MATCH_IPVS \
 	NETFILTER_XT_MARK \
-	IP_NF_NAT NF_NAT \
+	IP_NF_RAW IP_NF_NAT NF_NAT \
+	IP6_NF_RAW IP6_NF_NAT NF_NAT \
 	POSIX_MQUEUE
 # (POSIX_MQUEUE is required for bind-mounting /dev/mqueue into containers)
 
@@ -245,10 +244,13 @@ fi
 
 echo
 
+# Save the results of the required features while running optional feature checks.
+required_features_result=${EXITCODE}
+EXITCODE=0
+
 echo 'Optional Features:'
 {
 	check_flags USER_NS
-	check_distro_userns
 }
 {
 	check_flags SECCOMP
@@ -258,11 +260,10 @@ echo 'Optional Features:'
 	check_flags CGROUP_PIDS
 }
 {
-	check_flags MEMCG_SWAP
-	# Kernel v5.8+ removes MEMCG_SWAP_ENABLED.
-	if [ "$kernelMajor" -lt 5 ] || [ "$kernelMajor" -eq 5 -a "$kernelMinor" -le 8 ]; then
+	# Kernel v5.8+ removes MEMCG_SWAP_ENABLED and deprecates MEMCG_SWAP.
+	if [ "$kernelMajor" -lt 5 ] || [ "$kernelMajor" -eq 5 -a "$kernelMinor" -lt 8 ]; then
 		CODE=${EXITCODE}
-		check_flags MEMCG_SWAP_ENABLED
+		check_flags MEMCG_SWAP MEMCG_SWAP_ENABLED
 		# FIXME this check is cgroupv1-specific
 		if [ -e /sys/fs/cgroup/memory/memory.memsw.limit_in_bytes ]; then
 			echo "    $(wrap_color '(cgroup swap accounting is currently enabled)' bold black)"
@@ -320,8 +321,9 @@ check_flags \
 	CGROUP_PERF \
 	CGROUP_HUGETLB \
 	NET_CLS_CGROUP $netprio \
-	CFS_BANDWIDTH FAIR_GROUP_SCHED RT_GROUP_SCHED \
+	CFS_BANDWIDTH FAIR_GROUP_SCHED \
 	IP_NF_TARGET_REDIRECT \
+	IP_SCTP \
 	IP_VS \
 	IP_VS_NFCT \
 	IP_VS_PROTO_TCP \
@@ -329,6 +331,20 @@ check_flags \
 	IP_VS_RR \
 	SECURITY_SELINUX \
 	SECURITY_APPARMOR
+
+check_flags \
+	NFT_CT \
+	NFT_FIB_IPV4 \
+	NFT_FIB_IPV6 \
+	NFT_FIB \
+	NFT_FWD_NETDEV \
+	NFT_MASQ \
+	NFT_NAT \
+	NFT_NUMGEN \
+	NFT_REDIR \
+	NFT_REJECT \
+	NF_TABLES \
+	NF_TABLES_NETDEV
 
 if ! is_set EXT4_USE_FOR_EXT2; then
 	check_flags EXT3_FS EXT3_FS_XATTR EXT3_FS_POSIX_ACL EXT3_FS_SECURITY
@@ -346,12 +362,19 @@ if ! is_set EXT4_FS || ! is_set EXT4_FS_POSIX_ACL || ! is_set EXT4_FS_SECURITY; 
 	fi
 fi
 
+# Restore results of the required features check.
+EXITCODE=${required_features_result}
+
 echo '- Network Drivers:'
+echo "  - \"$(wrap_color 'bridge' blue)\":"
+check_sysctl net.ipv4.ip_forward 1 | sed 's/^/    - /'
+check_sysctl net.ipv6.conf.all.forwarding 1 | sed 's/^/    - /'
+check_sysctl net.ipv6.conf.default.forwarding 1 | sed 's/^/    - /'
 echo "  - \"$(wrap_color 'overlay' blue)\":"
 check_flags VXLAN BRIDGE_VLAN_FILTERING | sed 's/^/    /'
 echo '      Optional (for encrypted networks):'
 check_flags CRYPTO CRYPTO_AEAD CRYPTO_GCM CRYPTO_SEQIV CRYPTO_GHASH \
-	XFRM XFRM_USER XFRM_ALGO INET_ESP | sed 's/^/      /'
+	XFRM XFRM_USER XFRM_ALGO INET_ESP NETFILTER_XT_MATCH_BPF | sed 's/^/      /'
 if [ "$kernelMajor" -lt 5 ] || [ "$kernelMajor" -eq 5 -a "$kernelMinor" -le 3 ]; then
 	check_flags INET_XFRM_MODE_TRANSPORT | sed 's/^/      /'
 fi
@@ -368,22 +391,9 @@ EXITCODE=0
 STORAGE=1
 
 echo '- Storage Drivers:'
-echo "  - \"$(wrap_color 'aufs' blue)\":"
-check_flags AUFS_FS | sed 's/^/    /'
-if ! is_set AUFS_FS && grep -q aufs /proc/filesystems; then
-	echo "      $(wrap_color '(note that some kernels include AUFS patches but not the AUFS_FS flag)' bold black)"
-fi
-[ "$EXITCODE" = 0 ] && STORAGE=0
-EXITCODE=0
-
 echo "  - \"$(wrap_color 'btrfs' blue)\":"
 check_flags BTRFS_FS | sed 's/^/    /'
 check_flags BTRFS_FS_POSIX_ACL | sed 's/^/    /'
-[ "$EXITCODE" = 0 ] && STORAGE=0
-EXITCODE=0
-
-echo "  - \"$(wrap_color 'devicemapper' blue)\":"
-check_flags BLK_DEV_DM DM_THIN_PROVISIONING | sed 's/^/    /'
 [ "$EXITCODE" = 0 ] && STORAGE=0
 EXITCODE=0
 

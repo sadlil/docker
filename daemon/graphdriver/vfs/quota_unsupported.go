@@ -1,12 +1,10 @@
 //go:build !linux
-// +build !linux
 
-package vfs // import "github.com/docker/docker/daemon/graphdriver/vfs"
+package vfs
 
-import "github.com/docker/docker/quota"
+import "github.com/moby/moby/v2/daemon/internal/quota"
 
-type driverQuota struct {
-}
+type driverQuota struct{}
 
 func setupDriverQuota(driver *Driver) error {
 	return nil

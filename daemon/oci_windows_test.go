@@ -7,13 +7,14 @@ import (
 	"strings"
 	"testing"
 
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/fs"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	swarmagent "github.com/docker/swarmkit/agent"
-	swarmapi "github.com/docker/swarmkit/api"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/container"
+	swarmagent "github.com/moby/swarmkit/v2/agent"
+	swarmapi "github.com/moby/swarmkit/v2/api"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/windows/registry"
 	"gotest.tools/v3/assert"
 )
@@ -21,9 +22,6 @@ import (
 func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 	// we need a temp directory to act as the daemon's root
 	tmpDaemonRoot := fs.NewDir(t, t.Name()).Path()
-	defer func() {
-		assert.NilError(t, os.RemoveAll(tmpDaemonRoot))
-	}()
 
 	daemon := &Daemon{
 		root: tmpDaemonRoot,
@@ -34,15 +32,15 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 
 		err := daemon.setWindowsCredentialSpec(&container.Container{}, spec)
 		assert.NilError(t, err)
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 
 		err = daemon.setWindowsCredentialSpec(&container.Container{HostConfig: &containertypes.HostConfig{}}, spec)
 		assert.NilError(t, err)
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 
 		err = daemon.setWindowsCredentialSpec(&container.Container{HostConfig: &containertypes.HostConfig{SecurityOpt: []string{}}}, spec)
 		assert.NilError(t, err)
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 	})
 
 	dummyContainerID := "dummy-container-ID"
@@ -69,7 +67,7 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 		assert.NilError(t, err)
 		dummyCredFileName := "dummy-cred-spec.json"
 		dummyCredFilePath := filepath.Join(credSpecsDir, dummyCredFileName)
-		err = os.WriteFile(dummyCredFilePath, []byte(dummyCredFileContents), 0644)
+		err = os.WriteFile(dummyCredFilePath, []byte(dummyCredFileContents), 0o644)
 		defer func() {
 			assert.NilError(t, os.Remove(dummyCredFilePath))
 		}()
@@ -87,34 +85,33 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 		spec := &specs.Spec{}
 
 		err := daemon.setWindowsCredentialSpec(containerFactory(`file://C:\path\to\my\credspec.json`), spec)
-		assert.ErrorContains(t, err, "invalid credential spec - file:// path cannot be absolute")
+		assert.ErrorContains(t, err, "invalid credential spec: file:// path cannot be absolute")
 
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 	})
 
 	t.Run("it's not allowed to use a 'file://' option breaking out of the cred specs' directory", func(t *testing.T) {
 		spec := &specs.Spec{}
 
 		err := daemon.setWindowsCredentialSpec(containerFactory(`file://..\credspec.json`), spec)
-		assert.ErrorContains(t, err, fmt.Sprintf("invalid credential spec - file:// path must be under %s", credSpecsDir))
+		assert.ErrorContains(t, err, fmt.Sprintf("invalid credential spec: file:// path must be under %s", credSpecsDir))
 
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 	})
 
 	t.Run("when using a 'file://' option pointing to a file that doesn't exist, it fails gracefully", func(t *testing.T) {
 		spec := &specs.Spec{}
 
 		err := daemon.setWindowsCredentialSpec(containerFactory("file://i-dont-exist.json"), spec)
-		assert.ErrorContains(t, err, fmt.Sprintf("credential spec for container %s could not be read from file", dummyContainerID))
-		assert.ErrorContains(t, err, "The system cannot find")
-
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.ErrorContains(err, fmt.Sprintf("failed to load credential spec for container %s", dummyContainerID)))
+		assert.Check(t, is.ErrorIs(err, os.ErrNotExist))
+		assert.Check(t, is.Nil(spec.Windows))
 	})
 
 	t.Run("happy path with a 'registry://' option", func(t *testing.T) {
 		valueName := "my-cred-spec"
 		key := &dummyRegistryKey{
-			getStringValueFunc: func(name string) (val string, valtype uint32, err error) {
+			getStringValueFunc: func(name string) (val string, valType uint32, _ error) {
 				assert.Equal(t, valueName, name)
 				return dummyCredFileContents, 0, nil
 			},
@@ -138,13 +135,13 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 		err := daemon.setWindowsCredentialSpec(containerFactory("registry://my-cred-spec"), spec)
 		assert.ErrorContains(t, err, fmt.Sprintf("registry key %s could not be opened: %v", credentialSpecRegistryLocation, dummyError))
 
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 	})
 
 	t.Run("when using a 'registry://' option pointing to a value that doesn't exist, it fails gracefully", func(t *testing.T) {
 		valueName := "my-cred-spec"
 		key := &dummyRegistryKey{
-			getStringValueFunc: func(name string) (val string, valtype uint32, err error) {
+			getStringValueFunc: func(name string) (val string, valType uint32, _ error) {
 				assert.Equal(t, valueName, name)
 				return "", 0, registry.ErrNotExist
 			},
@@ -162,7 +159,7 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 		dummyError := fmt.Errorf("dummy error")
 		valueName := "my-cred-spec"
 		key := &dummyRegistryKey{
-			getStringValueFunc: func(name string) (val string, valtype uint32, err error) {
+			getStringValueFunc: func(name string) (val string, valType uint32, _ error) {
 				assert.Equal(t, valueName, name)
 				return "", 0, dummyError
 			},
@@ -219,7 +216,7 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 		err := daemon.setWindowsCredentialSpec(containerFactory("config://whatever"), spec)
 		assert.Equal(t, errInvalidCredentialSpecSecOpt, err)
 
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 	})
 
 	t.Run("happy path with a 'raw://' option", func(t *testing.T) {
@@ -250,7 +247,7 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 		err := daemon.setWindowsCredentialSpec(containerFactory("credentialspe=config://whatever"), spec)
 		assert.ErrorContains(t, err, "security option not supported: credentialspe")
 
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 	})
 
 	t.Run("it rejects unsupported credentialspec options", func(t *testing.T) {
@@ -259,7 +256,7 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 		err := daemon.setWindowsCredentialSpec(containerFactory("idontexist://whatever"), spec)
 		assert.Equal(t, errInvalidCredentialSpecSecOpt, err)
 
-		assert.Check(t, spec.Windows == nil)
+		assert.Check(t, is.Nil(spec.Windows))
 	})
 
 	for _, option := range []string{"file", "registry", "config", "raw"} {
@@ -269,7 +266,7 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 			err := daemon.setWindowsCredentialSpec(containerFactory(option+"://"), spec)
 			assert.Equal(t, errInvalidCredentialSpecSecOpt, err)
 
-			assert.Check(t, spec.Windows == nil)
+			assert.Check(t, is.Nil(spec.Windows))
 		})
 	}
 }
@@ -277,11 +274,11 @@ func TestSetWindowsCredentialSpecInSpec(t *testing.T) {
 /* Helpers below */
 
 type dummyRegistryKey struct {
-	getStringValueFunc func(name string) (val string, valtype uint32, err error)
+	getStringValueFunc func(name string) (val string, valType uint32, err error)
 	closed             bool
 }
 
-func (k *dummyRegistryKey) GetStringValue(name string) (val string, valtype uint32, err error) {
+func (k *dummyRegistryKey) GetStringValue(name string) (val string, valType uint32, _ error) {
 	return k.getStringValueFunc(name)
 }
 
@@ -310,4 +307,84 @@ func setRegistryOpenKeyFunc(t *testing.T, key *dummyRegistryKey, err ...error) f
 	return func() {
 		registryOpenKeyFunc = previousRegistryOpenKeyFunc
 	}
+}
+
+func TestSetupWindowsDevices(t *testing.T) {
+	t.Run("it does nothing if there are no devices", func(t *testing.T) {
+		devices, err := setupWindowsDevices(nil)
+		assert.NilError(t, err)
+		assert.Equal(t, len(devices), 0)
+	})
+
+	t.Run("it fails if any devices are blank", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "class/anything"}, {PathOnHost: ""}})
+		assert.ErrorContains(t, err, "invalid device assignment path")
+		assert.ErrorContains(t, err, "''")
+		assert.Equal(t, len(devices), 0)
+	})
+
+	t.Run("it fails if all devices do not contain '/' or '://'", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "anything"}, {PathOnHost: "goes"}})
+		assert.ErrorContains(t, err, "invalid device assignment path")
+		assert.ErrorContains(t, err, "'anything'")
+		assert.Equal(t, len(devices), 0)
+	})
+
+	t.Run("it fails if any devices do not contain '/' or '://'", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "class/anything"}, {PathOnHost: "goes"}})
+		assert.ErrorContains(t, err, "invalid device assignment path")
+		assert.ErrorContains(t, err, "'goes'")
+		assert.Equal(t, len(devices), 0)
+	})
+
+	t.Run("it fails if all '/'-separated devices do not have IDType 'class'", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "klass/anything"}, {PathOnHost: "klass/goes"}})
+		assert.ErrorContains(t, err, "invalid device assignment path")
+		assert.ErrorContains(t, err, "'klass/anything'")
+		assert.Equal(t, len(devices), 0)
+	})
+
+	t.Run("it fails if any '/'-separated devices do not have IDType 'class'", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "class/anything"}, {PathOnHost: "klass/goes"}})
+		assert.ErrorContains(t, err, "invalid device assignment path")
+		assert.ErrorContains(t, err, "'klass/goes'")
+		assert.Equal(t, len(devices), 0)
+	})
+
+	t.Run("it fails if any '://'-separated devices have IDType ''", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "class/anything"}, {PathOnHost: "://goes"}})
+		assert.ErrorContains(t, err, "invalid device assignment path")
+		assert.ErrorContains(t, err, "'://goes'")
+		assert.Equal(t, len(devices), 0)
+	})
+
+	t.Run("it creates devices if all '/'-separated devices have IDType 'class'", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "class/anything"}, {PathOnHost: "class/goes"}})
+		expectedDevices := []specs.WindowsDevice{{IDType: "class", ID: "anything"}, {IDType: "class", ID: "goes"}}
+		assert.NilError(t, err)
+		assert.Equal(t, len(devices), len(expectedDevices))
+		for i := range expectedDevices {
+			assert.Equal(t, devices[i], expectedDevices[i])
+		}
+	})
+
+	t.Run("it creates devices if all '://'-separated devices have non-blank IDType", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "class://anything"}, {PathOnHost: "klass://goes"}})
+		expectedDevices := []specs.WindowsDevice{{IDType: "class", ID: "anything"}, {IDType: "klass", ID: "goes"}}
+		assert.NilError(t, err)
+		assert.Equal(t, len(devices), len(expectedDevices))
+		for i := range expectedDevices {
+			assert.Equal(t, devices[i], expectedDevices[i])
+		}
+	})
+
+	t.Run("it creates devices when given a mix of '/'-separated and '://'-separated devices", func(t *testing.T) {
+		devices, err := setupWindowsDevices([]containertypes.DeviceMapping{{PathOnHost: "class/anything"}, {PathOnHost: "klass://goes"}})
+		expectedDevices := []specs.WindowsDevice{{IDType: "class", ID: "anything"}, {IDType: "klass", ID: "goes"}}
+		assert.NilError(t, err)
+		assert.Equal(t, len(devices), len(expectedDevices))
+		for i := range expectedDevices {
+			assert.Equal(t, devices[i], expectedDevices[i])
+		}
+	})
 }

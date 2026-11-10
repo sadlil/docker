@@ -108,7 +108,7 @@ type Message struct {
 	Type
 	Flags
 	Headers map[HeaderField]Variant
-	Body    []interface{}
+	Body    []any
 
 	serial uint32
 }
@@ -158,7 +158,9 @@ func DecodeMessageWithFDs(rd io.Reader, fds []int) (msg *Message, err error) {
 	if err != nil {
 		return nil, err
 	}
-	binary.Read(bytes.NewBuffer(b), order, &hlength)
+	if err := binary.Read(bytes.NewBuffer(b), order, &hlength); err != nil {
+		return nil, err
+	}
 	if hlength+length+16 > 1<<27 {
 		return nil, InvalidMessageError("message is too long")
 	}
@@ -177,16 +179,19 @@ func DecodeMessageWithFDs(rd io.Reader, fds []int) (msg *Message, err error) {
 		msg.Headers[HeaderField(v.Field)] = v.Variant
 	}
 
-	dec.align(8)
-	body := make([]byte, int(length))
-	if length != 0 {
-		_, err := io.ReadFull(rd, body)
-		if err != nil {
+	// Skip padding to 8-byte boundary before the body.
+	// Not using dec.align here as it panics on read errors.
+	if pad := (8 - dec.pos%8) % 8; pad > 0 {
+		if _, err := io.CopyN(io.Discard, rd, int64(pad)); err != nil {
 			return nil, err
 		}
 	}
+	body, err := readFull(rd, nil, int(length))
+	if err != nil {
+		return nil, err
+	}
 
-	if err = msg.IsValid(); err != nil {
+	if err = msg.validateHeader(); err != nil {
 		return nil, err
 	}
 	sig, _ := msg.Headers[FieldSignature].value.(Signature)
@@ -208,7 +213,7 @@ func DecodeMessageWithFDs(rd io.Reader, fds []int) (msg *Message, err error) {
 // The possibly returned error can be an error of the underlying reader, an
 // InvalidMessageError or a FormatError.
 func DecodeMessage(rd io.Reader) (msg *Message, err error) {
-	return DecodeMessageWithFDs(rd, make([]int, 0));
+	return DecodeMessageWithFDs(rd, make([]int, 0))
 }
 
 type nullwriter struct{}
@@ -227,17 +232,17 @@ func (msg *Message) CountFds() (int, error) {
 }
 
 func (msg *Message) EncodeToWithFDs(out io.Writer, order binary.ByteOrder) (fds []int, err error) {
-	if err := msg.IsValid(); err != nil {
-		return make([]int, 0), err
+	if err := msg.validateHeader(); err != nil {
+		return nil, err
 	}
-	var vs [7]interface{}
+	var vs [7]any
 	switch order {
 	case binary.LittleEndian:
 		vs[0] = byte('l')
 	case binary.BigEndian:
 		vs[0] = byte('B')
 	default:
-		return make([]int, 0), errors.New("dbus: invalid byte order")
+		return nil, errors.New("dbus: invalid byte order")
 	}
 	body := new(bytes.Buffer)
 	fds = make([]int, 0)
@@ -265,12 +270,14 @@ func (msg *Message) EncodeToWithFDs(out io.Writer, order binary.ByteOrder) (fds 
 		return
 	}
 	enc.align(8)
-	body.WriteTo(&buf)
+	if _, err := body.WriteTo(&buf); err != nil {
+		return nil, err
+	}
 	if buf.Len() > 1<<27 {
-		return make([]int, 0), InvalidMessageError("message is too long")
+		return nil, InvalidMessageError("message is too long")
 	}
 	if _, err := buf.WriteTo(out); err != nil {
-		return make([]int, 0), err
+		return nil, err
 	}
 	return enc.fds, nil
 }
@@ -284,8 +291,12 @@ func (msg *Message) EncodeTo(out io.Writer, order binary.ByteOrder) (err error) 
 }
 
 // IsValid checks whether msg is a valid message and returns an
-// InvalidMessageError if it is not.
+// InvalidMessageError or FormatError if it is not.
 func (msg *Message) IsValid() error {
+	return msg.EncodeTo(io.Discard, nativeEndian)
+}
+
+func (msg *Message) validateHeader() error {
 	if msg.Flags & ^(FlagNoAutoStart|FlagNoReplyExpected|FlagAllowInteractiveAuthorization) != 0 {
 		return InvalidMessageError("invalid flags")
 	}
@@ -330,6 +341,7 @@ func (msg *Message) IsValid() error {
 			return InvalidMessageError("missing signature")
 		}
 	}
+
 	return nil
 }
 

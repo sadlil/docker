@@ -1,20 +1,23 @@
-package plugin // import "github.com/docker/docker/daemon/cluster/controllers/plugin"
+package plugin
 
 import (
 	"context"
 	"io"
 	"net/http"
 
-	"github.com/docker/distribution/reference"
-	enginetypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/swarm/runtime"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/plugin"
-	v2 "github.com/docker/docker/plugin/v2"
-	"github.com/docker/swarmkit/api"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
 	"github.com/gogo/protobuf/proto"
+	plugintypes "github.com/moby/moby/api/types/plugin"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/daemon/cluster/internal/runtime"
+	"github.com/moby/moby/v2/daemon/pkg/plugin"
+	v2 "github.com/moby/moby/v2/daemon/pkg/plugin/v2"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/swarmkit/v2/api"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // Controller is the controller for the plugin backend.
@@ -28,8 +31,8 @@ import (
 // the right way to pass registry credentials via secrets.
 type Controller struct {
 	backend Backend
-	spec    runtime.PluginSpec
-	logger  *logrus.Entry
+	spec    swarm.RuntimeSpec
+	logger  *log.Entry
 
 	pluginID  string
 	serviceID string
@@ -41,13 +44,13 @@ type Controller struct {
 // Backend is the interface for interacting with the plugin manager
 // Controller actions are passed to the configured backend to do the real work.
 type Backend interface {
-	Disable(name string, config *enginetypes.PluginDisableConfig) error
-	Enable(name string, config *enginetypes.PluginEnableConfig) error
-	Remove(name string, config *enginetypes.PluginRmConfig) error
-	Pull(ctx context.Context, ref reference.Named, name string, metaHeaders http.Header, authConfig *enginetypes.AuthConfig, privileges enginetypes.PluginPrivileges, outStream io.Writer, opts ...plugin.CreateOpt) error
-	Upgrade(ctx context.Context, ref reference.Named, name string, metaHeaders http.Header, authConfig *enginetypes.AuthConfig, privileges enginetypes.PluginPrivileges, outStream io.Writer) error
+	Disable(name string, config *backend.PluginDisableConfig) error
+	Enable(name string, config *backend.PluginEnableConfig) error
+	Remove(name string, config *backend.PluginRmConfig) error
+	Pull(ctx context.Context, ref reference.Named, name string, metaHeaders http.Header, authConfig *registry.AuthConfig, privileges plugintypes.Privileges, outStream io.Writer, opts ...plugin.CreateOpt) error
+	Upgrade(ctx context.Context, ref reference.Named, name string, metaHeaders http.Header, authConfig *registry.AuthConfig, privileges plugintypes.Privileges, outStream io.Writer) error
 	Get(name string) (*v2.Plugin, error)
-	SubscribeEvents(buffer int, events ...plugin.Event) (eventCh <-chan interface{}, cancel func())
+	SubscribeEvents(buffer int, events ...plugin.Event) (eventCh <-chan any, cancel func())
 }
 
 // NewController returns a new cluster plugin controller
@@ -60,21 +63,23 @@ func NewController(backend Backend, t *api.Task) (*Controller, error) {
 		backend:   backend,
 		spec:      spec,
 		serviceID: t.ServiceID,
-		logger: logrus.WithFields(logrus.Fields{
+		logger: log.G(context.TODO()).WithFields(log.Fields{
 			"controller": "plugin",
 			"task":       t.ID,
 			"plugin":     spec.Name,
-		})}, nil
+		}),
+	}, nil
 }
 
-func readSpec(t *api.Task) (runtime.PluginSpec, error) {
+func readSpec(t *api.Task) (swarm.RuntimeSpec, error) {
 	var cfg runtime.PluginSpec
 
 	generic := t.Spec.GetGeneric()
 	if err := proto.Unmarshal(generic.Payload.Value, &cfg); err != nil {
-		return cfg, errors.Wrap(err, "error reading plugin spec")
+		return swarm.RuntimeSpec{}, errors.Wrap(err, "error reading plugin spec")
 	}
-	return cfg, nil
+
+	return runtime.ToAPI(cfg), nil
 }
 
 // Update is the update phase from swarmkit
@@ -84,7 +89,7 @@ func (p *Controller) Update(ctx context.Context, t *api.Task) error {
 }
 
 // Prepare is the prepare phase from swarmkit
-func (p *Controller) Prepare(ctx context.Context) (err error) {
+func (p *Controller) Prepare(ctx context.Context) (retErr error) {
 	p.logger.Debug("Prepare")
 
 	remote, err := reference.ParseNormalizedNamed(p.spec.Remote)
@@ -96,13 +101,13 @@ func (p *Controller) Prepare(ctx context.Context) (err error) {
 		p.spec.Name = remote.String()
 	}
 
-	var authConfig enginetypes.AuthConfig
+	var authConfig registry.AuthConfig
 	privs := convertPrivileges(p.spec.Privileges)
 
 	pl, err := p.backend.Get(p.spec.Name)
 
 	defer func() {
-		if pl != nil && err == nil {
+		if pl != nil && retErr == nil {
 			pl.Acquire()
 		}
 	}()
@@ -112,7 +117,7 @@ func (p *Controller) Prepare(ctx context.Context) (err error) {
 			return errors.Errorf("plugin already exists: %s", p.spec.Name)
 		}
 		if pl.IsEnabled() {
-			if err := p.backend.Disable(pl.GetID(), &enginetypes.PluginDisableConfig{ForceDisable: true}); err != nil {
+			if err := p.backend.Disable(pl.GetID(), &backend.PluginDisableConfig{ForceDisable: true}); err != nil {
 				p.logger.WithError(err).Debug("could not disable plugin before running upgrade")
 			}
 		}
@@ -143,12 +148,12 @@ func (p *Controller) Start(ctx context.Context) error {
 
 	if p.spec.Disabled {
 		if pl.IsEnabled() {
-			return p.backend.Disable(p.pluginID, &enginetypes.PluginDisableConfig{ForceDisable: false})
+			return p.backend.Disable(p.pluginID, &backend.PluginDisableConfig{ForceDisable: false})
 		}
 		return nil
 	}
 	if !pl.IsEnabled() {
-		return p.backend.Enable(p.pluginID, &enginetypes.PluginEnableConfig{Timeout: 30})
+		return p.backend.Enable(p.pluginID, &backend.PluginEnableConfig{Timeout: 30})
 	}
 	return nil
 }
@@ -197,7 +202,7 @@ func (p *Controller) Wait(ctx context.Context) error {
 }
 
 func isNotFound(err error) bool {
-	return errdefs.IsNotFound(err)
+	return cerrdefs.IsNotFound(err)
 }
 
 // Shutdown is the shutdown phase from swarmkit
@@ -232,7 +237,7 @@ func (p *Controller) Remove(ctx context.Context) error {
 
 	// This may error because we have exactly 1 plugin, but potentially multiple
 	// tasks which are calling remove.
-	err = p.backend.Remove(p.pluginID, &enginetypes.PluginRmConfig{ForceRemove: true})
+	err = p.backend.Remove(p.pluginID, &backend.PluginRmConfig{ForceRemove: true})
 	if isNotFound(err) {
 		return nil
 	}
@@ -245,10 +250,10 @@ func (p *Controller) Close() error {
 	return nil
 }
 
-func convertPrivileges(ls []*runtime.PluginPrivilege) enginetypes.PluginPrivileges {
-	var out enginetypes.PluginPrivileges
+func convertPrivileges(ls []*swarm.RuntimePrivilege) plugintypes.Privileges {
+	var out plugintypes.Privileges
 	for _, p := range ls {
-		pp := enginetypes.PluginPrivilege{
+		pp := plugintypes.Privilege{
 			Name:        p.Name,
 			Description: p.Description,
 			Value:       p.Value,

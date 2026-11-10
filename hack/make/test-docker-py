@@ -4,19 +4,42 @@ set -e
 source hack/make/.integration-test-helpers
 
 # The commit or tag to use for testing
-# TODO docker 17.06 cli client used in CI fails to build using a sha;
-# unable to prepare context: unable to 'git clone' to temporary context directory: error fetching: error: no such remote ref ead0bb9e08c13dd3d1712759491eee06bf5a5602
-#: exit status 128
-: "${DOCKER_PY_COMMIT:=5.0.3}"
+: "${DOCKER_PY_COMMIT:=f387c3f92513189bbfbf7a77148138056d552e91}" # master (7.2.1-dev)
 
 # custom options to pass py.test
 #
 # This option can be used to temporarily skip flaky tests (using the `--deselect`
 # flag) until they are fixed upstream. For example:
 # --deselect=tests/integration/api_container_test.py::AttachContainerTest::test_attach_no_stream
+: "${PY_TEST_OPTIONS:=--junitxml=${DEST}/junit-report.xml}"
+
+# build --squash is not supported with containerd integration.
+if [ -z "$TEST_INTEGRATION_USE_GRAPHDRIVER" ]; then
+	PY_TEST_OPTIONS="$PY_TEST_OPTIONS --deselect=tests/integration/api_build_test.py::BuildTest::test_build_squash"
+fi
+
 # TODO re-enable test_attach_no_stream after https://github.com/docker/docker-py/issues/2513 is resolved
-# TODO re-enable test_create_with_device_cgroup_rules after https://github.com/docker/docker-py/issues/2939 is resolved
-: "${PY_TEST_OPTIONS:=--junitxml=${DEST}/junit-report.xml --deselect=tests/integration/api_container_test.py::AttachContainerTest::test_attach_no_stream --deselect=tests/integration/api_container_test.py::CreateContainerTest::test_create_with_device_cgroup_rules}"
+PY_TEST_OPTIONS="$PY_TEST_OPTIONS --deselect=tests/integration/api_container_test.py::AttachContainerTest::test_attach_no_stream"
+
+# TODO re-enable test_run_container_reading_socket_ws. It's reported in https://github.com/docker/docker-py/issues/1478, and we're getting that error in our tests.
+PY_TEST_OPTIONS="$PY_TEST_OPTIONS --deselect=tests/integration/api_container_test.py::AttachContainerTest::test_run_container_reading_socket_ws"
+
+# Legacy links are deprecated since a long time, and starting with v29.0, the Engine won't set legacy links env vars
+# automatically in linking containers. Thus, this test is expected to fail — skip it. See https://github.com/moby/moby/pull/50719
+PY_TEST_OPTIONS="${PY_TEST_OPTIONS} --deselect=tests/integration/api_container_test.py::CreateContainerTest::test_create_with_links"
+
+# The NetworkSettings.MacAddress field has been deprecated since Docker 1.9, and starting with v29.0, the Engine won't
+# include it in API respoonses. Thus, this test is expected to fail — skip it.
+# See https://github.com/moby/moby/pull/50846 and https://github.com/moby/moby/pull/50957
+PY_TEST_OPTIONS="${PY_TEST_OPTIONS} --deselect=tests/integration/api_container_test.py::CreateContainerTest::test_create_with_mac_address"
+
+# TODO re-enable once leaving a swarm no longer races the certificate renewal
+# that follows enabling autolock. When the leave loses, it fails with
+# "unlinkat /var/lib/docker/swarm/certificates: directory not empty", the
+# encrypted swarm state is left behind, and the next test's swarm init fails
+# with "Swarm is encrypted and needs to be unlocked".
+PY_TEST_OPTIONS="$PY_TEST_OPTIONS --deselect=tests/integration/api_swarm_test.py::SwarmTest::test_init_swarm_with_autolock_managers"
+PY_TEST_OPTIONS="$PY_TEST_OPTIONS --deselect=tests/integration/api_swarm_test.py::SwarmTest::test_rotate_manager_unlock_key"
 (
 	bundle .integration-daemon-start
 
@@ -60,4 +83,4 @@ source hack/make/.integration-test-helpers
 		exec docker run --rm ${run_opts} --mount type=bind,"src=${ABS_DEST}","dst=/src/${DEST}" "${docker_py_image}" pytest ${PY_TEST_OPTIONS} tests/integration
 	)
 	bundle .integration-daemon-stop
-) 2>&1 | tee -a "$DEST/test.log"
+) &> >(tee -a "$DEST/test.log")

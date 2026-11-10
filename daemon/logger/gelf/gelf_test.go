@@ -1,13 +1,12 @@
 //go:build linux
-// +build linux
 
-package gelf // import "github.com/docker/docker/daemon/logger/gelf"
+package gelf
 
 import (
 	"net"
 	"testing"
 
-	"github.com/docker/docker/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger"
 )
 
 // Validate parseAddress
@@ -97,13 +96,13 @@ func TestTCPValidateLogOpt(t *testing.T) {
 func TestUDPValidateLogOpt(t *testing.T) {
 	err := ValidateLogOpt(map[string]string{
 		"gelf-address":           "udp://127.0.0.1:12201",
-		"tag":                    "testtag",
-		"labels":                 "testlabel",
-		"labels-regex":           "testlabel-regex",
-		"env":                    "testenv",
-		"env-regex":              "testenv-regex",
 		"gelf-compression-level": "9",
 		"gelf-compression-type":  "gzip",
+		logger.AttrLogTag:        "testtag",
+		logger.AttrLabels:        "testlabel",
+		logger.AttrLabelsRegex:   "testlabel-regex",
+		logger.AttrEnv:           "testenv",
+		logger.AttrEnvRegex:      "testenv-regex",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +157,7 @@ func TestNewGELFTCPWriter(t *testing.T) {
 			"gelf-address":             url,
 			"gelf-tcp-max-reconnect":   "0",
 			"gelf-tcp-reconnect-delay": "0",
-			"tag":                      "{{.ID}}",
+			logger.AttrLogTag:          "{{.ID}}",
 		},
 		ContainerID: "12345678901234567890",
 	}
@@ -194,7 +193,7 @@ func TestNewGELFUDPWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer.Close()
+	err = writer.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,12 +222,12 @@ func TestNewTCP(t *testing.T) {
 		ContainerID: "12345678901234567890",
 	}
 
-	logger, err := New(info)
+	gelfLogger, err := New(info)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = logger.Close()
+	err = gelfLogger.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,12 +249,12 @@ func TestNewUDP(t *testing.T) {
 		ContainerID: "12345678901234567890",
 	}
 
-	logger, err := New(info)
+	gelfLogger, err := New(info)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = logger.Close()
+	err = gelfLogger.Close()
 	if err != nil {
 		t.Fatal(err)
 	}

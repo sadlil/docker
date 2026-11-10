@@ -1,46 +1,43 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/pkg/stringid"
-	volumemounts "github.com/docker/docker/volume/mounts"
-	volumeopts "github.com/docker/docker/volume/service/opts"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/container"
+	volumemounts "github.com/moby/moby/v2/daemon/volume/mounts"
+	volumeopts "github.com/moby/moby/v2/daemon/volume/service/opts"
 )
 
 // createContainerOSSpecificSettings performs host-OS specific container create functionality
-func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Container, config *containertypes.Config, hostConfig *containertypes.HostConfig) error {
-	if containertypes.Isolation.IsDefault(hostConfig.Isolation) {
+func (daemon *Daemon) createContainerOSSpecificSettings(ctx context.Context, ctr *container.Container) error {
+	if containertypes.Isolation.IsDefault(ctr.HostConfig.Isolation) {
 		// Make sure the host config has the default daemon isolation if not specified by caller.
-		hostConfig.Isolation = daemon.defaultIsolation
+		ctr.HostConfig.Isolation = daemon.defaultIsolation
 	}
+	return nil
+}
+
+// createContainerVolumesOS performs host-OS specific volume creation
+func (daemon *Daemon) createContainerVolumesOS(ctx context.Context, ctr *container.Container, config *containertypes.Config) error {
 	parser := volumemounts.NewParser()
 	for spec := range config.Volumes {
 
-		mp, err := parser.ParseMountRaw(spec, hostConfig.VolumeDriver)
+		mp, err := parser.ParseMountRaw(spec, ctr.HostConfig.VolumeDriver)
 		if err != nil {
 			return fmt.Errorf("Unrecognised volume spec: %v", err)
 		}
 
-		// If the mountpoint doesn't have a name, generate one.
-		if len(mp.Name) == 0 {
-			mp.Name = stringid.GenerateRandomID()
-		}
-
 		// Skip volumes for which we already have something mounted on that
 		// destination because of a --volume-from.
-		if container.IsDestinationMounted(mp.Destination) {
+		if ctr.IsDestinationMounted(mp.Destination) {
 			continue
 		}
 
-		volumeDriver := hostConfig.VolumeDriver
-
 		// Create the volume in the volume driver. If it doesn't exist,
 		// a new one will be created.
-		v, err := daemon.volumes.Create(context.TODO(), mp.Name, volumeDriver, volumeopts.WithCreateReference(container.ID))
+		v, err := daemon.volumes.Create(ctx, "", ctr.HostConfig.VolumeDriver, volumeopts.WithCreateReference(ctr.ID))
 		if err != nil {
 			return err
 		}
@@ -76,7 +73,7 @@ func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Con
 		//	}
 
 		// Add it to container.MountPoints
-		container.AddMountPointWithVolume(mp.Destination, &volumeWrapper{v: v, s: daemon.volumes}, mp.RW)
+		ctr.AddMountPointWithVolume(mp.Destination, &volumeWrapper{v: v, s: daemon.volumes}, mp.RW)
 	}
 	return nil
 }

@@ -9,7 +9,7 @@ on the Go client libraries.
 ## Testing gRPC services using fakes
 
 *Note*: You can see the full
-[example code using a fake here](https://github.com/googleapis/google-cloud-go/tree/master/internal/examples/fake).
+[example code using a fake here](https://github.com/googleapis/google-cloud-go/tree/main/internal/examples/fake).
 
 The clients found in `cloud.google.com/go` are gRPC based, with a couple of
 notable exceptions being the [`storage`](https://pkg.go.dev/cloud.google.com/go/storage)
@@ -79,7 +79,7 @@ func (f *fakeTranslationServer) TranslateText(ctx context.Context, req *translat
 ```
 
 All of the generated protobuf code found in [google.golang.org/genproto](https://pkg.go.dev/google.golang.org/genproto)
-contains a similar `package.UnimplmentedFooServer` type that is useful for
+contains a similar `package.UnimplementedFooServer` type that is useful for
 creating fakes. By embedding the unimplemented server in the
 `fakeTranslationServer`, the fake will “inherit” all of the RPCs the server
 exposes. Then, by providing our own `fakeTranslationServer.TranslateText`
@@ -99,6 +99,7 @@ import (
         "google.golang.org/api/option"
         translatepb "google.golang.org/genproto/googleapis/cloud/translate/v3"
         "google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func TestTranslateTextWithConcreteClient(t *testing.T) {
@@ -123,7 +124,7 @@ func TestTranslateTextWithConcreteClient(t *testing.T) {
         client, err := translate.NewTranslationClient(ctx,
                 option.WithEndpoint(fakeServerAddr),
                 option.WithoutAuthentication(),
-                option.WithGRPCDialOption(grpc.WithInsecure()),
+                option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
         )
         if err != nil {
                 t.Fatal(err)
@@ -143,7 +144,7 @@ func TestTranslateTextWithConcreteClient(t *testing.T) {
 ## Testing using mocks
 
 *Note*: You can see the full
-[example code using a mock here](https://github.com/googleapis/google-cloud-go/tree/master/internal/examples/mock).
+[example code using a mock here](https://github.com/googleapis/google-cloud-go/tree/main/internal/examples/mock).
 
 When mocking code you need to work with interfaces. Let’s create an interface
 for the `cloud.google.com/go/translate/apiv3` client used in the

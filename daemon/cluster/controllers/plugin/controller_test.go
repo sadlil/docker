@@ -1,4 +1,4 @@
-package plugin // import "github.com/docker/docker/daemon/cluster/controllers/plugin"
+package plugin
 
 import (
 	"context"
@@ -9,12 +9,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/distribution/reference"
-	enginetypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/swarm/runtime"
-	"github.com/docker/docker/pkg/pubsub"
-	"github.com/docker/docker/plugin"
-	v2 "github.com/docker/docker/plugin/v2"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
+	plugintypes "github.com/moby/moby/api/types/plugin"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/daemon/pkg/plugin"
+	v2 "github.com/moby/moby/v2/daemon/pkg/plugin/v2"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/pubsub"
 	"github.com/sirupsen/logrus"
 )
 
@@ -27,7 +30,7 @@ const (
 func TestPrepare(t *testing.T) {
 	b := newMockBackend()
 	c := newTestController(b, false)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	if err := c.Prepare(ctx); err != nil {
 		t.Fatal(err)
@@ -58,7 +61,7 @@ func TestPrepare(t *testing.T) {
 func TestStart(t *testing.T) {
 	b := newMockBackend()
 	c := newTestController(b, false)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	if err := c.Prepare(ctx); err != nil {
 		t.Fatal(err)
@@ -98,7 +101,7 @@ func TestStart(t *testing.T) {
 func TestWaitCancel(t *testing.T) {
 	b := newMockBackend()
 	c := newTestController(b, true)
-	ctx := context.Background()
+	ctx := t.Context()
 	if err := c.Prepare(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -114,18 +117,18 @@ func TestWaitCancel(t *testing.T) {
 	cancel()
 	select {
 	case err := <-chErr:
-		if err != context.Canceled {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatal(err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("timeout waiting for cancelation")
+		t.Fatal("timeout waiting for cancellation")
 	}
 }
 
 func TestWaitDisabled(t *testing.T) {
 	b := newMockBackend()
 	c := newTestController(b, true)
-	ctx := context.Background()
+	ctx := t.Context()
 	if err := c.Prepare(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +209,7 @@ func TestWaitDisabled(t *testing.T) {
 func TestWaitEnabled(t *testing.T) {
 	b := newMockBackend()
 	c := newTestController(b, false)
-	ctx := context.Background()
+	ctx := t.Context()
 	if err := c.Prepare(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +290,7 @@ func TestWaitEnabled(t *testing.T) {
 func TestRemove(t *testing.T) {
 	b := newMockBackend()
 	c := newTestController(b, false)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	if err := c.Prepare(ctx); err != nil {
 		t.Fatal(err)
@@ -320,9 +323,9 @@ func TestRemove(t *testing.T) {
 
 func newTestController(b Backend, disabled bool) *Controller {
 	return &Controller{
-		logger:  &logrus.Entry{Logger: &logrus.Logger{Out: io.Discard}},
+		logger:  &log.Entry{Logger: &logrus.Logger{Out: io.Discard}},
 		backend: b,
-		spec: runtime.PluginSpec{
+		spec: swarm.RuntimeSpec{
 			Name:     pluginTestName,
 			Remote:   pluginTestRemote,
 			Disabled: disabled,
@@ -341,27 +344,27 @@ type mockBackend struct {
 	pub *pubsub.Publisher
 }
 
-func (m *mockBackend) Disable(name string, config *enginetypes.PluginDisableConfig) error {
+func (m *mockBackend) Disable(name string, config *backend.PluginDisableConfig) error {
 	m.p.PluginObj.Enabled = false
 	m.pub.Publish(plugin.EventDisable{})
 	return nil
 }
 
-func (m *mockBackend) Enable(name string, config *enginetypes.PluginEnableConfig) error {
+func (m *mockBackend) Enable(name string, config *backend.PluginEnableConfig) error {
 	m.p.PluginObj.Enabled = true
 	m.pub.Publish(plugin.EventEnable{})
 	return nil
 }
 
-func (m *mockBackend) Remove(name string, config *enginetypes.PluginRmConfig) error {
+func (m *mockBackend) Remove(name string, config *backend.PluginRmConfig) error {
 	m.p = nil
 	m.pub.Publish(plugin.EventRemove{})
 	return nil
 }
 
-func (m *mockBackend) Pull(ctx context.Context, ref reference.Named, name string, metaHeaders http.Header, authConfig *enginetypes.AuthConfig, privileges enginetypes.PluginPrivileges, outStream io.Writer, opts ...plugin.CreateOpt) error {
+func (m *mockBackend) Pull(ctx context.Context, ref reference.Named, name string, metaHeaders http.Header, authConfig *registry.AuthConfig, privileges plugintypes.Privileges, outStream io.Writer, opts ...plugin.CreateOpt) error {
 	m.p = &v2.Plugin{
-		PluginObj: enginetypes.Plugin{
+		PluginObj: plugintypes.Plugin{
 			ID:              "1234",
 			Name:            name,
 			PluginReference: ref.String(),
@@ -370,7 +373,7 @@ func (m *mockBackend) Pull(ctx context.Context, ref reference.Named, name string
 	return nil
 }
 
-func (m *mockBackend) Upgrade(ctx context.Context, ref reference.Named, name string, metaHeaders http.Header, authConfig *enginetypes.AuthConfig, privileges enginetypes.PluginPrivileges, outStream io.Writer) error {
+func (m *mockBackend) Upgrade(ctx context.Context, ref reference.Named, name string, metaHeaders http.Header, authConfig *registry.AuthConfig, privileges plugintypes.Privileges, outStream io.Writer) error {
 	m.p.PluginObj.PluginReference = pluginTestRemoteUpgrade
 	return nil
 }
@@ -382,7 +385,7 @@ func (m *mockBackend) Get(name string) (*v2.Plugin, error) {
 	return m.p, nil
 }
 
-func (m *mockBackend) SubscribeEvents(buffer int, events ...plugin.Event) (eventCh <-chan interface{}, cancel func()) {
+func (m *mockBackend) SubscribeEvents(buffer int, events ...plugin.Event) (eventCh <-chan any, cancel func()) {
 	ch := m.pub.SubscribeTopicWithBuffer(nil, buffer)
 	cancel = func() { m.pub.Evict(ch) }
 	return ch, cancel

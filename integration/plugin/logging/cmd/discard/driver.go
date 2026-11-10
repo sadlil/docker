@@ -37,7 +37,7 @@ func handle(mux *http.ServeMux) {
 			return
 		}
 
-		f, err := os.OpenFile(req.File, syscall.O_RDONLY, 0700)
+		f, err := os.OpenFile(req.File, syscall.O_RDONLY, 0o600)
 		if err != nil {
 			respond(err, w)
 		}
@@ -81,5 +81,7 @@ func respond(err error, w io.Writer) {
 	if err != nil {
 		res.Err = err.Error()
 	}
-	json.NewEncoder(w).Encode(&res)
+	if err := json.NewEncoder(w).Encode(&res); err != nil {
+		panic("failed to encode response: " + err.Error())
+	}
 }

@@ -1,26 +1,27 @@
 package cacheimport
 
 import (
+	"cmp"
+	"context"
 	"fmt"
+	"slices"
 	"sort"
 
-	"github.com/moby/buildkit/exporter/containerimage/exptypes"
+	cerrdefs "github.com/containerd/errdefs"
+	cacheimporttypes "github.com/moby/buildkit/cache/remotecache/v1/types"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/compression"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
-// EmptyLayerRemovalSupported defines if implementation supports removal of empty layers. Buildkit image exporter
-// removes empty layers, but moby layerstore based implementation does not.
-var EmptyLayerRemovalSupported = true
-
 // sortConfig sorts the config structure to make sure it is deterministic
-func sortConfig(cc *CacheConfig) {
+func sortConfig(cc *cacheimporttypes.CacheConfig) {
 	type indexedLayer struct {
 		oldIndex int
 		newIndex int
-		l        CacheLayer
+		l        cacheimporttypes.CacheLayer
 	}
 
 	unsortedLayers := make([]*indexedLayer, len(cc.Layers))
@@ -31,19 +32,14 @@ func sortConfig(cc *CacheConfig) {
 		unsortedLayers[i] = il
 		sortedLayers[i] = il
 	}
-	sort.Slice(sortedLayers, func(i, j int) bool {
-		li := sortedLayers[i].l
-		lj := sortedLayers[j].l
-		if li.Blob == lj.Blob {
-			return li.ParentIndex < lj.ParentIndex
-		}
-		return li.Blob < lj.Blob
+	slices.SortFunc(sortedLayers, func(a, b *indexedLayer) int {
+		return cmp.Or(cmp.Compare(a.l.Blob, b.l.Blob), cmp.Compare(a.l.ParentIndex, b.l.ParentIndex))
 	})
 	for i, l := range sortedLayers {
 		l.newIndex = i
 	}
 
-	layers := make([]CacheLayer, len(sortedLayers))
+	layers := make([]cacheimporttypes.CacheLayer, len(sortedLayers))
 	for i, l := range sortedLayers {
 		if pID := l.l.ParentIndex; pID != -1 {
 			l.l.ParentIndex = unsortedLayers[pID].newIndex
@@ -54,7 +50,7 @@ func sortConfig(cc *CacheConfig) {
 	type indexedRecord struct {
 		oldIndex int
 		newIndex int
-		r        CacheRecord
+		r        cacheimporttypes.CacheRecord
 	}
 
 	unsortedRecords := make([]*indexedRecord, len(cc.Records))
@@ -95,7 +91,7 @@ func sortConfig(cc *CacheConfig) {
 		l.newIndex = i
 	}
 
-	records := make([]CacheRecord, len(sortedRecords))
+	records := make([]cacheimporttypes.CacheRecord, len(sortedRecords))
 	for i, r := range sortedRecords {
 		for j := range r.r.Results {
 			r.r.Results[j].LayerIndex = unsortedLayers[r.r.Results[j].LayerIndex].newIndex
@@ -104,8 +100,8 @@ func sortConfig(cc *CacheConfig) {
 			for k := range inputs {
 				r.r.Inputs[j][k].LinkIndex = unsortedRecords[r.r.Inputs[j][k].LinkIndex].newIndex
 			}
-			sort.Slice(inputs, func(i, j int) bool {
-				return inputs[i].LinkIndex < inputs[j].LinkIndex
+			slices.SortFunc(inputs, func(a, b cacheimporttypes.CacheInput) int {
+				return cmp.Compare(a.LinkIndex, b.LinkIndex)
 			})
 		}
 		records[i] = r.r
@@ -116,7 +112,7 @@ func sortConfig(cc *CacheConfig) {
 }
 
 func outputKey(dgst digest.Digest, idx int) digest.Digest {
-	return digest.FromBytes([]byte(fmt.Sprintf("%s@%d", dgst, idx)))
+	return digest.FromBytes(fmt.Appendf(nil, "%s@%d", dgst, idx))
 }
 
 type nlink struct {
@@ -124,234 +120,97 @@ type nlink struct {
 	input    int
 	selector string
 }
-type normalizeState struct {
-	added map[*item]*item
-	links map[*item]map[nlink]map[digest.Digest]struct{}
-	byKey map[digest.Digest]*item
-	next  int
-}
-
-func (s *normalizeState) removeLoops() {
-	roots := []digest.Digest{}
-	for dgst, it := range s.byKey {
-		if len(it.links) == 0 {
-			roots = append(roots, dgst)
-		}
-	}
-
-	visited := map[digest.Digest]struct{}{}
-
-	for _, d := range roots {
-		s.checkLoops(d, visited)
-	}
-}
-
-func (s *normalizeState) checkLoops(d digest.Digest, visited map[digest.Digest]struct{}) {
-	it, ok := s.byKey[d]
-	if !ok {
-		return
-	}
-	links, ok := s.links[it]
-	if !ok {
-		return
-	}
-	visited[d] = struct{}{}
-	defer func() {
-		delete(visited, d)
-	}()
-
-	for l, ids := range links {
-		for id := range ids {
-			if _, ok := visited[id]; ok {
-				it2, ok := s.byKey[id]
-				if !ok {
-					continue
-				}
-				if !it2.removeLink(it) {
-					logrus.Warnf("failed to remove looping cache key %s %s", d, id)
-				}
-				delete(links[l], id)
-			} else {
-				s.checkLoops(id, visited)
-			}
-		}
-	}
-}
-
-func normalizeItem(it *item, state *normalizeState) (*item, error) {
-	if it2, ok := state.added[it]; ok {
-		return it2, nil
-	}
-
-	if len(it.links) == 0 {
-		id := it.dgst
-		if it2, ok := state.byKey[id]; ok {
-			state.added[it] = it2
-			return it2, nil
-		}
-		state.byKey[id] = it
-		state.added[it] = it
-		return nil, nil
-	}
-
-	matches := map[digest.Digest]struct{}{}
-
-	// check if there is already a matching record
-	for i, m := range it.links {
-		if len(m) == 0 {
-			return nil, errors.Errorf("invalid incomplete links")
-		}
-		for l := range m {
-			nl := nlink{dgst: it.dgst, input: i, selector: l.selector}
-			it2, err := normalizeItem(l.src, state)
-			if err != nil {
-				return nil, err
-			}
-			links := state.links[it2][nl]
-			if i == 0 {
-				for id := range links {
-					matches[id] = struct{}{}
-				}
-			} else {
-				for id := range matches {
-					if _, ok := links[id]; !ok {
-						delete(matches, id)
-					}
-				}
-			}
-		}
-	}
-
-	var id digest.Digest
-
-	links := it.links
-
-	if len(matches) > 0 {
-		for m := range matches {
-			if id == "" || id > m {
-				id = m
-			}
-		}
-	} else {
-		// keep tmp IDs deterministic
-		state.next++
-		id = digest.FromBytes([]byte(fmt.Sprintf("%d", state.next)))
-		state.byKey[id] = it
-		it.links = make([]map[link]struct{}, len(it.links))
-		for i := range it.links {
-			it.links[i] = map[link]struct{}{}
-		}
-	}
-
-	it2 := state.byKey[id]
-	state.added[it] = it2
-
-	for i, m := range links {
-		for l := range m {
-			subIt, err := normalizeItem(l.src, state)
-			if err != nil {
-				return nil, err
-			}
-			it2.links[i][link{src: subIt, selector: l.selector}] = struct{}{}
-
-			nl := nlink{dgst: it.dgst, input: i, selector: l.selector}
-			if _, ok := state.links[subIt]; !ok {
-				state.links[subIt] = map[nlink]map[digest.Digest]struct{}{}
-			}
-			if _, ok := state.links[subIt][nl]; !ok {
-				state.links[subIt][nl] = map[digest.Digest]struct{}{}
-			}
-			state.links[subIt][nl][id] = struct{}{}
-		}
-	}
-
-	return it2, nil
-}
 
 type marshalState struct {
-	layers      []CacheLayer
+	layers      []cacheimporttypes.CacheLayer
 	chainsByID  map[string]int
 	descriptors DescriptorProvider
 
-	records       []CacheRecord
+	records       []cacheimporttypes.CacheRecord
 	recordsByItem map[*item]int
 }
 
-func marshalRemote(r *solver.Remote, state *marshalState) string {
+func marshalRemote(ctx context.Context, r *solver.Remote, state *marshalState) string {
 	if len(r.Descriptors) == 0 {
 		return ""
 	}
-	var parentID string
-	if len(r.Descriptors) > 1 {
-		r2 := &solver.Remote{
-			Descriptors: r.Descriptors[:len(r.Descriptors)-1],
-			Provider:    r.Provider,
+
+	if r.Provider != nil {
+		for _, d := range r.Descriptors {
+			if _, err := r.Provider.Info(ctx, d.Digest); err != nil && !cerrdefs.IsNotImplemented(err) {
+				bklog.G(ctx).WithError(err).Warnf("skipping cache result: blob %s is not available", d.Digest)
+				return ""
+			}
 		}
-		parentID = marshalRemote(r2, state)
-	}
-	desc := r.Descriptors[len(r.Descriptors)-1]
-
-	if desc.Digest == exptypes.EmptyGZLayer && EmptyLayerRemovalSupported {
-		return parentID
 	}
 
-	state.descriptors[desc.Digest] = DescriptorProviderPair{
-		Descriptor: desc,
-		Provider:   r.Provider,
-	}
+	var parentID string
+	for _, desc := range r.Descriptors {
+		if desc.MediaType != "" {
+			desc = compression.ConvertAllLayerMediaTypes(ctx, true, desc)[0]
+		}
 
-	id := desc.Digest.String() + parentID
+		state.descriptors[desc.Digest] = DescriptorProviderPair{
+			Descriptor: desc,
+			Provider:   r.Provider,
+		}
 
-	if _, ok := state.chainsByID[id]; ok {
-		return id
-	}
+		id := desc.Digest.String() + parentID
 
-	state.chainsByID[id] = len(state.layers)
-	l := CacheLayer{
-		Blob:        desc.Digest,
-		ParentIndex: -1,
+		if _, ok := state.chainsByID[id]; !ok {
+			state.chainsByID[id] = len(state.layers)
+			l := cacheimporttypes.CacheLayer{
+				Blob:        desc.Digest,
+				ParentIndex: -1,
+			}
+			if parentID != "" {
+				l.ParentIndex = state.chainsByID[parentID]
+			}
+			state.layers = append(state.layers, l)
+		}
+		parentID = id
 	}
-	if parentID != "" {
-		l.ParentIndex = state.chainsByID[parentID]
-	}
-	state.layers = append(state.layers, l)
-	return id
+	return parentID
 }
 
-func marshalItem(it *item, state *marshalState) error {
+func marshalItem(ctx context.Context, it *item, state *marshalState) error {
 	if _, ok := state.recordsByItem[it]; ok {
 		return nil
 	}
+	state.recordsByItem[it] = -1
 
-	rec := CacheRecord{
+	rec := cacheimporttypes.CacheRecord{
 		Digest: it.dgst,
-		Inputs: make([][]CacheInput, len(it.links)),
+		Inputs: make([][]cacheimporttypes.CacheInput, len(it.parents)),
 	}
 
-	for i, m := range it.links {
+	for i, m := range it.parents {
 		for l := range m {
-			if err := marshalItem(l.src, state); err != nil {
+			if err := marshalItem(ctx, l.src, state); err != nil {
 				return err
 			}
 			idx, ok := state.recordsByItem[l.src]
 			if !ok {
 				return errors.Errorf("invalid source record: %v", l.src)
 			}
-			rec.Inputs[i] = append(rec.Inputs[i], CacheInput{
+			if idx == -1 {
+				continue
+			}
+			rec.Inputs[i] = append(rec.Inputs[i], cacheimporttypes.CacheInput{
 				Selector:  l.selector,
 				LinkIndex: idx,
 			})
 		}
 	}
 
-	if it.result != nil {
-		id := marshalRemote(it.result, state)
+	if res := it.bestResult(); res != nil {
+		id := marshalRemote(ctx, res.Result, state)
 		if id != "" {
 			idx, ok := state.chainsByID[id]
 			if !ok {
-				return errors.Errorf("parent chainid not found")
+				return errors.New("parent chainid not found")
 			}
-			rec.Results = append(rec.Results, CacheResult{LayerIndex: idx, CreatedAt: it.resultTime})
+			rec.Results = append(rec.Results, cacheimporttypes.CacheResult{LayerIndex: idx, CreatedAt: res.CreatedAt})
 		}
 	}
 

@@ -3,14 +3,15 @@ package cacheimport
 import (
 	"encoding/json"
 
+	cacheimporttypes "github.com/moby/buildkit/cache/remotecache/v1/types"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/contentutil"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
 func Parse(configJSON []byte, provider DescriptorProvider, t solver.CacheExporterTarget) error {
-	var config CacheConfig
+	var config cacheimporttypes.CacheConfig
 	if err := json.Unmarshal(configJSON, &config); err != nil {
 		return errors.WithStack(err)
 	}
@@ -18,7 +19,7 @@ func Parse(configJSON []byte, provider DescriptorProvider, t solver.CacheExporte
 	return ParseConfig(config, provider, t)
 }
 
-func ParseConfig(config CacheConfig, provider DescriptorProvider, t solver.CacheExporterTarget) error {
+func ParseConfig(config cacheimporttypes.CacheConfig, provider DescriptorProvider, t solver.CacheExporterTarget) error {
 	cache := map[int]solver.CacheExporterRecord{}
 
 	for i := range config.Records {
@@ -29,31 +30,40 @@ func ParseConfig(config CacheConfig, provider DescriptorProvider, t solver.Cache
 	return nil
 }
 
-func parseRecord(cc CacheConfig, idx int, provider DescriptorProvider, t solver.CacheExporterTarget, cache map[int]solver.CacheExporterRecord) (solver.CacheExporterRecord, error) {
+func parseRecord(cc cacheimporttypes.CacheConfig, idx int, provider DescriptorProvider, t solver.CacheExporterTarget, cache map[int]solver.CacheExporterRecord) (solver.CacheExporterRecord, error) {
 	if r, ok := cache[idx]; ok {
 		if r == nil {
-			return nil, errors.Errorf("invalid looping record")
+			return nil, errors.New("invalid looping record")
 		}
 		return r, nil
 	}
 
+	cache[idx] = nil
 	if idx < 0 || idx >= len(cc.Records) {
 		return nil, errors.Errorf("invalid record ID: %d", idx)
 	}
 	rec := cc.Records[idx]
 
-	r := t.Add(rec.Digest)
-	cache[idx] = nil
+	links := make([][]solver.CacheLink, len(rec.Inputs))
+
 	for i, inputs := range rec.Inputs {
-		for _, inp := range inputs {
+		if len(inputs) == 0 {
+			return nil, errors.Errorf("invalid empty input for record %d", idx)
+		}
+		links[i] = make([]solver.CacheLink, len(inputs))
+		for j, inp := range inputs {
 			src, err := parseRecord(cc, inp.LinkIndex, provider, t, cache)
 			if err != nil {
 				return nil, err
 			}
-			r.LinkFrom(src, i, inp.Selector)
+			links[i][j] = solver.CacheLink{
+				Selector: inp.Selector,
+				Src:      src,
+			}
 		}
 	}
 
+	results := make([]solver.CacheExportResult, 0, len(rec.Results))
 	for _, res := range rec.Results {
 		visited := map[int]struct{}{}
 		remote, err := getRemoteChain(cc.Layers, res.LayerIndex, provider, visited)
@@ -61,17 +71,51 @@ func parseRecord(cc CacheConfig, idx int, provider DescriptorProvider, t solver.
 			return nil, err
 		}
 		if remote != nil {
-			r.AddResult(res.CreatedAt, remote)
+			results = append(results, solver.CacheExportResult{
+				CreatedAt: res.CreatedAt,
+				Result:    remote,
+			})
+		}
+	}
+	for _, res := range rec.ChainedResults {
+		remote := &solver.Remote{}
+		mp := contentutil.NewMultiProvider(nil)
+		for _, diff := range res.LayerIndexes {
+			if diff < 0 || diff >= len(cc.Layers) {
+				return nil, errors.Errorf("invalid layer index %d", diff)
+			}
+
+			l := cc.Layers[diff]
+
+			descPair, ok := provider[l.Blob]
+			if !ok {
+				remote = nil
+				break
+			}
+
+			remote.Descriptors = append(remote.Descriptors, descPair.Descriptor)
+			mp.Add(descPair.Descriptor.Digest, descPair)
+		}
+		if remote != nil {
+			remote.Provider = mp
+			results = append(results, solver.CacheExportResult{
+				CreatedAt: res.CreatedAt,
+				Result:    remote,
+			})
 		}
 	}
 
+	r, _, err := t.Add(rec.Digest, links, results)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to add record %d", idx)
+	}
 	cache[idx] = r
 	return r, nil
 }
 
-func getRemoteChain(layers []CacheLayer, idx int, provider DescriptorProvider, visited map[int]struct{}) (*solver.Remote, error) {
+func getRemoteChain(layers []cacheimporttypes.CacheLayer, idx int, provider DescriptorProvider, visited map[int]struct{}) (*solver.Remote, error) {
 	if _, ok := visited[idx]; ok {
-		return nil, errors.Errorf("invalid looping layer")
+		return nil, errors.New("invalid looping layer")
 	}
 	visited[idx] = struct{}{}
 
@@ -98,13 +142,12 @@ func getRemoteChain(layers []CacheLayer, idx int, provider DescriptorProvider, v
 		}
 		r.Descriptors = append(r.Descriptors, descPair.Descriptor)
 		mp := contentutil.NewMultiProvider(r.Provider)
-		mp.Add(descPair.Descriptor.Digest, descPair.Provider)
+		mp.Add(descPair.Descriptor.Digest, descPair)
 		r.Provider = mp
 		return r, nil
 	}
 	return &solver.Remote{
-		Descriptors: []ocispec.Descriptor{descPair.Descriptor},
-		Provider:    descPair.Provider,
+		Descriptors: []ocispecs.Descriptor{descPair.Descriptor},
+		Provider:    descPair,
 	}, nil
-
 }

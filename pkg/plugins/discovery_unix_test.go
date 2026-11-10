@@ -1,10 +1,8 @@
 //go:build !windows
-// +build !windows
 
-package plugins // import "github.com/docker/docker/pkg/plugins"
+package plugins
 
 import (
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,8 +14,11 @@ import (
 
 func TestLocalSocket(t *testing.T) {
 	// TODO Windows: Enable a similar version for Windows named pipes
-	tmpdir, unregister := Setup(t)
-	defer unregister()
+	tmpdir := t.TempDir()
+	r := LocalRegistry{
+		socketsPath: tmpdir,
+		specsPaths:  []string{tmpdir},
+	}
 
 	cases := []string{
 		filepath.Join(tmpdir, "echo.sock"),
@@ -25,7 +26,7 @@ func TestLocalSocket(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		if err := os.MkdirAll(filepath.Dir(c), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(c), 0o755); err != nil {
 			t.Fatal(err)
 		}
 
@@ -34,7 +35,6 @@ func TestLocalSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		r := newLocalRegistry()
 		p, err := r.Plugin("echo")
 		if err != nil {
 			t.Fatal(err)
@@ -44,7 +44,7 @@ func TestLocalSocket(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(p, pp) {
+		if !reflect.DeepEqual(p, pp) { //nolint:govet // ignore 'deepequalerrors: avoid using reflect.DeepEqual with errors', which is triggered by Plugin having a activateErr field.
 			t.Fatalf("Expected %v, was %v\n", p, pp)
 		}
 
@@ -52,7 +52,7 @@ func TestLocalSocket(t *testing.T) {
 			t.Fatalf("Expected plugin `echo`, got %s\n", p.name)
 		}
 
-		addr := fmt.Sprintf("unix://%s", c)
+		addr := "unix://" + c
 		if p.Addr != addr {
 			t.Fatalf("Expected plugin addr `%s`, got %s\n", addr, p.Addr)
 		}
@@ -64,10 +64,13 @@ func TestLocalSocket(t *testing.T) {
 }
 
 func TestScan(t *testing.T) {
-	tmpdir, unregister := Setup(t)
-	defer unregister()
+	tmpdir := t.TempDir()
+	r := LocalRegistry{
+		socketsPath: tmpdir,
+		specsPaths:  []string{tmpdir},
+	}
 
-	pluginNames, err := Scan()
+	pluginNames, err := r.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,21 +82,20 @@ func TestScan(t *testing.T) {
 	addr := "unix://var/lib/docker/plugins/echo.sock"
 	name := "echo"
 
-	err = os.MkdirAll(filepath.Dir(path), 0755)
+	err = os.MkdirAll(filepath.Dir(path), 0o755)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = os.WriteFile(path, []byte(addr), 0644)
+	err = os.WriteFile(path, []byte(addr), 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	r := newLocalRegistry()
 	p, err := r.Plugin(name)
 	assert.NilError(t, err)
 
-	pluginNamesNotEmpty, err := Scan()
+	pluginNamesNotEmpty, err := r.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,14 +108,17 @@ func TestScan(t *testing.T) {
 }
 
 func TestScanNotPlugins(t *testing.T) {
-	tmpdir, unregister := Setup(t)
-	defer unregister()
+	tmpdir := t.TempDir()
+	localRegistry := LocalRegistry{
+		socketsPath: tmpdir,
+		specsPaths:  []string{tmpdir},
+	}
 
 	// not that `Setup()` above sets the sockets path and spec path dirs, which
 	// `Scan()` uses to find plugins to the returned `tmpdir`
 
 	notPlugin := filepath.Join(tmpdir, "not-a-plugin")
-	if err := os.MkdirAll(notPlugin, 0700); err != nil {
+	if err := os.MkdirAll(notPlugin, 0o700); err != nil {
 		t.Fatal(err)
 	}
 
@@ -131,7 +136,7 @@ func TestScanNotPlugins(t *testing.T) {
 	}
 	defer f.Close()
 
-	names, err := Scan()
+	names, err := localRegistry.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +151,7 @@ func TestScanNotPlugins(t *testing.T) {
 	}
 	defer f.Close()
 
-	names, err = Scan()
+	names, err = localRegistry.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}

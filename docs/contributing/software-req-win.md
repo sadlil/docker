@@ -58,10 +58,10 @@ Check out the [getting started documentation](https://github.com/docker/labs/blo
 To contribute to the Docker project, you need a <a href="https://github.com" target="_blank">GitHub account</a>.
 A free account is fine. All the Moby project repositories are public and visible to everyone.
 
-This guide assumes that you have basic familiarity with Git and Github terminology
+This guide assumes that you have basic familiarity with Git and GitHub terminology
 and usage.
 Refer to [GitHub For Beginners: Don’t Get Scared, Get Started](http://readwrite.com/2013/09/30/understanding-github-a-journey-for-beginners-part-1/)
-to get up to speed on Github.
+to get up to speed on GitHub.
 
 ### 3. Git
 
@@ -100,8 +100,8 @@ To build Moby, run:
 Copy out the resulting Windows Moby Engine binary to `dockerd.exe` in the
 current directory:
 
-    docker cp binaries:C:\gopath\src\github.com\docker\docker\bundles\docker.exe docker.exe
-    docker cp binaries:C:\gopath\src\github.com\docker\docker\bundles\dockerd.exe dockerd.exe
+    docker cp binaries:C:\usr\src\moby\bundles\docker.exe docker.exe
+    docker cp binaries:C:\usr\src\moby\bundles\dockerd.exe dockerd.exe
 
 To test it, stop the system Docker daemon and start the one you just built:
 
@@ -109,7 +109,8 @@ To test it, stop the system Docker daemon and start the one you just built:
     .\dockerd.exe -D
 
 The other make targets work too, to run unit tests try:
-`docker run --rm docker-builder sh -c 'cd /c/gopath/src/github.com/docker/docker; hack/make.sh test-unit'`.
+
+    docker run --rm docker-builder sh -c 'cd /c/usr/src/moby; hack/make.sh test-unit'
 
 ### 6. Remove the interim binaries container
 
@@ -173,5 +174,7 @@ https://github.com/kevpar/docker-w2wCIScripts/blob/master/runCI/Invoke-DockerCI.
 
 ## Where to go next
 
-In the next section, you'll [learn how to set up and configure Git for
-contributing to Moby](set-up-git.md).
+In the next section, you'll [configure the project to be properly recognized by the IDE](set-up-ide.md).
+
+If you don't want to use IDE, you can proceed to the next step
+and [learn how to set up and configure Git for contributing to Moby](set-up-git.md).

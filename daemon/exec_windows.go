@@ -1,13 +1,15 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/exec"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"context"
+
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config, p *specs.Process) error {
-	if c.OS == "windows" {
+func (daemon *Daemon) execSetPlatformOpt(ctx context.Context, daemonCfg *config.Config, ec *container.ExecConfig, p *specs.Process) error {
+	if ec.Container.ImagePlatform.OS == "windows" {
 		p.User.Username = ec.User
 	}
 	return nil

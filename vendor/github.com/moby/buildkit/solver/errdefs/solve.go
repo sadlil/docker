@@ -1,26 +1,25 @@
 package errdefs
 
 import (
-	"bytes"
 	"errors"
 
-	"github.com/containerd/typeurl"
-	"github.com/golang/protobuf/jsonpb"
+	"github.com/containerd/typeurl/v2"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/grpcerrors"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func init() {
 	typeurl.Register((*Solve)(nil), "github.com/moby/buildkit", "errdefs.Solve+json")
 }
 
-//nolint:golint
+//nolint:staticcheck
 type IsSolve_Subject isSolve_Subject
 
 // SolveError will be returned when an error is encountered during a solve that
 // has an exec op.
 type SolveError struct {
-	Solve
+	*Solve
 	Err error
 }
 
@@ -33,7 +32,7 @@ func (e *SolveError) Unwrap() error {
 }
 
 func (e *SolveError) ToProto() grpcerrors.TypedErrorProto {
-	return &e.Solve
+	return e.Solve
 }
 
 func WithSolveError(err error, subject IsSolve_Subject, inputIDs, mountIDs []string) error {
@@ -41,34 +40,34 @@ func WithSolveError(err error, subject IsSolve_Subject, inputIDs, mountIDs []str
 		return nil
 	}
 	var (
-		oe *OpError
-		op *pb.Op
+		oe          *OpError
+		op          *pb.Op
+		description map[string]string
 	)
 	if errors.As(err, &oe) {
 		op = oe.Op
+		description = oe.Description
 	}
 	return &SolveError{
 		Err: err,
-		Solve: Solve{
-			InputIDs: inputIDs,
-			MountIDs: mountIDs,
-			Op:       op,
-			Subject:  subject,
+		Solve: &Solve{
+			InputIDs:    inputIDs,
+			MountIDs:    mountIDs,
+			Op:          op,
+			Subject:     subject,
+			Description: description,
 		},
 	}
 }
 
 func (v *Solve) WrapError(err error) error {
-	return &SolveError{Err: err, Solve: *v}
+	return &SolveError{Err: err, Solve: v}
 }
 
 func (v *Solve) MarshalJSON() ([]byte, error) {
-	m := jsonpb.Marshaler{}
-	buf := new(bytes.Buffer)
-	err := m.Marshal(buf, v)
-	return buf.Bytes(), err
+	return protojson.Marshal(v)
 }
 
 func (v *Solve) UnmarshalJSON(b []byte) error {
-	return jsonpb.Unmarshal(bytes.NewReader(b), v)
+	return protojson.Unmarshal(b, v)
 }

@@ -1,13 +1,15 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
-	"github.com/docker/docker/api/types"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
+	cerrdefs "github.com/containerd/errdefs"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/server/backend"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -34,54 +36,56 @@ func newContainerWithState(state *container.State) *container.Container {
 // TestContainerDelete tests that a useful error message and instructions is
 // given when attempting to remove a container (#30842)
 func TestContainerDelete(t *testing.T) {
-	tt := []struct {
+	tests := []struct {
+		doc           string
 		errMsg        string
-		fixMsg        string
 		initContainer func() *container.Container
 	}{
-		// a paused container
 		{
-			errMsg: "cannot remove a paused container",
-			fixMsg: "Unpause and then stop the container before attempting removal or force remove",
+			doc:    "paused container",
+			errMsg: "container is paused and must be unpaused first",
 			initContainer: func() *container.Container {
 				return newContainerWithState(&container.State{Paused: true, Running: true})
-			}},
-		// a restarting container
+			},
+		},
 		{
-			errMsg: "cannot remove a restarting container",
-			fixMsg: "Stop the container before attempting removal or force remove",
+			doc:    "restarting container",
+			errMsg: "container is restarting: stop the container before removing or force remove",
 			initContainer: func() *container.Container {
-				c := newContainerWithState(container.NewState())
-				c.SetRunning(0, true)
-				c.SetRestarting(&container.ExitStatus{})
+				c := newContainerWithState(&container.State{Running: true, StartedAt: time.Now()})
+				c.State.SetRestarting(&container.ExitStatus{})
 				return c
-			}},
-		// a running container
+			},
+		},
 		{
-			errMsg: "cannot remove a running container",
-			fixMsg: "Stop the container before attempting removal or force remove",
+			doc:    "running container",
+			errMsg: "container is running: stop the container before removing or force remove",
 			initContainer: func() *container.Container {
 				return newContainerWithState(&container.State{Running: true})
-			}},
+			},
+		},
 	}
 
-	for _, te := range tt {
-		c := te.initContainer()
-		d, cleanup := newDaemonWithTmpRoot(t)
-		defer cleanup()
-		d.containers.Add(c.ID, c)
+	for _, tc := range tests {
+		t.Run(tc.doc, func(t *testing.T) {
+			c := tc.initContainer()
+			d, cleanup := newDaemonWithTmpRoot(t)
+			defer cleanup()
+			d.containers.Add(c.ID, c)
 
-		err := d.ContainerRm(c.ID, &types.ContainerRmConfig{ForceRemove: false})
-		assert.Check(t, is.ErrorContains(err, te.errMsg))
-		assert.Check(t, is.ErrorContains(err, te.fixMsg))
+			err := d.ContainerRm(c.ID, &backend.ContainerRmConfig{ForceRemove: false})
+			assert.Check(t, is.ErrorType(err, cerrdefs.IsConflict))
+			assert.Check(t, is.ErrorContains(err, tc.errMsg))
+		})
 	}
 }
 
-func TestContainerDoubleDelete(t *testing.T) {
-	c := newContainerWithState(container.NewState())
-
-	// Mark the container as having a delete in progress
-	c.SetRemovalInProgress()
+// TestContainerDeleteRemovalInProgress verifies that removing a container
+// that is already being removed returns a conflict, even when forced.
+func TestContainerDeleteRemovalInProgress(t *testing.T) {
+	c := newContainerWithState(&container.State{
+		RemovalInProgress: true,
+	})
 
 	d, cleanup := newDaemonWithTmpRoot(t)
 	defer cleanup()
@@ -89,6 +93,7 @@ func TestContainerDoubleDelete(t *testing.T) {
 
 	// Try to remove the container when its state is removalInProgress.
 	// It should return an error indicating it is under removal progress.
-	err := d.ContainerRm(c.ID, &types.ContainerRmConfig{ForceRemove: true})
+	err := d.ContainerRm(c.ID, &backend.ContainerRmConfig{ForceRemove: true})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsConflict))
 	assert.Check(t, is.ErrorContains(err, fmt.Sprintf("removal of container %s is already in progress", c.ID)))
 }

@@ -1,23 +1,40 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"net/url"
-
-	"github.com/docker/docker/api/types"
 )
 
+// ContainerStartOptions holds options for [Client.ContainerStart].
+type ContainerStartOptions struct {
+	CheckpointID  string
+	CheckpointDir string
+}
+
+// ContainerStartResult holds the result of [Client.ContainerStart],
+type ContainerStartResult struct {
+	// Add future fields here.
+}
+
 // ContainerStart sends a request to the docker daemon to start a container.
-func (cli *Client) ContainerStart(ctx context.Context, containerID string, options types.ContainerStartOptions) error {
+func (cli *Client) ContainerStart(ctx context.Context, containerID string, options ContainerStartOptions) (ContainerStartResult, error) {
+	containerID, err := trimID("container", containerID)
+	if err != nil {
+		return ContainerStartResult{}, err
+	}
+
 	query := url.Values{}
-	if len(options.CheckpointID) != 0 {
+	if options.CheckpointID != "" {
 		query.Set("checkpoint", options.CheckpointID)
 	}
-	if len(options.CheckpointDir) != 0 {
+	if options.CheckpointDir != "" {
 		query.Set("checkpoint-dir", options.CheckpointDir)
 	}
 
 	resp, err := cli.post(ctx, "/containers/"+containerID+"/start", query, nil, nil)
-	ensureReaderClosed(resp)
-	return err
+	defer ensureReaderClosed(resp)
+	if err != nil {
+		return ContainerStartResult{}, err
+	}
+	return ContainerStartResult{}, nil
 }

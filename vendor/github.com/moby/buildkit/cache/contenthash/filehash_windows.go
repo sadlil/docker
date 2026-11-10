@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 package contenthash
 
@@ -8,6 +8,6 @@ import (
 	fstypes "github.com/tonistiigi/fsutil/types"
 )
 
-func setUnixOpt(path string, fi os.FileInfo, stat *fstypes.Stat) error {
+func setUnixOpt(_ string, _ os.FileInfo, _ *fstypes.Stat) error {
 	return nil
 }

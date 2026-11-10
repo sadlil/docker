@@ -1,25 +1,75 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/moby/moby/api/types/container"
+	libcontainerdtypes "github.com/moby/moby/v2/daemon/internal/libcontainerd/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func toContainerdResources(resources container.Resources) *libcontainerdtypes.Resources {
+func toContainerdResources(resources container.Resources) (*libcontainerdtypes.Resources, error) {
 	var r libcontainerdtypes.Resources
 
-	r.BlockIO = &specs.LinuxBlockIO{
-		Weight: &resources.BlkioWeight,
+	// little helper to lazily initialize the BlockIO struct only if needed
+	blockIO := func() *specs.LinuxBlockIO {
+		if r.BlockIO == nil {
+			r.BlockIO = &specs.LinuxBlockIO{}
+		}
+		return r.BlockIO
 	}
 
-	shares := uint64(resources.CPUShares)
-	r.CPU = &specs.LinuxCPU{
-		Shares: &shares,
-		Cpus:   resources.CpusetCpus,
-		Mems:   resources.CpusetMems,
+	weightDevices, err := getBlkioWeightDevices(resources)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioWeightDevice != nil {
+		blockIO().WeightDevice = weightDevices
+	}
+
+	readBpsDevices, err := getBlkioThrottleDevices(resources.BlkioDeviceReadBps)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioDeviceReadBps != nil {
+		blockIO().ThrottleReadBpsDevice = readBpsDevices
+	}
+
+	writeBpsDevices, err := getBlkioThrottleDevices(resources.BlkioDeviceWriteBps)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioDeviceWriteBps != nil {
+		blockIO().ThrottleWriteBpsDevice = writeBpsDevices
+	}
+
+	readIOpsDevices, err := getBlkioThrottleDevices(resources.BlkioDeviceReadIOps)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioDeviceReadIOps != nil {
+		blockIO().ThrottleReadIOPSDevice = readIOpsDevices
+	}
+
+	writeIOpsDevices, err := getBlkioThrottleDevices(resources.BlkioDeviceWriteIOps)
+	if err != nil {
+		return nil, err
+	}
+	if resources.BlkioDeviceWriteIOps != nil {
+		blockIO().ThrottleWriteIOPSDevice = writeIOpsDevices
+	}
+
+	if resources.BlkioWeight != 0 {
+		blockIO().Weight = &resources.BlkioWeight
+	}
+
+	cpu := specs.LinuxCPU{
+		Cpus: resources.CpusetCpus,
+		Mems: resources.CpusetMems,
+	}
+	if resources.CPUShares != 0 {
+		shares := uint64(resources.CPUShares)
+		cpu.Shares = &shares
 	}
 
 	var (
@@ -37,19 +87,32 @@ func toContainerdResources(resources container.Resources) *libcontainerdtypes.Re
 		period = uint64(resources.CPUPeriod)
 	}
 
-	r.CPU.Period = &period
-	r.CPU.Quota = &quota
-
-	r.Memory = &specs.LinuxMemory{
-		Limit:       &resources.Memory,
-		Reservation: &resources.MemoryReservation,
-		Kernel:      &resources.KernelMemory,
+	if period != 0 {
+		cpu.Period = &period
+	}
+	if quota != 0 {
+		cpu.Quota = &quota
 	}
 
+	if cpu != (specs.LinuxCPU{}) {
+		r.CPU = &cpu
+	}
+
+	var memory specs.LinuxMemory
+	if resources.Memory != 0 {
+		memory.Limit = &resources.Memory
+	}
+	if resources.MemoryReservation != 0 {
+		memory.Reservation = &resources.MemoryReservation
+	}
 	if resources.MemorySwap > 0 {
-		r.Memory.Swap = &resources.MemorySwap
+		memory.Swap = &resources.MemorySwap
+	}
+
+	if memory != (specs.LinuxMemory{}) {
+		r.Memory = &memory
 	}
 
 	r.Pids = getPidsLimit(resources)
-	return &r
+	return &r, nil
 }

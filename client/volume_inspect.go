@@ -1,38 +1,36 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 
-	"github.com/docker/docker/api/types"
+	"github.com/moby/moby/api/types/volume"
 )
 
-// VolumeInspect returns the information about a specific volume in the docker host.
-func (cli *Client) VolumeInspect(ctx context.Context, volumeID string) (types.Volume, error) {
-	volume, _, err := cli.VolumeInspectWithRaw(ctx, volumeID)
-	return volume, err
+// VolumeInspectOptions holds options for inspecting a volume.
+type VolumeInspectOptions struct {
+	// Add future optional parameters here
 }
 
-// VolumeInspectWithRaw returns the information about a specific volume in the docker host and its raw representation
-func (cli *Client) VolumeInspectWithRaw(ctx context.Context, volumeID string) (types.Volume, []byte, error) {
-	if volumeID == "" {
-		return types.Volume{}, nil, objectNotFoundError{object: "volume", id: volumeID}
+// VolumeInspectResult holds the result from the [Client.VolumeInspect] method.
+type VolumeInspectResult struct {
+	Volume volume.Volume
+	Raw    json.RawMessage
+}
+
+// VolumeInspect returns the information about a specific volume in the docker host.
+func (cli *Client) VolumeInspect(ctx context.Context, volumeID string, options VolumeInspectOptions) (VolumeInspectResult, error) {
+	volumeID, err := trimID("volume", volumeID)
+	if err != nil {
+		return VolumeInspectResult{}, err
 	}
 
-	var volume types.Volume
 	resp, err := cli.get(ctx, "/volumes/"+volumeID, nil, nil)
-	defer ensureReaderClosed(resp)
 	if err != nil {
-		return volume, nil, wrapResponseError(err, resp, "volume", volumeID)
+		return VolumeInspectResult{}, err
 	}
 
-	body, err := io.ReadAll(resp.body)
-	if err != nil {
-		return volume, nil, err
-	}
-	rdr := bytes.NewReader(body)
-	err = json.NewDecoder(rdr).Decode(&volume)
-	return volume, body, err
+	var out VolumeInspectResult
+	out.Raw, err = decodeWithRaw(resp, &out.Volume)
+	return out, err
 }

@@ -1,17 +1,15 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
@@ -22,35 +20,35 @@ import (
 func TestExportContainerAndImportImage(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-	cID := container.Run(ctx, t, client, container.WithCmd("true"))
-	poll.WaitOn(t, container.IsStopped(ctx, client, cID), poll.WithDelay(100*time.Millisecond))
+	cID := container.Run(ctx, t, apiClient, container.WithCmd("true"))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID))
 
 	reference := "repo/" + strings.ToLower(t.Name()) + ":v1"
-	exportResp, err := client.ContainerExport(ctx, cID)
+	exportRes, err := apiClient.ContainerExport(ctx, cID, client.ContainerExportOptions{})
 	assert.NilError(t, err)
-	importResp, err := client.ImageImport(ctx, types.ImageImportSource{
-		Source:     exportResp,
+	importRes, err := apiClient.ImageImport(ctx, client.ImageImportSource{
+		Source:     exportRes,
 		SourceName: "-",
-	}, reference, types.ImageImportOptions{})
+	}, reference, client.ImageImportOptions{})
 	assert.NilError(t, err)
+	defer func() { _ = importRes.Close() }()
 
 	// If the import is successfully, then the message output should contain
 	// the image ID and match with the output from `docker images`.
 
-	dec := json.NewDecoder(importResp)
-	var jm jsonmessage.JSONMessage
+	dec := json.NewDecoder(importRes)
+	var jm jsonstream.Message
 	err = dec.Decode(&jm)
 	assert.NilError(t, err)
 
-	images, err := client.ImageList(ctx, types.ImageListOptions{
-		Filters: filters.NewArgs(filters.Arg("reference", reference)),
+	images, err := apiClient.ImageList(ctx, client.ImageListOptions{
+		Filters: make(client.Filters).Add("reference", reference),
 	})
 	assert.NilError(t, err)
-	assert.Check(t, is.Equal(jm.Status, images[0].ID))
+	assert.Check(t, is.Equal(jm.Status, images.Items[0].ID))
 }
 
 // TestExportContainerAfterDaemonRestart checks that a container
@@ -61,17 +59,21 @@ func TestExportContainerAfterDaemonRestart(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	skip.If(t, testEnv.IsRemoteDaemon)
 
+	t.Parallel()
+
+	ctx := testutil.StartSpan(baseContext, t)
+
 	d := daemon.New(t)
 	c := d.NewClientT(t)
 
-	d.StartWithBusybox(t)
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
 
-	ctx := context.Background()
 	ctrID := container.Create(ctx, t, c)
 
-	d.Restart(t)
+	d.Restart(t, "--iptables=false", "--ip6tables=false")
 
-	_, err := c.ContainerExport(ctx, ctrID)
+	res, err := c.ContainerExport(ctx, ctrID, client.ContainerExportOptions{})
 	assert.NilError(t, err)
+	_ = res.Close()
 }

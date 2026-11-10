@@ -1,13 +1,13 @@
-package container // import "github.com/docker/docker/daemon/cluster/executor/container"
+package container
 
 import (
 	"os"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/daemon"
-	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/swarmkit/api"
+	"github.com/moby/moby/v2/daemon"
+	"github.com/moby/moby/v2/daemon/internal/stringid"
+	"github.com/moby/swarmkit/v2/api"
 )
 
 func newTestControllerWithMount(m api.Mount) (*controller, error) {

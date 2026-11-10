@@ -1,65 +1,63 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/network"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestNetworkDisconnectError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	err := client.NetworkDisconnect(context.Background(), "network_id", "container_id", false)
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.NetworkDisconnect(t.Context(), "network_id", NetworkDisconnectOptions{
+		Container: "container_id",
+	})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	// Empty network ID or container ID
+	_, err = client.NetworkDisconnect(t.Context(), "", NetworkDisconnectOptions{
+		Container: "container_id",
+	})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.NetworkDisconnect(t.Context(), "network_id", NetworkDisconnectOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestNetworkDisconnect(t *testing.T) {
-	expectedURL := "/networks/network_id/disconnect"
+	const expectedURL = "/networks/network_id/disconnect"
 
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+			return nil, err
+		}
 
-			if req.Method != http.MethodPost {
-				return nil, fmt.Errorf("expected POST method, got %s", req.Method)
-			}
+		var disconnect network.DisconnectRequest
+		if err := json.NewDecoder(req.Body).Decode(&disconnect); err != nil {
+			return nil, err
+		}
 
-			var disconnect types.NetworkDisconnect
-			if err := json.NewDecoder(req.Body).Decode(&disconnect); err != nil {
-				return nil, err
-			}
+		if disconnect.Container != "container_id" {
+			return nil, fmt.Errorf("expected 'container_id', got %s", disconnect.Container)
+		}
 
-			if disconnect.Container != "container_id" {
-				return nil, fmt.Errorf("expected 'container_id', got %s", disconnect.Container)
-			}
+		if !disconnect.Force {
+			return nil, fmt.Errorf("expected Force to be true, got %v", disconnect.Force)
+		}
 
-			if !disconnect.Force {
-				return nil, fmt.Errorf("expected Force to be true, got %v", disconnect.Force)
-			}
+		return mockResponse(http.StatusOK, nil, "")(req)
+	}))
+	assert.NilError(t, err)
 
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader([]byte(""))),
-			}, nil
-		}),
-	}
-
-	err := client.NetworkDisconnect(context.Background(), "network_id", "container_id", true)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, err = client.NetworkDisconnect(t.Context(), "network_id", NetworkDisconnectOptions{Container: "container_id", Force: true})
+	assert.NilError(t, err)
 }

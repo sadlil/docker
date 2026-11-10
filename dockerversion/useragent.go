@@ -1,76 +1,114 @@
-package dockerversion // import "github.com/docker/docker/dockerversion"
+package dockerversion
 
 import (
 	"context"
-	"fmt"
 	"runtime"
+	"strings"
+	"sync"
 
-	"github.com/docker/docker/pkg/parsers/kernel"
-	"github.com/docker/docker/pkg/useragent"
+	"github.com/moby/moby/v2/pkg/parsers/kernel"
+	"github.com/moby/moby/v2/pkg/useragent"
 )
 
-// UAStringKey is used as key type for user-agent string in net/context struct
-type UAStringKey struct{}
+// uaStringKey is used as key type for user-agent string in net/context struct
+type uaStringKey struct{}
 
-// DockerUserAgent is the User-Agent the Docker client uses to identify itself.
-// In accordance with RFC 7231 (5.5.3) is of the form:
-//    [docker client's UA] UpstreamClient([upstream client's UA])
-func DockerUserAgent(ctx context.Context) string {
-	httpVersion := make([]useragent.VersionInfo, 0, 6)
-	httpVersion = append(httpVersion, useragent.VersionInfo{Name: "docker", Version: Version})
-	httpVersion = append(httpVersion, useragent.VersionInfo{Name: "go", Version: runtime.Version()})
-	httpVersion = append(httpVersion, useragent.VersionInfo{Name: "git-commit", Version: GitCommit})
-	if kernelVersion, err := kernel.GetKernelVersion(); err == nil {
-		httpVersion = append(httpVersion, useragent.VersionInfo{Name: "kernel", Version: kernelVersion.String()})
+// WithUpstreamUserAgent returns a new context carrying the upstream client's
+// User-Agent string.
+func WithUpstreamUserAgent(ctx context.Context, ua string) context.Context {
+	if ua == "" {
+		return ctx
 	}
-	httpVersion = append(httpVersion, useragent.VersionInfo{Name: "os", Version: runtime.GOOS})
-	httpVersion = append(httpVersion, useragent.VersionInfo{Name: "arch", Version: runtime.GOARCH})
-
-	dockerUA := useragent.AppendVersions("", httpVersion...)
-	upstreamUA := getUserAgentFromContext(ctx)
-	if len(upstreamUA) > 0 {
-		ret := insertUpstreamUserAgent(upstreamUA, dockerUA)
-		return ret
-	}
-	return dockerUA
+	return context.WithValue(ctx, uaStringKey{}, ua)
 }
 
-// getUserAgentFromContext returns the previously saved user-agent context stored in ctx, if one exists
-func getUserAgentFromContext(ctx context.Context) string {
-	var upstreamUA string
-	if ctx != nil {
-		var ki interface{} = ctx.Value(UAStringKey{})
-		if ki != nil {
-			upstreamUA = ctx.Value(UAStringKey{}).(string)
+// DockerUserAgent is the User-Agent used by the daemon.
+//
+// It consists of the daemon's User-Agent, optional version metadata, and
+// an optional upstream client comment:
+//
+//	[daemon user agent] [extra] [UpstreamClient(<upstream-user-agent>)]
+//
+// "UpstreamClient" is a Docker-defined convention. The upstream value is
+// sanitized before inclusion. See [RFC9110], section 10.1.5.
+//
+// [RFC9110]: https://www.rfc-editor.org/rfc/rfc9110#section-10.1.5
+func DockerUserAgent(ctx context.Context, extraVersions ...useragent.VersionInfo) string {
+	ua := useragent.AppendVersions(getDaemonUserAgent(), extraVersions...)
+	if upstreamUA := getUpstreamUserAgent(ctx); upstreamUA != "" {
+		ua += " " + upstreamUA
+	}
+	return ua
+}
+
+var (
+	daemonUAOnce sync.Once
+	daemonUA     string
+)
+
+// getDaemonUserAgent returns the user-agent to use for requests made by
+// the daemon.
+//
+// It includes:
+//
+// - the docker version
+// - go version
+// - git-commit
+// - kernel version
+// - os
+// - architecture
+func getDaemonUserAgent() string {
+	daemonUAOnce.Do(func() {
+		httpVersion := make([]useragent.VersionInfo, 0, 6)
+		httpVersion = append(httpVersion, useragent.VersionInfo{Name: "docker", Version: Version})
+		httpVersion = append(httpVersion, useragent.VersionInfo{Name: "go", Version: runtime.Version()})
+		httpVersion = append(httpVersion, useragent.VersionInfo{Name: "git-commit", Version: GitCommit})
+		if kernelVersion, err := kernel.GetKernelVersion(); err == nil {
+			httpVersion = append(httpVersion, useragent.VersionInfo{Name: "kernel", Version: kernelVersion.String()})
 		}
-	}
-	return upstreamUA
+		httpVersion = append(httpVersion, useragent.VersionInfo{Name: "os", Version: runtime.GOOS})
+		httpVersion = append(httpVersion, useragent.VersionInfo{Name: "arch", Version: runtime.GOARCH})
+		daemonUA = useragent.AppendVersions("", httpVersion...)
+	})
+	return daemonUA
 }
 
-// escapeStr returns s with every rune in charsToEscape escaped by a backslash
-func escapeStr(s string, charsToEscape string) string {
-	var ret string
-	for _, currRune := range s {
-		appended := false
-		for _, escapableRune := range charsToEscape {
-			if currRune == escapableRune {
-				ret += `\` + string(currRune)
-				appended = true
-				break
+// getUpstreamUserAgent returns the previously saved user-agent context stored
+// in ctx, if one exists, and formats it as:
+//
+//	UpstreamClient(<upstream user agent string>)
+//
+// It returns an empty string if no user-agent is present in the context.
+func getUpstreamUserAgent(ctx context.Context) string {
+	upstreamUA, ok := ctx.Value(uaStringKey{}).(string)
+	if !ok || upstreamUA == "" {
+		return ""
+	}
+
+	return "UpstreamClient(" + escapeStr(upstreamUA) + ")"
+}
+
+// escapeStr escapes and sanitizes s for use in a User-Agent comment ([RFC9110]).
+//
+// [RFC9110]: https://www.rfc-editor.org/rfc/rfc9110#section-10.1.5
+func escapeStr(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+
+	for i := range len(s) {
+		switch c := s[i]; c {
+		// TODO(thaJeztah): remove redundant escaping semicolons; see https://github.com/moby/moby/pull/52356#discussion_r3234266285
+		case '(', ')', ';', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case '\t':
+			b.WriteByte(c)
+		default:
+			if c >= 0x20 && c != 0x7f {
+				b.WriteByte(c)
 			}
 		}
-		if !appended {
-			ret += string(currRune)
-		}
 	}
-	return ret
-}
 
-// insertUpstreamUserAgent adds the upstream client useragent to create a user-agent
-// string of the form:
-//   $dockerUA UpstreamClient($upstreamUA)
-func insertUpstreamUserAgent(upstreamUA string, dockerUA string) string {
-	charsToEscape := `();\`
-	upstreamUAEscaped := escapeStr(upstreamUA, charsToEscape)
-	return fmt.Sprintf("%s UpstreamClient(%s)", dockerUA, upstreamUAEscaped)
+	return b.String()
 }

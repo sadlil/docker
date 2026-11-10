@@ -1,207 +1,381 @@
 //go:build !windows
-// +build !windows
 
-package network // import "github.com/docker/docker/daemon/network"
+package network
 
 import (
-	"strings"
 	"testing"
+	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
+	cerrdefs "github.com/containerd/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/v2/daemon/internal/filters"
 )
 
-func TestFilterNetworks(t *testing.T) {
-	networks := []types.NetworkResource{
+var _ FilterNetwork = mockFilterNetwork{}
+
+type mockFilterNetwork struct {
+	driver     string
+	name       string
+	id         string
+	labels     map[string]string
+	scope      string
+	created    time.Time
+	containers bool
+	services   bool
+}
+
+func (n mockFilterNetwork) Driver() string {
+	return n.driver
+}
+
+func (n mockFilterNetwork) Name() string {
+	return n.name
+}
+
+func (n mockFilterNetwork) ID() string {
+	return n.id
+}
+
+func (n mockFilterNetwork) Labels() map[string]string {
+	return n.labels
+}
+
+func (n mockFilterNetwork) Scope() string {
+	return n.scope
+}
+
+func (n mockFilterNetwork) Created() time.Time {
+	return n.created
+}
+
+func (n mockFilterNetwork) HasContainerAttachments() bool {
+	return n.containers
+}
+
+func (n mockFilterNetwork) HasServiceAttachments() bool {
+	return n.services
+}
+
+func TestFilter(t *testing.T) {
+	networks := []mockFilterNetwork{
 		{
-			Name:   "host",
-			Driver: "host",
-			Scope:  "local",
+			name:    network.NetworkHost,
+			id:      "ubfg", // ROT13(name)
+			driver:  "host",
+			scope:   "local",
+			created: time.Date(2025, time.June, 1, 0, 0, 0, 0, time.Local),
 		},
 		{
-			Name:   "bridge",
-			Driver: "bridge",
-			Scope:  "local",
+			name:    network.NetworkBridge,
+			id:      "oevqtr",
+			driver:  "bridge",
+			scope:   "local",
+			created: time.Date(2025, time.June, 1, 0, 0, 0, 0, time.Local),
 		},
 		{
-			Name:   "none",
-			Driver: "null",
-			Scope:  "local",
+			name:    network.NetworkNone,
+			id:      "abar",
+			driver:  "null",
+			scope:   "local",
+			created: time.Date(2025, time.June, 1, 0, 0, 0, 0, time.Local),
 		},
 		{
-			Name:   "myoverlay",
-			Driver: "overlay",
-			Scope:  "swarm",
+			name:    "myoverlay",
+			id:      "zlbireynl",
+			driver:  "overlay",
+			scope:   "swarm",
+			created: time.Date(2024, time.June, 1, 12, 0, 0, 0, time.Local),
 		},
 		{
-			Name:   "mydrivernet",
-			Driver: "mydriver",
-			Scope:  "local",
+			name:    "mydrivernet",
+			id:      "zlqevirearg",
+			driver:  "mydriver",
+			scope:   "local",
+			labels:  map[string]string{"foo": "bar"},
+			created: time.Date(2024, time.December, 1, 2, 0, 0, 0, time.Local),
 		},
 		{
-			Name:   "mykvnet",
-			Driver: "mykvdriver",
-			Scope:  "global",
+			name:    "mykvnet",
+			id:      "zlxiarg",
+			driver:  "mykvdriver",
+			scope:   "global",
+			created: time.Date(2025, time.January, 1, 0, 0, 0, 0, time.Local),
 		},
 		{
-			Name:   "networkwithcontainer",
-			Driver: "nwc",
-			Scope:  "local",
-			Containers: map[string]types.EndpointResource{
-				"customcontainer": {
-					Name: "customendpoint",
-				},
-			},
+			name:       "networkwithcontainer",
+			id:         "argjbexjvgupbagnvare",
+			driver:     "nwc",
+			scope:      "local",
+			containers: true,
+			created:    time.Date(2025, time.June, 1, 0, 0, 0, 0, time.Local),
+		},
+		{
+			name:     "networkwithservice",
+			id:       "argjbexjvgufreivpr",
+			driver:   "nwc",
+			scope:    "local",
+			services: true,
+			created:  time.Date(2025, time.June, 1, 0, 0, 0, 0, time.Local),
+		},
+		{
+			name:    "idoverlap",
+			id:      "aaaaa0my0bbbbbb",
+			driver:  "nwc",
+			scope:   "local",
+			created: time.Date(2025, time.February, 1, 0, 0, 0, 0, time.Local),
 		},
 	}
 
-	bridgeDriverFilters := filters.NewArgs()
-	bridgeDriverFilters.Add("driver", "bridge")
-
-	overlayDriverFilters := filters.NewArgs()
-	overlayDriverFilters.Add("driver", "overlay")
-
-	nonameDriverFilters := filters.NewArgs()
-	nonameDriverFilters.Add("driver", "noname")
-
-	customDriverFilters := filters.NewArgs()
-	customDriverFilters.Add("type", "custom")
-
-	builtinDriverFilters := filters.NewArgs()
-	builtinDriverFilters.Add("type", "builtin")
-
-	invalidDriverFilters := filters.NewArgs()
-	invalidDriverFilters.Add("type", "invalid")
-
-	localScopeFilters := filters.NewArgs()
-	localScopeFilters.Add("scope", "local")
-
-	swarmScopeFilters := filters.NewArgs()
-	swarmScopeFilters.Add("scope", "swarm")
-
-	globalScopeFilters := filters.NewArgs()
-	globalScopeFilters.Add("scope", "global")
-
-	trueDanglingFilters := filters.NewArgs()
-	trueDanglingFilters.Add("dangling", "true")
-
-	falseDanglingFilters := filters.NewArgs()
-	falseDanglingFilters.Add("dangling", "false")
-
 	testCases := []struct {
-		filter      filters.Args
-		resultCount int
-		err         string
-		name        string
-		results     []string
+		subtest           string
+		filter            filters.Args
+		pruneFilter       bool
+		idAlsoMatchesName bool
+
+		err     string
+		results []string
 	}{
 		{
-			filter:      bridgeDriverFilters,
-			resultCount: 1,
-			err:         "",
-			name:        "bridge driver filters",
+			subtest: "EmptyFilter",
+			filter:  filters.NewArgs(),
+			results: (func() []string {
+				var r []string
+				for _, n := range networks {
+					r = append(r, n.name)
+				}
+				return r
+			})(),
 		},
 		{
-			filter:      overlayDriverFilters,
-			resultCount: 1,
-			err:         "",
-			name:        "overlay driver filters",
+			subtest: "driver=bridge",
+			filter:  filters.NewArgs(filters.Arg("driver", "bridge")),
+			results: []string{"bridge"},
 		},
 		{
-			filter:      nonameDriverFilters,
-			resultCount: 0,
-			err:         "",
-			name:        "no name driver filters",
+			subtest: "driver=overlay",
+			filter:  filters.NewArgs(filters.Arg("driver", "overlay")),
+			results: []string{"myoverlay"},
 		},
 		{
-			filter:      customDriverFilters,
-			resultCount: 4,
-			err:         "",
-			name:        "custom driver filters",
+			subtest: "driver=noname",
+			filter:  filters.NewArgs(filters.Arg("driver", "noname")),
 		},
 		{
-			filter:      builtinDriverFilters,
-			resultCount: 3,
-			err:         "",
-			name:        "builtin driver filters",
+			subtest: "type=custom",
+			filter:  filters.NewArgs(filters.Arg("type", "custom")),
+			results: []string{"myoverlay", "mydrivernet", "mykvnet", "networkwithcontainer", "networkwithservice", "idoverlap"},
 		},
 		{
-			filter:      invalidDriverFilters,
-			resultCount: 0,
-			err:         "invalid filter: 'type'='invalid'",
-			name:        "invalid driver filters",
+			subtest: "type=builtin",
+			filter:  filters.NewArgs(filters.Arg("type", "builtin")),
+			results: []string{network.NetworkHost, network.NetworkBridge, network.NetworkNone},
 		},
 		{
-			filter:      localScopeFilters,
-			resultCount: 5,
-			err:         "",
-			name:        "local scope filters",
+			subtest: "type=builtin,type=custom",
+			filter:  filters.NewArgs(filters.Arg("type", "builtin"), filters.Arg("type", "custom")),
+			results: []string{network.NetworkHost, network.NetworkBridge, network.NetworkNone, "myoverlay", "mydrivernet", "mykvnet", "networkwithcontainer", "networkwithservice", "idoverlap"},
 		},
 		{
-			filter:      swarmScopeFilters,
-			resultCount: 1,
-			err:         "",
-			name:        "swarm scope filters",
+			subtest: "type=invalid",
+			filter:  filters.NewArgs(filters.Arg("type", "invalid")),
+			err:     "invalid value for filter 'type': must be 'builtin' or 'custom'",
 		},
 		{
-			filter:      globalScopeFilters,
-			resultCount: 1,
-			err:         "",
-			name:        "global scope filters",
+			subtest: "scope=local",
+			filter:  filters.NewArgs(filters.Arg("scope", "local")),
+			results: []string{network.NetworkHost, network.NetworkBridge, network.NetworkNone, "mydrivernet", "networkwithcontainer", "networkwithservice", "idoverlap"},
 		},
 		{
-			filter:      trueDanglingFilters,
-			resultCount: 3,
-			err:         "",
-			name:        "dangling filter is 'True'",
+			subtest: "scope=swarm",
+			filter:  filters.NewArgs(filters.Arg("scope", "swarm")),
+			results: []string{"myoverlay"},
+		},
+		{
+			subtest: "scope=global",
+			filter:  filters.NewArgs(filters.Arg("scope", "global")),
+			results: []string{"mykvnet"},
+		},
+		{
+			subtest: "dangling=true",
+			filter:  filters.NewArgs(filters.Arg("dangling", "true")),
+			results: []string{"myoverlay", "mydrivernet", "mykvnet", "idoverlap"},
+		},
+		{
+			subtest: "dangling=1",
+			filter:  filters.NewArgs(filters.Arg("dangling", "1")),
+			results: []string{"myoverlay", "mydrivernet", "mykvnet", "idoverlap"},
+		},
+		{
+			subtest: "dangling=false",
+			filter:  filters.NewArgs(filters.Arg("dangling", "false")),
+			results: []string{network.NetworkHost, network.NetworkBridge, network.NetworkNone, "networkwithcontainer", "networkwithservice"},
+		},
+		{
+			subtest: "dangling=0",
+			filter:  filters.NewArgs(filters.Arg("dangling", "0")),
+			results: []string{network.NetworkHost, network.NetworkBridge, network.NetworkNone, "networkwithcontainer", "networkwithservice"},
+		},
+		{
+			subtest: "dangling=asdf",
+			filter:  filters.NewArgs(filters.Arg("dangling", "asdf")),
+			err:     "invalid value for filter 'dangling'",
+		},
+		{
+			subtest: "MultipleTerms=dangling",
+			filter:  filters.NewArgs(filters.Arg("dangling", "1"), filters.Arg("dangling", "true")),
+			err:     `got more than one value for filter key "dangling"`,
+		},
+		{
+			subtest: "label=foo",
+			filter:  filters.NewArgs(filters.Arg("label", "foo")),
+			results: []string{"mydrivernet"},
+		},
+		{
+			subtest: "label=foo=bar",
+			filter:  filters.NewArgs(filters.Arg("label", "foo=bar")),
+			results: []string{"mydrivernet"},
+		},
+		{
+			subtest: "label=foo=baz",
+			filter:  filters.NewArgs(filters.Arg("label", "foo=baz")),
+		},
+		{
+			subtest: "label!=foo",
+			filter:  filters.NewArgs(filters.Arg("label!", "foo")),
+			err:     "invalid filter 'label!'",
+		},
+		{
+			subtest: "until=1h",
+			filter:  filters.NewArgs(filters.Arg("until", "1h")),
+			err:     "invalid filter 'until'",
+		},
+		{
+			subtest: "name=with",
+			filter:  filters.NewArgs(filters.Arg("name", "with")),
+			results: []string{"networkwithcontainer", "networkwithservice"},
+		},
+		{
+			subtest: "id=with/IDAlsoMatchesName=False",
+			filter:  filters.NewArgs(filters.Arg("id", "with")),
+		},
+		{
+			subtest:           "id=with/IDAlsoMatchesName=True",
+			filter:            filters.NewArgs(filters.Arg("id", "with")),
+			idAlsoMatchesName: true,
+			results:           []string{"networkwithcontainer", "networkwithservice"},
+		},
+		{
+			subtest: "id=jbexjvgu/IDAlsoMatchesName=False",
+			filter:  filters.NewArgs(filters.Arg("id", "argjbex")),
+			results: []string{"networkwithcontainer", "networkwithservice"},
+		},
+		{
+			subtest:           "id=jbexjvgu/IDAlsoMatchesName=True",
+			filter:            filters.NewArgs(filters.Arg("id", "argjbex")),
+			idAlsoMatchesName: true,
+			results:           []string{"networkwithcontainer", "networkwithservice"},
+		},
+		{
+			subtest: "id=my/IDAlsoMatchesName=False",
+			filter:  filters.NewArgs(filters.Arg("id", "my")),
+			results: []string{"idoverlap"},
+		},
+		{
+			subtest:           "id=my/IDAlsoMatchesName=True",
+			filter:            filters.NewArgs(filters.Arg("id", "my")),
+			idAlsoMatchesName: true,
+			results:           []string{"myoverlay", "mydrivernet", "mykvnet", "idoverlap"},
+		},
+		{
+			subtest:     "Prune/empty",
+			filter:      filters.NewArgs(),
+			pruneFilter: true,
+			// Prune filters have an implicit dangling=true
+			results: []string{"myoverlay", "mydrivernet", "mykvnet", "idoverlap"},
+		},
+		{
+			subtest:     "Prune/label=foo",
+			filter:      filters.NewArgs(filters.Arg("label", "foo")),
+			pruneFilter: true,
+			results:     []string{"mydrivernet"},
+		},
+		{
+			subtest:     "Prune/label=foo=bar",
+			filter:      filters.NewArgs(filters.Arg("label", "foo=bar")),
+			pruneFilter: true,
+			results:     []string{"mydrivernet"},
+		},
+		{
+			subtest:     "Prune/label=foo=baz",
+			filter:      filters.NewArgs(filters.Arg("label", "foo=baz")),
+			pruneFilter: true,
+		},
+		{
+			subtest:     "Prune/label!=foo",
+			filter:      filters.NewArgs(filters.Arg("label!", "foo")),
+			pruneFilter: true,
+			results:     []string{"myoverlay", "mykvnet", "idoverlap"},
+		},
+		{
+			subtest:     "Prune/until=2025-01-01",
+			filter:      filters.NewArgs(filters.Arg("until", "2025-01-01")),
+			pruneFilter: true,
 			results:     []string{"myoverlay", "mydrivernet", "mykvnet"},
 		},
 		{
-			filter:      falseDanglingFilters,
-			resultCount: 4,
-			err:         "",
-			name:        "dangling filter is 'False'",
-			results:     []string{"host", "bridge", "none", "networkwithcontainer"},
+			subtest:     "Prune/until=2024-12-01T01:00:00",
+			filter:      filters.NewArgs(filters.Arg("until", "2024-12-01T01:00:00")),
+			pruneFilter: true,
+			results:     []string{"myoverlay"},
+		},
+		{
+			subtest:     "Prune/MultipleTerms=until",
+			filter:      filters.NewArgs(filters.Arg("until", "2024-12-01T01:00:00"), filters.Arg("until", "2h")),
+			pruneFilter: true,
+			err:         "invalid filter: 'until' cannot be specified more than once",
+		},
+		{
+			subtest:     "Prune/id=invalid",
+			filter:      filters.NewArgs(filters.Arg("id", "invalid")),
+			pruneFilter: true,
+			err:         "invalid filter 'id'",
 		},
 	}
 
 	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			ls := make([]types.NetworkResource, 0, len(networks))
-			ls = append(ls, networks...)
-			result, err := FilterNetworks(ls, testCase.filter)
-			if testCase.err != "" {
-				if err == nil {
-					t.Fatalf("expect error '%s', got no error", testCase.err)
-
-				} else if !strings.Contains(err.Error(), testCase.err) {
-					t.Fatalf("expect error '%s', got '%s'", testCase.err, err)
-				}
+		t.Run(testCase.subtest, func(t *testing.T) {
+			var (
+				flt Filter
+				err error
+			)
+			if testCase.pruneFilter {
+				flt, err = NewPruneFilter(testCase.filter)
 			} else {
-				if err != nil {
-					t.Fatalf("expect no error, got error '%s'", err)
-				}
-				// Make sure result is not nil
-				if result == nil {
-					t.Fatal("filterNetworks should not return nil")
-				}
+				flt, err = NewFilter(testCase.filter)
+			}
+			if testCase.err != "" {
+				assert.Check(t, is.ErrorContains(err, testCase.err))
+				assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+				return
+			}
+			assert.NilError(t, err)
 
-				if len(result) != testCase.resultCount {
-					t.Fatalf("expect '%d' networks, got '%d' networks", testCase.resultCount, len(result))
-				}
-
-				if len(testCase.results) > 0 {
-					resultMap := make(map[string]bool)
-					for _, r := range result {
-						resultMap[r.Name] = true
-					}
-					for _, r := range testCase.results {
-						if _, ok := resultMap[r]; !ok {
-							t.Fatalf("expected result: '%s' not found", r)
-						}
-					}
+			flt.IDAlsoMatchesName = testCase.idAlsoMatchesName
+			got := map[string]bool{}
+			for _, nw := range networks {
+				if flt.Matches(nw) {
+					got[nw.Name()] = true
 				}
 			}
+
+			want := map[string]bool{}
+			for _, r := range testCase.results {
+				want[r] = true
+			}
+			assert.Check(t, is.DeepEqual(got, want))
 		})
 	}
 }

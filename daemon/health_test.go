@@ -1,23 +1,17 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	containertypes "github.com/docker/docker/api/types/container"
-	eventtypes "github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/events"
+	containertypes "github.com/moby/moby/api/types/container"
+	eventtypes "github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/events"
+	"gotest.tools/v3/assert"
 )
 
-func reset(c *container.Container) {
-	c.State = &container.State{}
-	c.State.Health = &container.Health{}
-	c.State.Health.SetStatus(types.Starting)
-}
-
-func TestNoneHealthcheck(t *testing.T) {
+func TestHealthcheckNone(t *testing.T) {
 	c := &container.Container{
 		ID:   "container_id",
 		Name: "container_name",
@@ -30,126 +24,146 @@ func TestNoneHealthcheck(t *testing.T) {
 		State: &container.State{},
 	}
 	store, err := container.NewViewDB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	daemon := &Daemon{
-		containersReplica: store,
-	}
-
+	assert.NilError(t, err)
+	daemon := &Daemon{containersReplica: store}
 	daemon.initHealthMonitor(c)
-	if c.State.Health != nil {
-		t.Error("Expecting Health to be nil, but was not")
-	}
+	assert.Assert(t, c.State.Health == nil)
 }
 
-// FIXME(vdemeester) This takes around 3s… This is *way* too long
 func TestHealthStates(t *testing.T) {
-	e := events.New()
-	_, l, _ := e.Subscribe()
-	defer e.Evict(l)
+	tests := []struct {
+		name        string
+		retries     int
+		startPeriod time.Duration
+		test        func(t *testing.T, c *container.Container, handleResult func(time.Duration, int), expectEvent func(eventtypes.Action))
+	}{
+		{
+			name:    "status transitions",
+			retries: 1,
+			test: func(t *testing.T, c *container.Container, handleResult func(time.Duration, int), expectEvent func(eventtypes.Action)) {
+				handleResult(time.Second, 1)
+				expectEvent(eventtypes.ActionHealthStatusUnhealthy)
 
-	expect := func(expected string) {
-		select {
-		case event := <-l:
-			ev := event.(eventtypes.Message)
-			if ev.Status != expected {
-				t.Errorf("Expecting event %#v, but got %#v\n", expected, ev.Status)
-			}
-		case <-time.After(1 * time.Second):
-			t.Errorf("Expecting event %#v, but got nothing\n", expected)
-		}
-	}
+				handleResult(2*time.Second, 0)
+				expectEvent(eventtypes.ActionHealthStatusHealthy)
 
-	c := &container.Container{
-		ID:   "container_id",
-		Name: "container_name",
-		Config: &containertypes.Config{
-			Image: "image_name",
+				handleResult(3*time.Second, 1)
+				expectEvent(eventtypes.ActionHealthStatusUnhealthy)
+			},
+		},
+		{
+			name:    "retries",
+			retries: 3,
+			test: func(t *testing.T, c *container.Container, handleResult func(time.Duration, int), expectEvent func(eventtypes.Action)) {
+				handleResult(20*time.Second, 1)
+				handleResult(40*time.Second, 1)
+
+				assert.Equal(t, c.State.Health.Status(), containertypes.Starting)
+				assert.Equal(t, c.State.Health.FailingStreak, 2)
+
+				handleResult(60*time.Second, 1)
+				expectEvent(eventtypes.ActionHealthStatusUnhealthy)
+
+				handleResult(80*time.Second, 0)
+				expectEvent(eventtypes.ActionHealthStatusHealthy)
+
+				assert.Equal(t, c.State.Health.FailingStreak, 0)
+			},
+		},
+		{
+			name:        "start period",
+			retries:     2,
+			startPeriod: 30 * time.Second,
+			test: func(t *testing.T, c *container.Container, handleResult func(time.Duration, int), expectEvent func(eventtypes.Action)) {
+				handleResult(20*time.Second, 1)
+
+				assert.Equal(t, c.State.Health.Status(), containertypes.Starting)
+				assert.Equal(t, c.State.Health.FailingStreak, 0)
+
+				handleResult(50*time.Second, 1)
+
+				assert.Equal(t, c.State.Health.Status(), containertypes.Starting)
+				assert.Equal(t, c.State.Health.FailingStreak, 1)
+
+				handleResult(80*time.Second, 0)
+				expectEvent(eventtypes.ActionHealthStatusHealthy)
+
+				assert.Equal(t, c.State.Health.FailingStreak, 0)
+			},
 		},
 	}
 
-	store, err := container.NewViewDB()
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := events.New()
+			_, listener, cancel := e.Subscribe()
+			t.Cleanup(cancel)
+
+			store, err := container.NewViewDB()
+			assert.NilError(t, err)
+
+			c := &container.Container{
+				ID:   "container_id",
+				Name: "container_name",
+				Config: &containertypes.Config{
+					Image: "image_name",
+					Healthcheck: &containertypes.HealthConfig{
+						Retries:     tc.retries,
+						StartPeriod: tc.startPeriod,
+					},
+				},
+				State: &container.State{
+					Health: &container.Health{
+						Health: containertypes.Health{
+							Status: containertypes.Starting,
+						},
+					},
+				},
+			}
+
+			daemon := &Daemon{
+				EventsService:     e,
+				containersReplica: store,
+			}
+
+			handleResult := func(sinceStart time.Duration, exitCode int) {
+				start := c.State.StartedAt.Add(sinceStart)
+				handleProbeResult(daemon, c, &containertypes.HealthcheckResult{
+					Start:    start,
+					End:      start,
+					ExitCode: exitCode,
+				}, nil)
+			}
+
+			// expectEvent verifies that the next emitted event has the expected action.
+			expectEvent := func(expected eventtypes.Action) {
+				t.Helper()
+
+				select {
+				case event := <-listener:
+					ev, ok := event.(eventtypes.Message)
+					assert.Assert(t, ok)
+					assert.Equal(t, ev.Action, expected)
+				default:
+					t.Fatalf("expected event %v, got none", expected)
+				}
+			}
+			tc.test(t, c, handleResult, expectEvent)
+		})
+	}
+}
+
+func TestHealthcheckEmptyCommand(t *testing.T) {
+	c := &container.Container{
+		ID: "container_id",
+		Config: &containertypes.Config{
+			Healthcheck: &containertypes.HealthConfig{
+				Test: []string{"CMD"},
+			},
+		},
 	}
 
-	daemon := &Daemon{
-		EventsService:     e,
-		containersReplica: store,
-	}
-	muteLogs()
-
-	c.Config.Healthcheck = &containertypes.HealthConfig{
-		Retries: 1,
-	}
-
-	reset(c)
-
-	handleResult := func(startTime time.Time, exitCode int) {
-		handleProbeResult(daemon, c, &types.HealthcheckResult{
-			Start:    startTime,
-			End:      startTime,
-			ExitCode: exitCode,
-		}, nil)
-	}
-
-	// starting -> failed -> success -> failed
-
-	handleResult(c.State.StartedAt.Add(1*time.Second), 1)
-	expect("health_status: unhealthy")
-
-	handleResult(c.State.StartedAt.Add(2*time.Second), 0)
-	expect("health_status: healthy")
-
-	handleResult(c.State.StartedAt.Add(3*time.Second), 1)
-	expect("health_status: unhealthy")
-
-	// Test retries
-
-	reset(c)
-	c.Config.Healthcheck.Retries = 3
-
-	handleResult(c.State.StartedAt.Add(20*time.Second), 1)
-	handleResult(c.State.StartedAt.Add(40*time.Second), 1)
-	if status := c.State.Health.Status(); status != types.Starting {
-		t.Errorf("Expecting starting, but got %#v\n", status)
-	}
-	if c.State.Health.FailingStreak != 2 {
-		t.Errorf("Expecting FailingStreak=2, but got %d\n", c.State.Health.FailingStreak)
-	}
-	handleResult(c.State.StartedAt.Add(60*time.Second), 1)
-	expect("health_status: unhealthy")
-
-	handleResult(c.State.StartedAt.Add(80*time.Second), 0)
-	expect("health_status: healthy")
-	if c.State.Health.FailingStreak != 0 {
-		t.Errorf("Expecting FailingStreak=0, but got %d\n", c.State.Health.FailingStreak)
-	}
-
-	// Test start period
-
-	reset(c)
-	c.Config.Healthcheck.Retries = 2
-	c.Config.Healthcheck.StartPeriod = 30 * time.Second
-
-	handleResult(c.State.StartedAt.Add(20*time.Second), 1)
-	if status := c.State.Health.Status(); status != types.Starting {
-		t.Errorf("Expecting starting, but got %#v\n", status)
-	}
-	if c.State.Health.FailingStreak != 0 {
-		t.Errorf("Expecting FailingStreak=0, but got %d\n", c.State.Health.FailingStreak)
-	}
-	handleResult(c.State.StartedAt.Add(50*time.Second), 1)
-	if status := c.State.Health.Status(); status != types.Starting {
-		t.Errorf("Expecting starting, but got %#v\n", status)
-	}
-	if c.State.Health.FailingStreak != 1 {
-		t.Errorf("Expecting FailingStreak=1, but got %d\n", c.State.Health.FailingStreak)
-	}
-	handleResult(c.State.StartedAt.Add(80*time.Second), 0)
-	expect("health_status: healthy")
-	if c.State.Health.FailingStreak != 0 {
-		t.Errorf("Expecting FailingStreak=0, but got %d\n", c.State.Health.FailingStreak)
-	}
+	p := &cmdProbe{}
+	_, err := p.run(t.Context(), nil, c)
+	assert.ErrorContains(t, err, "has no command")
 }

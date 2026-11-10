@@ -1,14 +1,16 @@
-package convert // import "github.com/docker/docker/daemon/cluster/convert"
+package convert
 
 import (
+	"errors"
 	"testing"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/api/types/swarm/runtime"
-	swarmapi "github.com/docker/swarmkit/api"
 	google_protobuf3 "github.com/gogo/protobuf/types"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
+	swarmapi "github.com/moby/swarmkit/v2/api"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestServiceConvertFromGRPCRuntimeContainer(t *testing.T) {
@@ -86,7 +88,7 @@ func TestServiceConvertToGRPCGenericRuntimePlugin(t *testing.T) {
 	s := swarmtypes.ServiceSpec{
 		TaskTemplate: swarmtypes.TaskSpec{
 			Runtime:    swarmtypes.RuntimePlugin,
-			PluginSpec: &runtime.PluginSpec{},
+			PluginSpec: &swarmtypes.RuntimeSpec{},
 		},
 		Mode: swarmtypes.ServiceMode{
 			Global: &swarmtypes.GlobalService{},
@@ -109,11 +111,11 @@ func TestServiceConvertToGRPCGenericRuntimePlugin(t *testing.T) {
 }
 
 func TestServiceConvertToGRPCContainerRuntime(t *testing.T) {
-	image := "alpine:latest"
+	const imgName = "alpine:latest"
 	s := swarmtypes.ServiceSpec{
 		TaskTemplate: swarmtypes.TaskSpec{
 			ContainerSpec: &swarmtypes.ContainerSpec{
-				Image: image,
+				Image: imgName,
 			},
 		},
 		Mode: swarmtypes.ServiceMode{
@@ -131,8 +133,8 @@ func TestServiceConvertToGRPCContainerRuntime(t *testing.T) {
 		t.Fatal("expected type swarmapi.TaskSpec_Container")
 	}
 
-	if v.Container.Image != image {
-		t.Fatalf("expected image %s; received %s", image, v.Container.Image)
+	if v.Container.Image != imgName {
+		t.Fatalf("expected image %s; received %s", imgName, v.Container.Image)
 	}
 }
 
@@ -146,7 +148,7 @@ func TestServiceConvertToGRPCGenericRuntimeCustom(t *testing.T) {
 		},
 	}
 
-	if _, err := ServiceSpecToGRPC(s); err != ErrUnsupportedRuntime {
+	if _, err := ServiceSpecToGRPC(s); !errors.Is(err, ErrUnsupportedRuntime) {
 		t.Fatal(err)
 	}
 }
@@ -234,7 +236,7 @@ func TestServiceConvertFromGRPCIsolation(t *testing.T) {
 }
 
 func TestServiceConvertToGRPCCredentialSpec(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		name        string
 		from        swarmtypes.CredentialSpec
 		to          swarmapi.Privileges_CredentialSpec
@@ -306,22 +308,21 @@ func TestServiceConvertToGRPCCredentialSpec(t *testing.T) {
 		},
 	}
 
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			s := swarmtypes.ServiceSpec{
 				TaskTemplate: swarmtypes.TaskSpec{
 					ContainerSpec: &swarmtypes.ContainerSpec{
 						Privileges: &swarmtypes.Privileges{
-							CredentialSpec: &c.from,
+							CredentialSpec: &tc.from,
 						},
 					},
 				},
 			}
 
 			res, err := ServiceSpecToGRPC(s)
-			if c.expectedErr != "" {
-				assert.Error(t, err, c.expectedErr)
+			if tc.expectedErr != "" {
+				assert.Error(t, err, tc.expectedErr)
 				return
 			}
 
@@ -330,13 +331,13 @@ func TestServiceConvertToGRPCCredentialSpec(t *testing.T) {
 			if !ok {
 				t.Fatal("expected type swarmapi.TaskSpec_Container")
 			}
-			assert.DeepEqual(t, c.to, *v.Container.Privileges.CredentialSpec)
+			assert.DeepEqual(t, tc.to, *v.Container.Privileges.CredentialSpec)
 		})
 	}
 }
 
 func TestServiceConvertFromGRPCCredentialSpec(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		name string
 		from swarmapi.Privileges_CredentialSpec
 		to   *swarmtypes.CredentialSpec
@@ -369,9 +370,7 @@ func TestServiceConvertFromGRPCCredentialSpec(t *testing.T) {
 		},
 	}
 
-	for _, tc := range cases {
-		tc := tc
-
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			gs := swarmapi.Service{
 				Spec: swarmapi.ServiceSpec{
@@ -394,7 +393,7 @@ func TestServiceConvertFromGRPCCredentialSpec(t *testing.T) {
 	}
 }
 
-func TestServiceConvertToGRPCNetworkAtachmentRuntime(t *testing.T) {
+func TestServiceConvertToGRPCNetworkAttachmentRuntime(t *testing.T) {
 	someid := "asfjkl"
 	s := swarmtypes.ServiceSpec{
 		TaskTemplate: swarmtypes.TaskSpec{
@@ -410,7 +409,7 @@ func TestServiceConvertToGRPCNetworkAtachmentRuntime(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error %v but got no error", ErrUnsupportedRuntime)
 	}
-	if err != ErrUnsupportedRuntime {
+	if !errors.Is(err, ErrUnsupportedRuntime) {
 		t.Fatalf("expected error %v but got error %v", ErrUnsupportedRuntime, err)
 	}
 }
@@ -425,7 +424,7 @@ func TestServiceConvertToGRPCMismatchedRuntime(t *testing.T) {
 	} {
 		for j, spec := range []swarmtypes.TaskSpec{
 			{ContainerSpec: &swarmtypes.ContainerSpec{}},
-			{PluginSpec: &runtime.PluginSpec{}},
+			{PluginSpec: &swarmtypes.RuntimeSpec{}},
 		} {
 			// skip the cases, where the indices match, which would not error
 			if i == j {
@@ -437,7 +436,7 @@ func TestServiceConvertToGRPCMismatchedRuntime(t *testing.T) {
 			}
 			s.TaskTemplate.Runtime = rt
 
-			if _, err := ServiceSpecToGRPC(s); err != ErrMismatchedRuntime {
+			if _, err := ServiceSpecToGRPC(s); !errors.Is(err, ErrMismatchedRuntime) {
 				t.Fatalf("expected %v got %v", ErrMismatchedRuntime, err)
 			}
 		}
@@ -610,4 +609,33 @@ func TestServiceConvertToGRPCConfigs(t *testing.T) {
 			assert.DeepEqual(t, taskRuntime.Container.Configs[0], tc.to)
 		})
 	}
+}
+
+func TestServiceConvertToGRPCVolumeSubpath(t *testing.T) {
+	s := swarmtypes.ServiceSpec{
+		TaskTemplate: swarmtypes.TaskSpec{
+			ContainerSpec: &swarmtypes.ContainerSpec{
+				Mounts: []mount.Mount{
+					{
+						Source:   "/foo/bar",
+						Target:   "/baz",
+						Type:     mount.TypeVolume,
+						ReadOnly: false,
+						VolumeOptions: &mount.VolumeOptions{
+							Subpath: "sub",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	g, err := ServiceSpecToGRPC(s)
+	assert.NilError(t, err)
+
+	v, ok := g.Task.Runtime.(*swarmapi.TaskSpec_Container)
+	assert.Assert(t, ok)
+
+	assert.Check(t, is.Len(v.Container.Mounts, 1))
+	assert.Check(t, is.Equal(v.Container.Mounts[0].VolumeOptions.Subpath, "sub"))
 }

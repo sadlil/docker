@@ -6,12 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/testutil/daemon"
-	"github.com/docker/docker/testutil/environment"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
+	"github.com/moby/moby/v2/internal/testutil/environment"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
@@ -38,18 +36,8 @@ func NetworkPoll(config *poll.Settings) {
 	}
 }
 
-// ContainerPoll tweaks the pollSettings for `container`
-func ContainerPoll(config *poll.Settings) {
-	// Override the default pollSettings for `container` resource here ...
-
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
-		config.Timeout = 30 * time.Second
-		config.Delay = 100 * time.Millisecond
-	}
-}
-
 // NewSwarm creates a swarm daemon for testing
-func NewSwarm(t *testing.T, testEnv *environment.Execution, ops ...daemon.Option) *daemon.Daemon {
+func NewSwarm(ctx context.Context, t *testing.T, testEnv *environment.Execution, ops ...daemon.Option) *daemon.Daemon {
 	t.Helper()
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
@@ -58,7 +46,7 @@ func NewSwarm(t *testing.T, testEnv *environment.Execution, ops ...daemon.Option
 		ops = append(ops, daemon.WithExperimental())
 	}
 	d := daemon.New(t, ops...)
-	d.StartAndSwarmInit(t)
+	d.StartAndSwarmInit(ctx, t)
 	return d
 }
 
@@ -66,28 +54,59 @@ func NewSwarm(t *testing.T, testEnv *environment.Execution, ops ...daemon.Option
 type ServiceSpecOpt func(*swarmtypes.ServiceSpec)
 
 // CreateService creates a service on the passed in swarm daemon.
-func CreateService(t *testing.T, d *daemon.Daemon, opts ...ServiceSpecOpt) string {
+func CreateService(ctx context.Context, t *testing.T, d *daemon.Daemon, opts ...ServiceSpecOpt) string {
 	t.Helper()
 
-	client := d.NewClientT(t)
-	defer client.Close()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
 	spec := CreateServiceSpec(t, opts...)
-	resp, err := client.ServiceCreate(context.Background(), spec, types.ServiceCreateOptions{})
+	resp, err := apiClient.ServiceCreate(ctx, client.ServiceCreateOptions{
+		Spec: spec,
+	})
 	assert.NilError(t, err, "error creating service")
 	return resp.ID
 }
 
-// CreateServiceSpec creates a default service-spec, and applies the provided options
+// CreateServiceSpec creates a default service-spec, and applies the provided options.
+//
+// The defaults include running tasks under an init, so a test that wants the
+// daemon's own default instead has to say so with ServiceWithInit(nil) - saying
+// nothing gets the init.
 func CreateServiceSpec(t *testing.T, opts ...ServiceSpecOpt) swarmtypes.ServiceSpec {
 	t.Helper()
 	var spec swarmtypes.ServiceSpec
 	ServiceWithImage("busybox:latest")(&spec)
 	ServiceWithCommand([]string{"/bin/top"})(&spec)
 	ServiceWithReplicas(1)(&spec)
+	// Run tasks under an init. None of the commands these tests run install a
+	// SIGTERM handler, and a signal sent to PID 1 has no default action - so as
+	// PID 1 they ignore the stop signal, and every task teardown waits out the
+	// container's whole stop timeout before the kill. An init takes PID 1 and
+	// forwards the signal to a process the default action applies to.
+	ServiceWithInit(new(true))(&spec)
 
 	for _, o := range opts {
 		o(&spec)
+	}
+
+	// Declare an update complete once its new task has settled. The default
+	// monitoring period guards against a task that starts and then flaps, which
+	// is not what any of these tests are asking about - they wait for the update
+	// to report itself complete, and pay the whole window while it does.
+	//
+	// Applied after the options, rather than as a default before them, because a
+	// caller setting UpdateConfig for the order replaces the struct wholesale;
+	// this fills the field in without overriding a caller that asked for its own.
+	// A job is rejected outright if it carries an update config, so they keep
+	// none - they run their tasks to completion instead of updating them.
+	if spec.Mode.ReplicatedJob == nil && spec.Mode.GlobalJob == nil {
+		if spec.UpdateConfig == nil {
+			spec.UpdateConfig = &swarmtypes.UpdateConfig{}
+		}
+		if spec.UpdateConfig.Monitor == 0 {
+			spec.UpdateConfig.Monitor = time.Second
+		}
 	}
 	return spec
 }
@@ -158,6 +177,13 @@ func ServiceWithMaxReplicas(n uint64) ServiceSpecOpt {
 	}
 }
 
+func ServiceWithPlacementConstraints(constraints ...string) ServiceSpecOpt {
+	return func(spec *swarmtypes.ServiceSpec) {
+		ensurePlacement(spec)
+		spec.TaskTemplate.Placement.Constraints = constraints
+	}
+}
+
 // ServiceWithName sets the name of the service
 func ServiceWithName(name string) ServiceSpecOpt {
 	return func(spec *swarmtypes.ServiceSpec) {
@@ -205,35 +231,47 @@ func ServiceWithPidsLimit(limit int64) ServiceSpecOpt {
 	}
 }
 
+func ServiceWithMemorySwap(swap *int64, memoryLimit int64) ServiceSpecOpt {
+	return func(spec *swarmtypes.ServiceSpec) {
+		ensureResources(spec)
+		spec.TaskTemplate.Resources.SwapBytes = swap
+		spec.TaskTemplate.Resources.Limits.MemoryBytes = memoryLimit
+	}
+}
+
+func ServiceWithMemorySwappiness(swappiness *int64) ServiceSpecOpt {
+	return func(spec *swarmtypes.ServiceSpec) {
+		ensureResources(spec)
+		spec.TaskTemplate.Resources.MemorySwappiness = swappiness
+	}
+}
+
 // GetRunningTasks gets the list of running tasks for a service
-func GetRunningTasks(t *testing.T, c client.ServiceAPIClient, serviceID string) []swarmtypes.Task {
+func GetRunningTasks(ctx context.Context, t *testing.T, c client.TaskAPIClient, serviceID string) []swarmtypes.Task {
 	t.Helper()
 
-	tasks, err := c.TaskList(context.Background(), types.TaskListOptions{
-		Filters: filters.NewArgs(
-			filters.Arg("service", serviceID),
-			filters.Arg("desired-state", "running"),
-		),
+	taskList, err := c.TaskList(ctx, client.TaskListOptions{
+		Filters: make(client.Filters).
+			Add("service", serviceID).
+			Add("desired-state", "running"),
 	})
 
 	assert.NilError(t, err)
-	return tasks
+	return taskList.Items
 }
 
 // ExecTask runs the passed in exec config on the given task
-func ExecTask(t *testing.T, d *daemon.Daemon, task swarmtypes.Task, config types.ExecConfig) types.HijackedResponse {
+func ExecTask(ctx context.Context, t *testing.T, d *daemon.Daemon, task swarmtypes.Task, options client.ExecCreateOptions) client.HijackedResponse {
 	t.Helper()
-	client := d.NewClientT(t)
-	defer client.Close()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
-	ctx := context.Background()
-	resp, err := client.ContainerExecCreate(ctx, task.Status.ContainerStatus.ContainerID, config)
+	res, err := apiClient.ExecCreate(ctx, task.Status.ContainerStatus.ContainerID, options)
 	assert.NilError(t, err, "error creating exec")
 
-	startCheck := types.ExecStartCheck{}
-	attach, err := client.ContainerExecAttach(ctx, resp.ID, startCheck)
+	attach, err := apiClient.ExecAttach(ctx, res.ID, client.ExecAttachOptions{})
 	assert.NilError(t, err, "error attaching to exec")
-	return attach
+	return attach.HijackedResponse
 }
 
 func ensureResources(spec *swarmtypes.ServiceSpec) {

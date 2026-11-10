@@ -5,30 +5,22 @@
 
 # This represents the bare minimum required to build and test Docker.
 
-ARG GO_VERSION=1.17.8
+ARG GO_VERSION=1.27.4
 
-ARG BASE_DEBIAN_DISTRO="bullseye"
+ARG BASE_DEBIAN_DISTRO=trixie
 ARG GOLANG_IMAGE="golang:${GO_VERSION}-${BASE_DEBIAN_DISTRO}"
 
 FROM ${GOLANG_IMAGE}
-ENV GO111MODULE=off
-
-# allow replacing httpredir or deb mirror
-ARG APT_MIRROR=deb.debian.org
-RUN sed -ri "s/(httpredir|deb).debian.org/$APT_MIRROR/g" /etc/apt/sources.list
+ENV GOTOOLCHAIN=local
 
 # Compile and runtime deps
-# https://github.com/docker/docker/blob/master/project/PACKAGERS.md#build-dependencies
-# https://github.com/docker/docker/blob/master/project/PACKAGERS.md#runtime-dependencies
+# https://github.com/moby/moby/blob/master/project/PACKAGERS.md#build-dependencies
+# https://github.com/moby/moby/blob/master/project/PACKAGERS.md#runtime-dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
 		build-essential \
 		curl \
 		cmake \
-		gcc \
 		git \
-		libapparmor-dev \
-		libbtrfs-dev \
-		libdevmapper-dev \
 		libseccomp-dev \
 		ca-certificates \
 		e2fsprogs \
@@ -42,14 +34,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 		vim-common \
 	&& rm -rf /var/lib/apt/lists/*
 
-# Install runc, containerd, tini and docker-proxy
-# Please edit hack/dockerfile/install/<name>.installer to update them.
-COPY hack/dockerfile/install hack/dockerfile/install
-RUN for i in runc containerd tini proxy dockercli; \
-		do hack/dockerfile/install/install.sh $i; \
-	done
+# Install containerd.io (includes runc), tini, and docker-ce-cli.
+# The versions of these dependencies differ from the main Dockerfile,
+# but it should be sufficient for minimal build and test purposes.
+ADD --chmod=0644 --checksum=sha256:1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570 \
+	https://download.docker.com/linux/debian/gpg /etc/apt/keyrings/docker.asc
+ARG BASE_DEBIAN_DISTRO
+ADD <<-EOT /etc/apt/sources.list.d/docker.sources
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: ${BASE_DEBIAN_DISTRO}
+Components: stable
+Signed-By: /etc/apt/keyrings/docker.asc
+EOT
+RUN apt-get update && apt-get install -y --no-install-recommends \
+		containerd.io \
+		tini \
+		docker-ce-cli \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& ln -s /usr/bin/tini-static /usr/local/bin/docker-init
+
 ENV PATH=/usr/local/cli:$PATH
 
 ENV AUTO_GOPATH 1
-WORKDIR /usr/src/docker
-COPY . /usr/src/docker
+WORKDIR /usr/src/moby
+COPY . /usr/src/moby

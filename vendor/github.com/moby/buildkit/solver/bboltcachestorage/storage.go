@@ -6,6 +6,9 @@ import (
 	"fmt"
 
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/db"
+	"github.com/moby/buildkit/util/db/boltutil"
+	"github.com/moby/buildkit/util/db/compaction"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
@@ -19,14 +22,20 @@ const (
 )
 
 type Store struct {
-	db *bolt.DB
+	db db.DB
 }
 
-func NewStore(dbPath string) (*Store, error) {
-	db, err := bolt.Open(dbPath, 0600, nil)
+func NewStore(dbPath string, policies ...compaction.Config) (*Store, error) {
+	db, err := boltutil.SafeOpen(dbPath, 0600, &bolt.Options{
+		NoSync:         true,
+		FreelistType:   bolt.FreelistMapType,
+		NoFreelistSync: true,
+	}, policies...)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open database file %s", dbPath)
+		return nil, err
 	}
+
+	// Initialize the database with the needed buckets if they do not exist.
 	if err := db.Update(func(tx *bolt.Tx) error {
 		for _, b := range []string{resultBucket, linksBucket, byResultBucket, backlinksBucket} {
 			if _, err := tx.CreateBucketIfNotExists([]byte(b)); err != nil {
@@ -35,9 +44,9 @@ func NewStore(dbPath string) (*Store, error) {
 		}
 		return nil
 	}); err != nil {
+		db.Close()
 		return nil, err
 	}
-	db.NoSync = true
 	return &Store{db: db}, nil
 }
 
@@ -52,6 +61,10 @@ func (s *Store) Exists(id string) bool {
 		return false
 	}
 	return exists
+}
+
+func (s *Store) Close() error {
+	return s.db.Close()
 }
 
 func (s *Store) Walk(fn func(id string) error) error {
@@ -255,22 +268,33 @@ func (s *Store) emptyBranchWithParents(tx *bolt.Tx, id []byte) error {
 	if backlinks := tx.Bucket([]byte(backlinksBucket)).Bucket(id); backlinks != nil {
 		if err := backlinks.ForEach(func(k, v []byte) error {
 			if subLinks := tx.Bucket([]byte(linksBucket)).Bucket(k); subLinks != nil {
+				// Perform deletion outside of the iteration.
+				// https://github.com/etcd-io/bbolt/pull/611
+				var toDelete []string
 				if err := subLinks.ForEach(func(k, v []byte) error {
 					parts := bytes.Split(k, []byte("@"))
 					if len(parts) != 2 {
 						return errors.Errorf("invalid key %s", k)
 					}
 					if bytes.Equal(id, parts[1]) {
-						return subLinks.Delete(k)
+						toDelete = append(toDelete, string(k))
 					}
 					return nil
 				}); err != nil {
 					return err
 				}
 
-				if isEmptyBucket(subLinks) {
-					if err := tx.Bucket([]byte(linksBucket)).DeleteBucket(k); err != nil {
+				for _, k := range toDelete {
+					if err := subLinks.Delete([]byte(k)); err != nil {
 						return err
+					}
+				}
+
+				if isEmptyBucket(subLinks) {
+					if subResult := tx.Bucket([]byte(resultBucket)).Bucket(k); isEmptyBucket(subResult) {
+						if err := tx.Bucket([]byte(linksBucket)).DeleteBucket(k); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -284,8 +308,8 @@ func (s *Store) emptyBranchWithParents(tx *bolt.Tx, id []byte) error {
 	}
 
 	// intentionally ignoring errors
-	tx.Bucket([]byte(linksBucket)).DeleteBucket([]byte(id))
-	tx.Bucket([]byte(resultBucket)).DeleteBucket([]byte(id))
+	tx.Bucket([]byte(linksBucket)).DeleteBucket(id)
+	tx.Bucket([]byte(resultBucket)).DeleteBucket(id)
 
 	return nil
 }
@@ -319,6 +343,49 @@ func (s *Store) AddLink(id string, link solver.CacheInfoLink, target string) err
 	})
 }
 
+func (s *Store) WalkLinksAll(id string, fn func(id string, link solver.CacheInfoLink) error) error {
+	type linkEntry struct {
+		id   string
+		link solver.CacheInfoLink
+	}
+	var links []linkEntry
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(linksBucket))
+		if b == nil {
+			return nil
+		}
+		b = b.Bucket([]byte(id))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			parts := bytes.Split(k, []byte("@"))
+			if len(parts) != 2 {
+				return errors.Errorf("invalid key %s", k)
+			}
+			var link solver.CacheInfoLink
+			if err := json.Unmarshal(parts[0], &link); err != nil {
+				return err
+			}
+			// make digest relative to output as not all backends store output separately
+			link.Digest = digest.FromBytes(fmt.Appendf(nil, "%s@%d", link.Digest, link.Output))
+			links = append(links, linkEntry{
+				id:   string(parts[1]),
+				link: link,
+			})
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+	for _, l := range links {
+		if err := fn(l.id, l.link); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) WalkLinks(id string, link solver.CacheInfoLink, fn func(id string) error) error {
 	var links []string
 	if err := s.db.View(func(tx *bolt.Tx) error {
@@ -337,7 +404,7 @@ func (s *Store) WalkLinks(id string, link solver.CacheInfoLink, fn func(id strin
 		}
 		index := bytes.Join([][]byte{dt, {}}, []byte("@"))
 		c := b.Cursor()
-		k, _ := c.Seek([]byte(index))
+		k, _ := c.Seek(index)
 		for {
 			if k != nil && bytes.HasPrefix(k, index) {
 				target := bytes.TrimPrefix(k, index)
@@ -417,7 +484,7 @@ func (s *Store) WalkBacklinks(id string, fn func(id string, link solver.CacheInf
 					if err := json.Unmarshal(parts[0], &l); err != nil {
 						return err
 					}
-					l.Digest = digest.FromBytes([]byte(fmt.Sprintf("%s@%d", l.Digest, l.Output)))
+					l.Digest = digest.FromBytes(fmt.Appendf(nil, "%s@%d", l.Digest, l.Output))
 					l.Output = 0
 					outIDs = append(outIDs, string(bid))
 					outLinks = append(outLinks, l)

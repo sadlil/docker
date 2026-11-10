@@ -1,15 +1,13 @@
-package stats // import "github.com/docker/docker/daemon/stats"
+package stats
 
 import (
-	"bufio"
+	"runtime"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/pubsub"
-	"github.com/sirupsen/logrus"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/pubsub"
 )
 
 // Collector manages and provides container resource stats
@@ -19,7 +17,6 @@ type Collector struct {
 	supervisor supervisor
 	interval   time.Duration
 	publishers map[*container.Container]*pubsub.Publisher
-	bufReader  *bufio.Reader
 }
 
 // NewCollector creates a stats collector that will poll the supervisor with the specified interval
@@ -28,7 +25,6 @@ func NewCollector(supervisor supervisor, interval time.Duration) *Collector {
 		interval:   interval,
 		supervisor: supervisor,
 		publishers: make(map[*container.Container]*pubsub.Publisher),
-		bufReader:  bufio.NewReaderSize(nil, 128),
 	}
 	s.cond = sync.NewCond(&s.m)
 	return s
@@ -36,13 +32,13 @@ func NewCollector(supervisor supervisor, interval time.Duration) *Collector {
 
 type supervisor interface {
 	// GetContainerStats collects all the stats related to a container
-	GetContainerStats(container *container.Container) (*types.StatsJSON, error)
+	GetContainerStats(container *container.Container) (*containertypes.StatsResponse, error)
 }
 
 // Collect registers the container with the collector and adds it to
 // the event loop for collection on the specified interval returning
 // a channel for the subscriber to receive on.
-func (s *Collector) Collect(c *container.Container) chan interface{} {
+func (s *Collector) Collect(c *container.Container) chan any {
 	s.cond.L.Lock()
 	defer s.cond.L.Unlock()
 
@@ -68,7 +64,7 @@ func (s *Collector) StopCollection(c *container.Container) {
 }
 
 // Unsubscribe removes a specific subscriber from receiving updates for a container's stats.
-func (s *Collector) Unsubscribe(c *container.Container, ch chan interface{}) {
+func (s *Collector) Unsubscribe(c *container.Container, ch chan any) {
 	s.m.Lock()
 	publisher := s.publishers[c]
 	if publisher != nil {
@@ -100,52 +96,26 @@ func (s *Collector) Run() {
 		// but saves allocations in further iterations
 		pairs = pairs[:0]
 
-		for container, publisher := range s.publishers {
+		for ctr, publisher := range s.publishers {
 			// copy pointers here to release the lock ASAP
-			pairs = append(pairs, publishersPair{container, publisher})
+			pairs = append(pairs, publishersPair{
+				container: ctr,
+				publisher: publisher,
+			})
 		}
 
 		s.cond.L.Unlock()
 
-		onlineCPUs, err := s.getNumberOnlineCPUs()
-		if err != nil {
-			logrus.Errorf("collecting system online cpu count: %v", err)
-			continue
-		}
-
 		for _, pair := range pairs {
 			stats, err := s.supervisor.GetContainerStats(pair.container)
-
-			switch err.(type) {
-			case nil:
-				// Sample system CPU usage close to container usage to avoid
-				// noise in metric calculations.
-				systemUsage, err := s.getSystemCPUUsage()
-				if err != nil {
-					logrus.WithError(err).WithField("container_id", pair.container.ID).Errorf("collecting system cpu usage")
-					continue
+			if err != nil {
+				stats = &containertypes.StatsResponse{
+					ID:     pair.container.ID,
+					Name:   pair.container.Name,
+					OSType: runtime.GOOS,
 				}
-
-				// FIXME: move to containerd on Linux (not Windows)
-				stats.CPUStats.SystemUsage = systemUsage
-				stats.CPUStats.OnlineCPUs = onlineCPUs
-
-				pair.publisher.Publish(*stats)
-
-			case errdefs.ErrConflict, errdefs.ErrNotFound:
-				// publish empty stats containing only name and ID if not running or not found
-				pair.publisher.Publish(types.StatsJSON{
-					Name: pair.container.Name,
-					ID:   pair.container.ID,
-				})
-
-			default:
-				logrus.Errorf("collecting stats for %s: %v", pair.container.ID, err)
-				pair.publisher.Publish(types.StatsJSON{
-					Name: pair.container.Name,
-					ID:   pair.container.ID,
-				})
 			}
+			pair.publisher.Publish(*stats)
 		}
 
 		time.Sleep(s.interval)

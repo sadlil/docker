@@ -63,6 +63,9 @@
 .PARAMETER TestIntegration
      Runs integration tests.
 
+.PARAMETER TestIntegrationCli
+     Runs integration-cli tests.
+
 .PARAMETER All
      Runs everything this script knows about that can run in a container.
 
@@ -88,6 +91,7 @@ param(
     [Parameter(Mandatory=$False)][switch]$GoFormat,
     [Parameter(Mandatory=$False)][switch]$TestUnit,
     [Parameter(Mandatory=$False)][switch]$TestIntegration,
+    [Parameter(Mandatory=$False)][switch]$TestIntegrationCli,
     [Parameter(Mandatory=$False)][switch]$All
 )
 
@@ -158,7 +162,7 @@ Function Get-HeadCommit() {
 
 # Utility function to get the commit for upstream
 Function Get-UpstreamCommit() {
-    Invoke-Expression "git fetch -q https://github.com/docker/docker.git refs/heads/master"
+    Invoke-Expression "git fetch -q https://github.com/moby/moby.git refs/heads/master"
     if ($LASTEXITCODE -ne 0) { Throw "Failed fetching" }
 
     $upstream = Invoke-Expression "git rev-parse --verify FETCH_HEAD"
@@ -168,9 +172,10 @@ Function Get-UpstreamCommit() {
 }
 
 # Build a binary (client or daemon)
-Function Execute-Build($type, $additionalBuildTags, $directory) {
+Function Execute-Build($type, $additionalBuildTags, $directory, $ldflags) {
     # Generate the build flags
-    $buildTags = "autogen"
+    $buildTags = ""
+    $ldflags = "-linkmode=internal " + $ldflags
     if ($Noisy)                     { $verboseParm=" -v" }
     if ($Race)                      { Write-Warning "Using race detector"; $raceParm=" -race"}
     if ($ForceBuildAll)             { $allParm=" -a" }
@@ -188,7 +193,7 @@ Function Execute-Build($type, $additionalBuildTags, $directory) {
                     $allParm + `
                     $optParm + `
                     " -tags """ + $buildTags + """" + `
-                    " -ldflags """ + "-linkmode=internal" + """" + `
+                    " -ldflags """ + $ldflags + """" + `
                     " -o $root\bundles\"+$directory+".exe"
     Invoke-Expression $buildCommand
     if ($LASTEXITCODE -ne 0) { Throw "Failed to compile $type" }
@@ -238,7 +243,7 @@ Function Validate-DCO($headCommit, $upstreamCommit) {
         $badCommits | %{ $e+=" - $_`n"}
         $e += "`nPlease amend each commit to include a properly formatted DCO marker.`n`n"
         $e += "Visit the following URL for information about the Docker DCO:`n"
-        $e += "https://github.com/docker/docker/blob/master/CONTRIBUTING.md#sign-your-work`n"
+        $e += "https://github.com/moby/moby/blob/master/CONTRIBUTING.md#sign-your-work`n"
         Throw $e
     }
 }
@@ -256,9 +261,10 @@ Function Validate-PkgImports($headCommit, $upstreamCommit) {
         if ($LASTEXITCODE -ne 0) { Throw "Failed go list for dependencies on $file" }
         $imports = $imports -Replace "\[" -Replace "\]", "" -Split(" ") | Sort-Object | Get-Unique
         # Filter out what we are looking for
-        $imports = @() + $imports -NotMatch "^github.com/docker/docker/pkg/" `
-                                  -NotMatch "^github.com/docker/docker/vendor" `
-                                  -Match "^github.com/docker/docker" `
+        $imports = @() + $imports -NotMatch "^github.com/moby/moby/v2/pkg/" `
+                                  -NotMatch "^github.com/moby/moby/v2/vendor" `
+                                  -NotMatch "^github.com/moby/moby/v2/internal" `
+                                  -Match    "^github.com/moby/moby/v2" `
                                   -Replace "`n", ""
         $imports | ForEach-Object{ $badFiles+="$file imports $_`n" }
     }
@@ -312,16 +318,33 @@ Function Validate-GoFormat($headCommit, $upstreamCommit) {
 Function Run-UnitTests() {
     Write-Host "INFO: Running unit tests..."
     $testPath="./..."
-    $goListCommand = "go list -e -f '{{if ne .Name """ + '\"github.com/docker/docker\"' + """}}{{.ImportPath}}{{end}}' $testPath"
+    $goListCommand = "go list -e -f '{{if ne .Name """ + '\"github.com/moby/moby/v2\"' + """}}{{.ImportPath}}{{end}}' $testPath"
     $pkgList = $(Invoke-Expression $goListCommand)
     if ($LASTEXITCODE -ne 0) { Throw "go list for unit tests failed" }
-    $pkgList = $pkgList | Select-String -Pattern "github.com/docker/docker"
-    $pkgList = $pkgList | Select-String -NotMatch "github.com/docker/docker/vendor"
-    $pkgList = $pkgList | Select-String -NotMatch "github.com/docker/docker/man"
-    $pkgList = $pkgList | Select-String -NotMatch "github.com/docker/docker/integration"
+    $pkgList = $pkgList | Select-String -Pattern "github.com/moby/moby/v2"
+    $pkgList = $pkgList | Select-String -NotMatch "github.com/moby/moby/v2/integration"
     $pkgList = $pkgList -replace "`r`n", " "
 
-    $goTestArg = "--format=standard-verbose --jsonfile=bundles\go-test-report-unit-tests.json --junitfile=bundles\junit-report-unit-tests.xml -- " + $raceParm + " -cover -ldflags -w -a """ + "-test.timeout=10m" + """ $pkgList"
+    $jsonFilePath = $bundlesDir + "\go-test-report-unit-flaky-tests.json"
+    $xmlFilePath = $bundlesDir + "\junit-report-unit-flaky-tests.xml"
+    $coverageFilePath = $bundlesDir + "\coverage-report-unit-flaky-tests.txt"
+    $goTestArg = "--rerun-fails=4  --format=testname --jsonfile=$jsonFilePath --junitfile=$xmlFilePath """ + "--packages=$pkgList" + """ -- " + $raceParm + " -coverprofile=$coverageFilePath -covermode=atomic -ldflags -w -a -test.timeout=10m -test.run=TestFlaky.*"
+    Write-Host "INFO: Invoking unit tests run with $GOTESTSUM_LOCATION\gotestsum.exe $goTestArg"
+    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pinfo.FileName = "$GOTESTSUM_LOCATION\gotestsum.exe"
+    $pinfo.WorkingDirectory = "$($PWD.Path)"
+    $pinfo.UseShellExecute = $false
+    $pinfo.Arguments = $goTestArg
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $pinfo
+    $p.Start() | Out-Null
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) { Throw "Unit tests (flaky) failed" }
+
+    $jsonFilePath = $bundlesDir + "\go-test-report-unit-tests.json"
+    $xmlFilePath = $bundlesDir + "\junit-report-unit-tests.xml"
+    $coverageFilePath = $bundlesDir + "\coverage-report-unit-tests.txt"
+    $goTestArg = "--format=testname --jsonfile=$jsonFilePath --junitfile=$xmlFilePath -- " + $raceParm + " -coverprofile=$coverageFilePath -covermode=atomic -ldflags -w -a -test.timeout=10m -test.skip=TestFlaky.*" + " $pkgList"
     Write-Host "INFO: Invoking unit tests run with $GOTESTSUM_LOCATION\gotestsum.exe $goTestArg"
     $pinfo = New-Object System.Diagnostics.ProcessStartInfo
     $pinfo.FileName = "$GOTESTSUM_LOCATION\gotestsum.exe"
@@ -339,7 +362,8 @@ Function Run-UnitTests() {
 Function Run-IntegrationTests() {
     $escRoot = [Regex]::Escape($root)
     $env:DOCKER_INTEGRATION_DAEMON_DEST = $bundlesDir + "\tmp"
-    $dirs = go list -test -f '{{- if ne .ForTest `"`" -}}{{- .Dir -}}{{- end -}}' .\integration\...
+    $dirs = go list -test -f '{{- if ne .ForTest "" -}}{{- .Dir -}}{{- end -}}' .\integration\...
+    $failed = $false
     ForEach($dir in $dirs) {
         # Normalize directory name for using in the test results files.
         $normDir = $dir.Trim()
@@ -357,19 +381,54 @@ Function Run-IntegrationTests() {
         }
         $jsonFilePath = $bundlesDir + "\go-test-report-int-tests-$normDir" + ".json"
         $xmlFilePath = $bundlesDir + "\junit-report-int-tests-$normDir" + ".xml"
+        $coverageFilePath = $bundlesDir + "\coverage-report-int-tests-$normDir" + ".txt"
         Set-Location $dir
         Write-Host "Running $($PWD.Path)"
         $pinfo = New-Object System.Diagnostics.ProcessStartInfo
         $pinfo.FileName = "gotestsum.exe"
         $pinfo.WorkingDirectory = "$($PWD.Path)"
         $pinfo.UseShellExecute = $false
-        $pinfo.Arguments = "--format=standard-verbose --jsonfile=$jsonFilePath --junitfile=$xmlFilePath -- -test.timeout=60m $env:INTEGRATION_TESTFLAGS"
+        $pinfo.Arguments = "--format=testname --jsonfile=$jsonFilePath --junitfile=$xmlFilePath -- -coverprofile=$coverageFilePath -covermode=atomic -test.timeout=60m $env:INTEGRATION_TESTFLAGS"
         $p = New-Object System.Diagnostics.Process
         $p.StartInfo = $pinfo
         $p.Start() | Out-Null
         $p.WaitForExit()
-        if ($p.ExitCode -ne 0) { Throw "Integration tests failed" }
+        if ($p.ExitCode -ne 0) {
+            $failed = $true
+            if (-not [string]::IsNullOrEmpty($env:TEST_INTEGRATION_FAIL_FAST)) { break }
+        }
     }
+    if ($failed) { Throw "Integration tests failed" }
+}
+
+# Run the integration-cli tests
+Function Run-IntegrationCliTests() {
+    Write-Host "INFO: Running integration-cli tests..."
+
+    $goTestRun = ""
+    $reportSuffix = ""
+    if ($env:INTEGRATION_TESTRUN.Length -ne 0)
+    {
+        $goTestRun = "-test.run=($env:INTEGRATION_TESTRUN)/"
+        $reportSuffixStream = [IO.MemoryStream]::new([byte[]][char[]]$env:INTEGRATION_TESTRUN)
+        $reportSuffix = "-" + (Get-FileHash -InputStream $reportSuffixStream -Algorithm SHA256).Hash
+    }
+
+    $jsonFilePath = $bundlesDir + "\go-test-report-int-cli-tests$reportSuffix.json"
+    $xmlFilePath = $bundlesDir + "\junit-report-int-cli-tests$reportSuffix.xml"
+    $coverageFilePath = $bundlesDir + "\coverage-report-int-cli-tests$reportSuffix.txt"
+    $goTestArg = "--format=testname --packages=./integration-cli/... --jsonfile=$jsonFilePath --junitfile=$xmlFilePath -- -coverprofile=$coverageFilePath -covermode=atomic -tags=autogen -test.timeout=200m $goTestRun $env:INTEGRATION_TESTFLAGS"
+    Write-Host "INFO: Invoking integration-cli tests run with gotestsum.exe $goTestArg"
+    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pinfo.FileName = "gotestsum.exe"
+    $pinfo.WorkingDirectory = "$($PWD.Path)"
+    $pinfo.UseShellExecute = $false
+    $pinfo.Arguments = $goTestArg
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $pinfo
+    $p.Start() | Out-Null
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) { Throw "integration-cli tests failed" }
 }
 
 # Start of main code.
@@ -394,7 +453,7 @@ Try {
     if ($Binary) { $Client = $True; $Daemon = $True }
 
     # Default to building the daemon if not asked for anything explicitly.
-    if (-not($Client) -and -not($Daemon) -and -not($DCO) -and -not($PkgImports) -and -not($GoFormat) -and -not($TestUnit) -and -not($TestIntegration)) { $Daemon=$True }
+    if (-not($Client) -and -not($Daemon) -and -not($DCO) -and -not($PkgImports) -and -not($GoFormat) -and -not($TestUnit) -and -not($TestIntegration) -and -not($TestIntegrationCli)) { $Daemon=$True }
 
     # Verify git is installed
     if ($(Get-Command git -ErrorAction SilentlyContinue) -eq $nil) { Throw "Git does not appear to be installed" }
@@ -419,14 +478,21 @@ Try {
     if (-not $inContainer) { Verify-GoVersion }
 
     # Verify GOPATH is set
-    if ($env:GOPATH.Length -eq 0) { Throw "Missing GOPATH environment variable. See https://golang.org/doc/code.html#GOPATH" }
+    if ($env:GOPATH.Length -eq 0) { Throw "Missing GOPATH environment variable. See https://pkg.go.dev/cmd/go#hdr-GOPATH_environment_variable" }
 
-    # Run autogen if building binaries or running unit tests.
-    if ($Client -or $Daemon -or $TestUnit) {
+    # Run autogen if building daemon.
+    if ($Daemon) {
         Write-Host "INFO: Invoking autogen..."
-        Try { .\hack\make\.go-autogen.ps1 -CommitString $gitCommit -DockerVersion $dockerVersion -Platform "$env:PLATFORM" -Product "$env:PRODUCT" }
+        Try { .\hack\make\.go-autogen.ps1 -CommitString $gitCommit -DockerVersion $dockerVersion -Platform "$env:PLATFORM" -Product "$env:PRODUCT" -PackagerName "$env:PACKAGER_NAME" }
         Catch [Exception] { Throw $_ }
     }
+
+    $ldflags = "-X 'github.com/moby/moby/v2/dockerversion.Version="+$dockerVersion+"'"
+    $ldflags += " -X 'github.com/moby/moby/v2/dockerversion.GitCommit="+$gitCommit+"'"
+    $ldflags += " -X 'github.com/moby/moby/v2/dockerversion.BuildTime="+$env:BUILDTIME+"'"
+    $ldflags += " -X 'github.com/moby/moby/v2/dockerversion.PlatformName="+$env:PLATFORM+"'"
+    $ldflags += " -X 'github.com/moby/moby/v2/dockerversion.ProductName="+$env:PRODUCT+"'"
+    $ldflags += " -X 'github.com/moby/moby/v2/dockerversion.DefaultProductLicense="+$env:DEFAULT_PRODUCT_LICENSE+"'"
 
     # DCO, Package import and Go formatting tests.
     if ($DCO -or $PkgImports -or $GoFormat) {
@@ -448,11 +514,11 @@ Try {
     if ($Client -or $Daemon) {
 
         # Perform the actual build
-        if ($Daemon) { Execute-Build "daemon" "daemon" "dockerd" }
+        if ($Daemon) { Execute-Build "daemon" "daemon" "dockerd" $ldflags }
         if ($Client) {
             # Get the Docker channel and version from the environment, or use the defaults.
             if (-not ($channel = $env:DOCKERCLI_CHANNEL)) { $channel = "stable" }
-            if (-not ($version = $env:DOCKERCLI_VERSION)) { $version = "17.06.2-ce" }
+            if (-not ($version = $env:DOCKERCLI_VERSION)) { $version = "25.0.5" }
 
             # Download the zip file and extract the client executable.
             Write-Host "INFO: Downloading docker/cli version $version from $channel..."
@@ -474,6 +540,14 @@ Try {
             Finally {
                 Remove-Item -Force "docker.zip"
             }
+
+            if (-not ($buildx = $env:BUILDX_VERSION)) {
+                # renovate: datasource=docker depName=docker/buildx-bin versioning=docker
+                $buildx = "0.38.2"
+            }
+            Write-Host "INFO: Downloading docker/buildx version $buildx..."
+            $url = "https://github.com/docker/buildx/releases/download/v${buildx}/buildx-v${buildx}.windows-amd64.exe"
+            Invoke-WebRequest $url -OutFile "$PWD\bundles\docker-buildx.exe"
         }
     }
 
@@ -482,6 +556,9 @@ Try {
 
     # Run integration tests
     if ($TestIntegration) { Run-IntegrationTests }
+
+    # Run integration-cli tests
+    if ($TestIntegrationCli) { Run-IntegrationCliTests }
 
     # Gratuitous ASCII art.
     if ($Daemon -or $Client) {

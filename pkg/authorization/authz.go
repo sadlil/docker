@@ -1,19 +1,22 @@
-package authorization // import "github.com/docker/docker/pkg/authorization"
+package authorization
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+	"github.com/moby/moby/v2/pkg/ioutils"
 )
 
-const maxBodySize = 1048576 // 1MB
+const maxBodySize = 4 * 1024 * 1024 // 4MiB
 
 // NewCtx creates new authZ context, it is used to store authorization information related to a specific docker
 // REST http session
@@ -21,7 +24,7 @@ const maxBodySize = 1048576 // 1MB
 // Authenticate Request:
 // Call authZ plugins with current REST request and AuthN response
 // Request contains full HTTP packet sent to the docker daemon
-// https://docs.docker.com/engine/api/
+// https://docs.docker.com/reference/api/engine/
 //
 // Authenticate Response:
 // Call authZ plugins with full info about current REST request, REST response and AuthN response
@@ -55,12 +58,28 @@ type Ctx struct {
 // AuthZRequest authorized the request to the docker daemon using authZ plugins
 func (ctx *Ctx) AuthZRequest(w http.ResponseWriter, r *http.Request) error {
 	var body []byte
-	if sendBody(ctx.requestURI, r.Header) && r.ContentLength > 0 && r.ContentLength < maxBodySize {
-		var err error
-		body, r.Body, err = drainBody(r.Body)
-		if err != nil {
+	if sendBody(ctx.requestURI, r.Header) {
+		// Wrap the original request body in a buffered reader so we can inspect
+		// the prefix without consuming bytes from the downstream reader.
+		// `Peek(maxBodySize + 1)` is used as a size check:
+		//   - err == nil means at least maxBodySize+1 bytes are buffered/available,
+		//     so the payload exceeds the plugin limit and is rejected.
+		//   - otherwise, `peeked` contains the complete body bytes currently available
+		//     (for short bodies this is the full payload), and reads from r.Body still
+		//     stream the original body unchanged.
+		bufBody := bufio.NewReaderSize(r.Body, maxBodySize+1)
+		r.Body = ioutils.NewReadCloserWrapper(bufBody, r.Body.Close)
+
+		peeked, err := bufBody.Peek(maxBodySize + 1)
+		if err == nil {
+			// Successfully peeked maxBodySize+1 bytes, so body is too large
+			// TODO: Allows plugin to opt in
+			return fmt.Errorf("request body too large for authorization plugin: size exceeds %d bytes", maxBodySize)
+		} else if err != io.EOF {
 			return err
 		}
+
+		body = peeked
 	}
 
 	var h bytes.Buffer
@@ -85,7 +104,7 @@ func (ctx *Ctx) AuthZRequest(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	for _, plugin := range ctx.plugins {
-		logrus.Debugf("AuthZ request using plugin %s", plugin.Name())
+		log.G(context.TODO()).Debugf("AuthZ request using plugin %s", plugin.Name())
 
 		authRes, err := plugin.AuthZRequest(ctx.authReq)
 		if err != nil {
@@ -108,9 +127,8 @@ func (ctx *Ctx) AuthZResponse(rm ResponseModifier, r *http.Request) error {
 	if sendBody(ctx.requestURI, rm.Header()) {
 		ctx.authReq.ResponseBody = rm.RawBody()
 	}
-
 	for _, plugin := range ctx.plugins {
-		logrus.Debugf("AuthZ response using plugin %s", plugin.Name())
+		log.G(context.TODO()).Debugf("AuthZ response using plugin %s", plugin.Name())
 
 		authRes, err := plugin.AuthZResponse(ctx.authReq)
 		if err != nil {
@@ -127,29 +145,26 @@ func (ctx *Ctx) AuthZResponse(rm ResponseModifier, r *http.Request) error {
 	return nil
 }
 
-// drainBody dump the body (if its length is less than 1MB) without modifying the request state
-func drainBody(body io.ReadCloser) ([]byte, io.ReadCloser, error) {
-	bufReader := bufio.NewReaderSize(body, maxBodySize)
-	newBody := ioutils.NewReadCloserWrapper(bufReader, func() error { return body.Close() })
-
-	data, err := bufReader.Peek(maxBodySize)
-	// Body size exceeds max body size
-	if err == nil {
-		logrus.Warnf("Request body is larger than: '%d' skipping body", maxBodySize)
-		return nil, newBody, nil
+func isAuthEndpoint(urlPath string) (bool, error) {
+	// eg www.test.com/v1.24/auth/optional?optional1=something&optional2=something (version optional)
+	matched, err := regexp.MatchString(`^[^\/]*\/(v\d[\d\.]*\/)?auth.*`, urlPath)
+	if err != nil {
+		return false, err
 	}
-	// Body size is less than maximum size
-	if err == io.EOF {
-		return data, newBody, nil
-	}
-	// Unknown error
-	return nil, newBody, err
+	return matched, nil
 }
 
 // sendBody returns true when request/response body should be sent to AuthZPlugin
-func sendBody(url string, header http.Header) bool {
+func sendBody(inURL string, header http.Header) bool {
+	u, err := url.Parse(inURL)
+	// Assume no if the URL cannot be parsed - an empty request will still be forwarded to the plugin and should be rejected
+	if err != nil {
+		return false
+	}
+
 	// Skip body for auth endpoint
-	if strings.HasSuffix(url, "/auth") {
+	isAuth, err := isAuthEndpoint(u.Path)
+	if isAuth || err != nil {
 		return false
 	}
 

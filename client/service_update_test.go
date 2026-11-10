@@ -1,32 +1,46 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/swarm"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestServiceUpdateError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	_, err := client.ServiceUpdate(context.Background(), "service_id", swarm.Version{}, swarm.ServiceSpec{}, types.ServiceUpdateOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.ServiceUpdate(t.Context(), "service_id", ServiceUpdateOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ServiceUpdate(t.Context(), "", ServiceUpdateOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ServiceUpdate(t.Context(), "    ", ServiceUpdateOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+}
+
+// TestServiceUpdateConnectionError verifies that connection errors occurring
+// during API-version negotiation are not shadowed by API-version errors.
+//
+// Regression test for https://github.com/docker/cli/issues/4890
+func TestServiceUpdateConnectionError(t *testing.T) {
+	client, err := New(WithHost("tcp://no-such-host.invalid"))
+	assert.NilError(t, err)
+
+	_, err = client.ServiceUpdate(t.Context(), "service_id", ServiceUpdateOptions{})
+	assert.Check(t, is.ErrorType(err, IsErrConnectionFailed))
 }
 
 func TestServiceUpdate(t *testing.T) {
-	expectedURL := "/services/service_id/update"
+	const expectedURL = "/services/service_id/update"
 
 	updateCases := []struct {
 		swarmVersion    swarm.Version
@@ -50,28 +64,22 @@ func TestServiceUpdate(t *testing.T) {
 	}
 
 	for _, updateCase := range updateCases {
-		client := &Client{
-			client: newMockClient(func(req *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(req.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-				}
-				if req.Method != http.MethodPost {
-					return nil, fmt.Errorf("expected POST method, got %s", req.Method)
-				}
-				version := req.URL.Query().Get("version")
-				if version != updateCase.expectedVersion {
-					return nil, fmt.Errorf("version not set in URL query properly, expected '%s', got %s", updateCase.expectedVersion, version)
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte("{}"))),
-				}, nil
-			}),
-		}
+		client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+				return nil, err
+			}
+			version := req.URL.Query().Get("version")
+			if version != updateCase.expectedVersion {
+				return nil, fmt.Errorf("version not set in URL query properly, expected '%s', got %s", updateCase.expectedVersion, version)
+			}
+			return mockResponse(http.StatusOK, nil, "{}")(req)
+		}))
+		assert.NilError(t, err)
 
-		_, err := client.ServiceUpdate(context.Background(), "service_id", updateCase.swarmVersion, swarm.ServiceSpec{}, types.ServiceUpdateOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
+		_, err = client.ServiceUpdate(t.Context(), "service_id", ServiceUpdateOptions{
+			Version: updateCase.swarmVersion,
+			Spec:    swarm.ServiceSpec{},
+		})
+		assert.NilError(t, err)
 	}
 }

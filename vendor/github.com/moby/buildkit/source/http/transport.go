@@ -25,8 +25,8 @@ func (h *sessionHandler) RoundTrip(req *http.Request) (*http.Response, error) {
 		return h.rt.RoundTrip(req)
 	}
 
-	if req.Method != "GET" {
-		return nil, errors.Errorf("invalid request")
+	if req.Method != http.MethodGet {
+		return nil, errors.New("invalid request")
 	}
 
 	var resp *http.Response
@@ -44,7 +44,7 @@ func (h *sessionHandler) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp = &http.Response{
 			Status:        "200 OK",
-			StatusCode:    200,
+			StatusCode:    http.StatusOK,
 			Body:          pr,
 			ContentLength: -1,
 		}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -14,7 +15,19 @@ import (
 	"gotest.tools/v3/assert"
 )
 
-func (s *DockerSuite) TestClientSetsTLSServerName(c *testing.T) {
+type DockerCLISNISuite struct {
+	ds *DockerSuite
+}
+
+func (s *DockerCLISNISuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
+}
+
+func (s *DockerCLISNISuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
+}
+
+func (s *DockerCLISNISuite) TestClientSetsTLSServerName(c *testing.T) {
 	c.Skip("Flakey test")
 	// there may be more than one hit to the server for each registry request
 	var serverNameReceived []string

@@ -1,10 +1,9 @@
 //go:build !windows
-// +build !windows
 
 // TODO Windows: This uses a Unix socket for testing. This might be possible
 // to port to Windows using a named pipe instead.
 
-package authorization // import "github.com/docker/docker/pkg/authorization"
+package authorization
 
 import (
 	"bytes"
@@ -18,10 +17,11 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/docker/docker/pkg/plugins"
 	"github.com/docker/go-connections/tlsconfig"
 	"github.com/gorilla/mux"
+	"github.com/moby/moby/v2/pkg/plugins"
 )
 
 const (
@@ -140,95 +140,204 @@ func TestResponseModifier(t *testing.T) {
 	}
 }
 
-func TestDrainBody(t *testing.T) {
-	tests := []struct {
-		length             int // length is the message length send to drainBody
-		expectedBodyLength int // expectedBodyLength is the expected body length after drainBody is called
-	}{
-		{10, 10},                           // Small message size
-		{maxBodySize - 1, maxBodySize - 1}, // Max message size
-		{maxBodySize * 2, 0},               // Large message size (skip copying body)
+type recordingPlugin struct {
+	recordedRequest Request
+}
 
+func (p *recordingPlugin) Name() string { return "recording-plugin" }
+
+func (p *recordingPlugin) AuthZRequest(authReq *Request) (*Response, error) {
+	p.recordedRequest = *authReq
+	p.recordedRequest.RequestBody = bytes.Clone(authReq.RequestBody)
+	return &Response{Allow: true}, nil
+}
+
+func (p *recordingPlugin) AuthZResponse(_ *Request) (*Response, error) {
+	return &Response{Allow: true}, nil
+}
+
+func TestAuthZRequestBodyWithinLimit(t *testing.T) {
+	payload := strings.Repeat("a", maxBodySize)
+	plugin := &recordingPlugin{}
+	ctx := NewCtx([]Plugin{plugin}, "user", "tls", http.MethodPost, "/containers/create")
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/containers/create", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+
+	if err := ctx.AuthZRequest(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("AuthZRequest failed: %v", err)
 	}
 
-	for _, test := range tests {
-		msg := strings.Repeat("a", test.length)
-		body, closer, err := drainBody(io.NopCloser(bytes.NewReader([]byte(msg))))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(body) != test.expectedBodyLength {
-			t.Fatalf("Body must be copied, actual length: '%d'", len(body))
-		}
-		if closer == nil {
-			t.Fatal("Closer must not be nil")
-		}
-		modified, err := io.ReadAll(closer)
-		if err != nil {
-			t.Fatalf("Error must not be nil: '%v'", err)
-		}
-		if len(modified) != len(msg) {
-			t.Fatalf("Result should not be truncated. Original length: '%d', new length: '%d'", len(msg), len(modified))
-		}
+	if string(plugin.recordedRequest.RequestBody) != payload {
+		t.Fatalf("expected full request body to be sent to plugin, got length %d, expected %d", len(plugin.recordedRequest.RequestBody), len(payload))
+	}
+
+	remaining, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read request body after authz: %v", err)
+	}
+	if string(remaining) != payload {
+		t.Fatalf("request body should be preserved for downstream readers")
+	}
+}
+
+func TestAuthZRequestBodyOverLimit(t *testing.T) {
+	payload := strings.Repeat("a", maxBodySize+1)
+	plugin := &recordingPlugin{}
+	ctx := NewCtx([]Plugin{plugin}, "user", "tls", http.MethodPost, "/containers/create")
+
+	req := httptest.NewRequest(http.MethodPost, "http://example.com/containers/create", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+
+	err := ctx.AuthZRequest(httptest.NewRecorder(), req)
+	if err == nil {
+		t.Fatal("expected AuthZRequest to reject body over max size")
+	}
+	if !strings.Contains(err.Error(), "request body too large for authorization plugin") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	remaining, readErr := io.ReadAll(req.Body)
+	if readErr != nil {
+		t.Fatalf("failed to read request body after authz error: %v", readErr)
+	}
+	if string(remaining) != payload {
+		t.Fatalf("request body should still be preserved after over-limit check")
 	}
 }
 
 func TestSendBody(t *testing.T) {
-	var (
-		url       = "nothing.com"
-		testcases = []struct {
-			contentType string
-			expected    bool
-		}{
-			{
-				contentType: "application/json",
-				expected:    true,
-			},
-			{
-				contentType: "Application/json",
-				expected:    true,
-			},
-			{
-				contentType: "application/JSON",
-				expected:    true,
-			},
-			{
-				contentType: "APPLICATION/JSON",
-				expected:    true,
-			},
-			{
-				contentType: "application/json; charset=utf-8",
-				expected:    true,
-			},
-			{
-				contentType: "application/json;charset=utf-8",
-				expected:    true,
-			},
-			{
-				contentType: "application/json; charset=UTF8",
-				expected:    true,
-			},
-			{
-				contentType: "application/json;charset=UTF8",
-				expected:    true,
-			},
-			{
-				contentType: "text/html",
-				expected:    false,
-			},
-			{
-				contentType: "",
-				expected:    false,
-			},
-		}
-	)
+	testcases := []struct {
+		url         string
+		contentType string
+		expected    bool
+	}{
+		{
+			contentType: "application/json",
+			expected:    true,
+		},
+		{
+			contentType: "Application/json",
+			expected:    true,
+		},
+		{
+			contentType: "application/JSON",
+			expected:    true,
+		},
+		{
+			contentType: "APPLICATION/JSON",
+			expected:    true,
+		},
+		{
+			contentType: "application/json; charset=utf-8",
+			expected:    true,
+		},
+		{
+			contentType: "application/json;charset=utf-8",
+			expected:    true,
+		},
+		{
+			contentType: "application/json; charset=UTF8",
+			expected:    true,
+		},
+		{
+			contentType: "application/json;charset=UTF8",
+			expected:    true,
+		},
+		{
+			contentType: "text/html",
+			expected:    false,
+		},
+		{
+			contentType: "",
+			expected:    false,
+		},
+		{
+			url:         "nothing.com/auth",
+			contentType: "",
+			expected:    false,
+		},
+		{
+			url:         "nothing.com/auth",
+			contentType: "application/json;charset=UTF8",
+			expected:    false,
+		},
+		{
+			url:         "nothing.com/auth?p1=test",
+			contentType: "application/json;charset=UTF8",
+			expected:    false,
+		},
+		{
+			url:         "nothing.com/test?p1=/auth",
+			contentType: "application/json;charset=UTF8",
+			expected:    true,
+		},
+		{
+			url:         "nothing.com/something/auth",
+			contentType: "application/json;charset=UTF8",
+			expected:    true,
+		},
+		{
+			url:         "nothing.com/auth/test",
+			contentType: "application/json;charset=UTF8",
+			expected:    false,
+		},
+		{
+			url:         "nothing.com/v1.24/auth/test",
+			contentType: "application/json;charset=UTF8",
+			expected:    false,
+		},
+		{
+			url:         "nothing.com/v1/auth/test",
+			contentType: "application/json;charset=UTF8",
+			expected:    false,
+		},
+		{
+			url:         "www.nothing.com/v1.24/auth/test",
+			contentType: "application/json;charset=UTF8",
+			expected:    false,
+		},
+		{
+			url:         "https://www.nothing.com/v1.24/auth/test",
+			contentType: "application/json;charset=UTF8",
+			expected:    false,
+		},
+		{
+			url:         "http://nothing.com/v1.24/auth/test",
+			contentType: "application/json;charset=UTF8",
+			expected:    false,
+		},
+		{
+			url:         "www.nothing.com/test?p1=/auth",
+			contentType: "application/json;charset=UTF8",
+			expected:    true,
+		},
+		{
+			url:         "http://www.nothing.com/test?p1=/auth",
+			contentType: "application/json;charset=UTF8",
+			expected:    true,
+		},
+		{
+			url:         "www.nothing.com/something/auth",
+			contentType: "application/json;charset=UTF8",
+			expected:    true,
+		},
+		{
+			url:         "https://www.nothing.com/something/auth",
+			contentType: "application/json;charset=UTF8",
+			expected:    true,
+		},
+	}
 
 	for _, testcase := range testcases {
 		header := http.Header{}
 		header.Set("Content-Type", testcase.contentType)
+		if testcase.url == "" {
+			testcase.url = "nothing.com"
+		}
 
-		if b := sendBody(url, header); b != testcase.expected {
-			t.Fatalf("Unexpected Content-Type; Expected: %t, Actual: %t", testcase.expected, b)
+		if b := sendBody(testcase.url, header); b != testcase.expected {
+			t.Fatalf("sendBody failed: url: %s, content-type: %s; Expected: %t, Actual: %t", testcase.url, testcase.contentType, testcase.expected, b)
 		}
 	}
 }
@@ -310,6 +419,8 @@ func (t *authZPluginTestServer) start() {
 		Config: &http.Server{
 			Handler: r,
 			Addr:    pluginAddress,
+
+			ReadHeaderTimeout: 5 * time.Minute, // "G112: Potential Slowloris Attack (gosec)"; not a real concern for our use, so setting a long timeout.
 		},
 	}
 	t.server.Start()

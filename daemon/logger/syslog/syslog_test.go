@@ -1,14 +1,20 @@
-package syslog // import "github.com/docker/docker/daemon/logger/syslog"
+package syslog
 
 import (
+	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
 	"testing"
 
 	syslog "github.com/RackSec/srslog"
+	"github.com/moby/moby/v2/daemon/logger"
 )
 
-func functionMatches(expectedFun interface{}, actualFun interface{}) bool {
+func functionMatches(expectedFun any, actualFun any) bool {
 	return reflect.ValueOf(expectedFun).Pointer() == reflect.ValueOf(actualFun).Pointer()
 }
 
@@ -63,42 +69,65 @@ func TestValidateLogOptEmpty(t *testing.T) {
 }
 
 func TestValidateSyslogAddress(t *testing.T) {
-	err := ValidateLogOpt(map[string]string{
-		"syslog-address": "this is not an uri",
-	})
-	if err == nil {
-		t.Fatal("Expected error with invalid uri")
-	}
-
-	// File exists
-	err = ValidateLogOpt(map[string]string{
-		"syslog-address": "unix:///",
-	})
+	const sockPlaceholder = "/TEMPDIR/socket.sock"
+	s, err := os.Create(filepath.Join(t.TempDir(), "socket.sock"))
 	if err != nil {
-		t.Fatal(err)
+		log.Fatal(err)
 	}
+	socketPath := s.Name()
+	_ = s.Close()
 
-	// File does not exist
-	err = ValidateLogOpt(map[string]string{
-		"syslog-address": "unix:///does_not_exist",
-	})
-	if err == nil {
-		t.Fatal("Expected error when address is non existing file")
+	tests := []struct {
+		address     string
+		expectedErr string
+		skipOn      string
+	}{
+		{
+			address:     "this is not an uri",
+			expectedErr: "unsupported scheme: ''",
+		},
+		{
+			address:     "corrupted:42",
+			expectedErr: "unsupported scheme: 'corrupted'",
+		},
+		{
+			address: "unix://" + sockPlaceholder,
+			skipOn:  "windows", // doesn't work with unix:// sockets
+		},
+		{
+			address:     "unix:///does_not_exist",
+			expectedErr: "no such file or directory",
+			skipOn:      "windows", // error message differs
+		},
+		{
+			address: "tcp://1.2.3.4",
+		},
+		{
+			address: "udp://1.2.3.4",
+		},
+		{
+			address:     "http://1.2.3.4",
+			expectedErr: "unsupported scheme: 'http'",
+		},
 	}
-
-	// accepts udp and tcp URIs
-	err = ValidateLogOpt(map[string]string{
-		"syslog-address": "udp://1.2.3.4",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = ValidateLogOpt(map[string]string{
-		"syslog-address": "tcp://1.2.3.4",
-	})
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range tests {
+		if tc.skipOn == runtime.GOOS {
+			continue
+		}
+		t.Run(tc.address, func(t *testing.T) {
+			address := strings.Replace(tc.address, sockPlaceholder, socketPath, 1)
+			err := ValidateLogOpt(map[string]string{"syslog-address": address})
+			if tc.expectedErr != "" {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				if !strings.Contains(err.Error(), tc.expectedErr) {
+					t.Fatalf("expected error to contain '%s', got: '%s'", tc.expectedErr, err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: '%s'", err)
+			}
+		})
 	}
 }
 
@@ -109,8 +138,8 @@ func TestParseAddressDefaultPort(t *testing.T) {
 	}
 
 	_, port, _ := net.SplitHostPort(address)
-	if port != "514" {
-		t.Fatalf("Expected to default to port 514. It used port %s", port)
+	if port != defaultPort {
+		t.Fatalf("Expected to default to port %s. It used port %s", defaultPort, port)
 	}
 }
 
@@ -134,18 +163,19 @@ func TestValidateLogOptSyslogFormat(t *testing.T) {
 
 func TestValidateLogOpt(t *testing.T) {
 	err := ValidateLogOpt(map[string]string{
-		"env":                    "http://127.0.0.1",
-		"env-regex":              "abc",
-		"labels":                 "labelA",
-		"labels-regex":           "def",
 		"syslog-address":         "udp://1.2.3.4:1111",
 		"syslog-facility":        "daemon",
 		"syslog-tls-ca-cert":     "/etc/ca-certificates/custom/ca.pem",
 		"syslog-tls-cert":        "/etc/ca-certificates/custom/cert.pem",
 		"syslog-tls-key":         "/etc/ca-certificates/custom/key.pem",
 		"syslog-tls-skip-verify": "true",
-		"tag":                    "true",
 		"syslog-format":          "rfc3164",
+
+		logger.AttrEnv:         "http://127.0.0.1",
+		logger.AttrEnvRegex:    "abc",
+		logger.AttrLabels:      "labelA",
+		logger.AttrLabelsRegex: "def",
+		logger.AttrLogTag:      "true",
 	})
 	if err != nil {
 		t.Fatal(err)

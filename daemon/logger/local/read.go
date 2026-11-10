@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/docker/docker/api/types/plugins/logdriver"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/docker/docker/errdefs"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/internal/logdriver"
+	"github.com/moby/moby/v2/daemon/logger/loggerutils"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/pkg/errors"
 )
 
@@ -18,28 +18,11 @@ import (
 // logger.defaultBufSize caps the size of Line field.
 const maxMsgLen int = 1e6 // 1MB.
 
-func (d *driver) ReadLogs(config logger.ReadConfig) *logger.LogWatcher {
-	logWatcher := logger.NewLogWatcher()
-
-	go d.readLogs(logWatcher, config)
-	return logWatcher
+func (d *driver) ReadLogs(ctx context.Context, config logger.ReadConfig) *logger.LogWatcher {
+	return d.logfile.ReadLogs(ctx, config)
 }
 
-func (d *driver) readLogs(watcher *logger.LogWatcher, config logger.ReadConfig) {
-	defer close(watcher.Msg)
-
-	d.mu.Lock()
-	d.readers[watcher] = struct{}{}
-	d.mu.Unlock()
-
-	d.logfile.ReadLogs(config, watcher)
-
-	d.mu.Lock()
-	delete(d.readers, watcher)
-	d.mu.Unlock()
-}
-
-func getTailReader(ctx context.Context, r loggerutils.SizeReaderAt, req int) (io.Reader, int, error) {
+func getTailReader(ctx context.Context, r loggerutils.SizeReaderAt, req int) (loggerutils.SizeReaderAt, int, error) {
 	size := r.Size()
 	if req < 0 {
 		return nil, 0, errdefs.InvalidParameter(errors.Errorf("invalid number of lines to tail: %d", req))
@@ -63,7 +46,7 @@ func getTailReader(ctx context.Context, r loggerutils.SizeReaderAt, req int) (io
 		}
 
 		n, err := r.ReadAt(buf, offset-encodeBinaryLen64)
-		if err != nil && err != io.EOF {
+		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, 0, errors.Wrap(err, "error reading log message footer")
 		}
 
@@ -74,7 +57,7 @@ func getTailReader(ctx context.Context, r loggerutils.SizeReaderAt, req int) (io
 		msgLen := binary.BigEndian.Uint32(buf)
 
 		n, err = r.ReadAt(buf, offset-encodeBinaryLen64-encodeBinaryLen64-int64(msgLen))
-		if err != nil && err != io.EOF {
+		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, 0, errors.Wrap(err, "error reading log message header")
 		}
 
@@ -83,7 +66,7 @@ func getTailReader(ctx context.Context, r loggerutils.SizeReaderAt, req int) (io
 		}
 
 		if msgLen != binary.BigEndian.Uint32(buf) {
-			return nil, 0, errdefs.DataLoss(errors.Wrap(err, "log message header and footer indicate different message sizes"))
+			return nil, 0, errdefs.DataLoss(errors.New("log message header and footer indicate different message sizes"))
 		}
 
 		found++
@@ -115,7 +98,7 @@ type decoder struct {
 
 func (d *decoder) readRecord(size int) error {
 	var err error
-	for i := 0; i < maxDecodeRetry; i++ {
+	for range maxDecodeRetry {
 		var n int
 		n, err = io.ReadFull(d.rdr, d.buf[d.offset:size])
 		d.offset += n
@@ -219,7 +202,7 @@ func (d *decoder) decodeLogEntry() (*logger.Message, error) {
 	}
 
 	msg := protoToMessage(d.proto)
-	if msg.PLogMetaData == nil {
+	if msg.PLogMetaData == nil || msg.PLogMetaData.Last {
 		msg.Line = append(msg.Line, '\n')
 	}
 

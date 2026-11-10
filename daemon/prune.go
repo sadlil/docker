@@ -1,22 +1,22 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
-	"fmt"
-	"regexp"
 	"strconv"
-	"sync/atomic"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	timetypes "github.com/docker/docker/api/types/time"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/libnetwork"
-	"github.com/docker/docker/runconfig"
+	"github.com/containerd/log"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/v2/daemon/internal/filters"
+	"github.com/moby/moby/v2/daemon/internal/lazyregexp"
+	"github.com/moby/moby/v2/daemon/internal/timestamp"
+	"github.com/moby/moby/v2/daemon/libnetwork"
+	dnetwork "github.com/moby/moby/v2/daemon/network"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -29,22 +29,16 @@ var (
 		"label!": true,
 		"until":  true,
 	}
-
-	networksAcceptedFilters = map[string]bool{
-		"label":  true,
-		"label!": true,
-		"until":  true,
-	}
 )
 
-// ContainersPrune removes unused containers
-func (daemon *Daemon) ContainersPrune(ctx context.Context, pruneFilters filters.Args) (*types.ContainersPruneReport, error) {
-	if !atomic.CompareAndSwapInt32(&daemon.pruneRunning, 0, 1) {
+// ContainerPrune removes unused containers
+func (daemon *Daemon) ContainerPrune(ctx context.Context, pruneFilters filters.Args) (*container.PruneReport, error) {
+	if !daemon.pruneRunning.CompareAndSwap(false, true) {
 		return nil, errPruneRunning
 	}
-	defer atomic.StoreInt32(&daemon.pruneRunning, 0)
+	defer daemon.pruneRunning.Store(false)
 
-	rep := &types.ContainersPruneReport{}
+	rep := &container.PruneReport{}
 
 	// make sure that only accepted filters have been received
 	err := pruneFilters.Validate(containersAcceptedFilters)
@@ -57,27 +51,35 @@ func (daemon *Daemon) ContainersPrune(ctx context.Context, pruneFilters filters.
 		return nil, err
 	}
 
+	cfg := &daemon.config().Config
 	allContainers := daemon.List()
 	for _, c := range allContainers {
 		select {
 		case <-ctx.Done():
-			logrus.Debugf("ContainersPrune operation cancelled: %#v", *rep)
+			log.G(ctx).Debugf("ContainerPrune operation cancelled: %#v", *rep)
 			return rep, nil
 		default:
 		}
 
-		if !c.IsRunning() {
+		if !c.State.IsRunning() {
 			if !until.IsZero() && c.Created.After(until) {
 				continue
 			}
 			if !matchLabels(pruneFilters, c.Config.Labels) {
 				continue
 			}
-			cSize, _ := daemon.imageService.GetContainerLayerSize(c.ID)
-			// TODO: sets RmLink to true?
-			err := daemon.ContainerRm(c.ID, &types.ContainerRmConfig{})
+			cSize, _, err := daemon.imageService.GetContainerLayerSize(ctx, c.ID)
 			if err != nil {
-				logrus.Warnf("failed to prune container %s: %v", c.ID, err)
+				// Debug log only, the size is only for informational purposes anyway
+				log.G(ctx).WithFields(log.Fields{
+					"error":     err,
+					"container": c.ID,
+				}).Debug("failed to get layer size for container")
+			}
+			// TODO: sets RmLink to true?
+			err = daemon.containerRm(cfg, c.ID, &backend.ContainerRmConfig{})
+			if err != nil {
+				log.G(ctx).Warnf("failed to prune container %s: %v", c.ID, err)
 				continue
 			}
 			if cSize > 0 {
@@ -86,58 +88,51 @@ func (daemon *Daemon) ContainersPrune(ctx context.Context, pruneFilters filters.
 			rep.ContainersDeleted = append(rep.ContainersDeleted, c.ID)
 		}
 	}
-	daemon.EventsService.Log("prune", events.ContainerEventType, events.Actor{
+	daemon.EventsService.Log(events.ActionPrune, events.ContainerEventType, events.Actor{
 		Attributes: map[string]string{"reclaimed": strconv.FormatUint(rep.SpaceReclaimed, 10)},
 	})
 	return rep, nil
 }
 
-// localNetworksPrune removes unused local networks
-func (daemon *Daemon) localNetworksPrune(ctx context.Context, pruneFilters filters.Args) *types.NetworksPruneReport {
-	rep := &types.NetworksPruneReport{}
-
-	until, _ := getUntilFromPruneFilters(pruneFilters)
+// localNetworkPrune removes unused local networks
+func (daemon *Daemon) localNetworkPrune(ctx context.Context, pruneFilters dnetwork.Filter) *network.PruneReport {
+	rep := &network.PruneReport{}
 
 	// When the function returns true, the walk will stop.
-	l := func(nw libnetwork.Network) bool {
+	daemon.netController.WalkNetworks(func(nw *libnetwork.Network) bool {
 		select {
 		case <-ctx.Done():
 			// context cancelled
 			return true
 		default:
 		}
-		if nw.Info().ConfigOnly() {
+		if nw.ConfigOnly() {
 			return false
 		}
-		if !until.IsZero() && nw.Info().Created().After(until) {
+		if !pruneFilters.Matches(nw) {
 			return false
 		}
-		if !matchLabels(pruneFilters, nw.Info().Labels()) {
-			return false
-		}
-		nwName := nw.Name()
-		if runconfig.IsPreDefinedNetwork(nwName) {
+		if !nw.IsPruneable() {
 			return false
 		}
 		if len(nw.Endpoints()) > 0 {
 			return false
 		}
 		if err := daemon.DeleteNetwork(nw.ID()); err != nil {
-			logrus.Warnf("could not remove local network %s: %v", nwName, err)
+			log.G(ctx).Warnf("could not remove local network %s: %v", nw.Name(), err)
 			return false
 		}
-		rep.NetworksDeleted = append(rep.NetworksDeleted, nwName)
+		rep.NetworksDeleted = append(rep.NetworksDeleted, nw.Name())
 		return false
-	}
-	daemon.netController.WalkNetworks(l)
+	})
 	return rep
 }
 
-// clusterNetworksPrune removes unused cluster networks
-func (daemon *Daemon) clusterNetworksPrune(ctx context.Context, pruneFilters filters.Args) (*types.NetworksPruneReport, error) {
-	rep := &types.NetworksPruneReport{}
+var networkIsInUse = lazyregexp.New(`network ([[:alnum:]]+) is in use`)
 
-	until, _ := getUntilFromPruneFilters(pruneFilters)
+// clusterNetworkPrune removes unused cluster networks
+func (daemon *Daemon) clusterNetworkPrune(ctx context.Context, pruneFilters dnetwork.Filter) (*network.PruneReport, error) {
+	rep := &network.PruneReport{}
 
 	cluster := daemon.GetCluster()
 
@@ -145,11 +140,11 @@ func (daemon *Daemon) clusterNetworksPrune(ctx context.Context, pruneFilters fil
 		return rep, nil
 	}
 
-	networks, err := cluster.GetNetworks(pruneFilters)
+	networks, err := cluster.GetNetworks(pruneFilters, false)
 	if err != nil {
 		return rep, err
 	}
-	networkIsInUse := regexp.MustCompile(`network ([[:alnum:]]+) is in use`)
+
 	for _, nw := range networks {
 		select {
 		case <-ctx.Done():
@@ -159,13 +154,7 @@ func (daemon *Daemon) clusterNetworksPrune(ctx context.Context, pruneFilters fil
 				// Routing-mesh network removal has to be explicitly invoked by user
 				continue
 			}
-			if !until.IsZero() && nw.Created.After(until) {
-				continue
-			}
-			if !matchLabels(pruneFilters, nw.Labels) {
-				continue
-			}
-			// https://github.com/docker/docker/issues/24186
+			// https://github.com/moby/moby/issues/24186
 			// `docker network inspect` unfortunately displays ONLY those containers that are local to that node.
 			// So we try to remove it anyway and check the error
 			err = cluster.RemoveNetwork(nw.ID)
@@ -173,7 +162,7 @@ func (daemon *Daemon) clusterNetworksPrune(ctx context.Context, pruneFilters fil
 				// we can safely ignore the "network .. is in use" error
 				match := networkIsInUse.FindStringSubmatch(err.Error())
 				if len(match) != 2 || match[1] != nw.ID {
-					logrus.Warnf("could not remove cluster network %s: %v", nw.Name, err)
+					log.G(ctx).Warnf("could not remove cluster network %s: %v", nw.Name, err)
 				}
 				continue
 			}
@@ -183,62 +172,51 @@ func (daemon *Daemon) clusterNetworksPrune(ctx context.Context, pruneFilters fil
 	return rep, nil
 }
 
-// NetworksPrune removes unused networks
-func (daemon *Daemon) NetworksPrune(ctx context.Context, pruneFilters filters.Args) (*types.NetworksPruneReport, error) {
-	if !atomic.CompareAndSwapInt32(&daemon.pruneRunning, 0, 1) {
+// NetworkPrune removes unused networks
+func (daemon *Daemon) NetworkPrune(ctx context.Context, filterArgs filters.Args) (*network.PruneReport, error) {
+	if !daemon.pruneRunning.CompareAndSwap(false, true) {
 		return nil, errPruneRunning
 	}
-	defer atomic.StoreInt32(&daemon.pruneRunning, 0)
+	defer daemon.pruneRunning.Store(false)
 
-	// make sure that only accepted filters have been received
-	err := pruneFilters.Validate(networksAcceptedFilters)
+	pruneFilters, err := dnetwork.NewPruneFilter(filterArgs)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := getUntilFromPruneFilters(pruneFilters); err != nil {
-		return nil, err
-	}
-
-	rep := &types.NetworksPruneReport{}
-	if clusterRep, err := daemon.clusterNetworksPrune(ctx, pruneFilters); err == nil {
+	rep := &network.PruneReport{}
+	if clusterRep, err := daemon.clusterNetworkPrune(ctx, pruneFilters); err == nil {
 		rep.NetworksDeleted = append(rep.NetworksDeleted, clusterRep.NetworksDeleted...)
 	}
 
-	localRep := daemon.localNetworksPrune(ctx, pruneFilters)
+	localRep := daemon.localNetworkPrune(ctx, pruneFilters)
 	rep.NetworksDeleted = append(rep.NetworksDeleted, localRep.NetworksDeleted...)
 
 	select {
 	case <-ctx.Done():
-		logrus.Debugf("NetworksPrune operation cancelled: %#v", *rep)
+		log.G(ctx).Debugf("NetworkPrune operation cancelled: %#v", *rep)
 		return rep, nil
 	default:
 	}
-	daemon.EventsService.Log("prune", events.NetworkEventType, events.Actor{
+	daemon.EventsService.Log(events.ActionPrune, events.NetworkEventType, events.Actor{
 		Attributes: map[string]string{"reclaimed": "0"},
 	})
 	return rep, nil
 }
 
 func getUntilFromPruneFilters(pruneFilters filters.Args) (time.Time, error) {
-	until := time.Time{}
 	if !pruneFilters.Contains("until") {
-		return until, nil
+		return time.Time{}, nil
 	}
 	untilFilters := pruneFilters.Get("until")
 	if len(untilFilters) > 1 {
-		return until, fmt.Errorf("more than one until filter specified")
+		return time.Time{}, errdefs.InvalidParameter(errors.New("more than one until filter specified"))
 	}
-	ts, err := timetypes.GetTimestamp(untilFilters[0], time.Now())
+	t, err := timestamp.Parse(untilFilters[0], time.Now())
 	if err != nil {
-		return until, err
+		return time.Time{}, errdefs.InvalidParameter(err)
 	}
-	seconds, nanoseconds, err := timetypes.ParseTimestamps(ts, 0)
-	if err != nil {
-		return until, err
-	}
-	until = time.Unix(seconds, nanoseconds)
-	return until, nil
+	return t, nil
 }
 
 func matchLabels(pruneFilters filters.Args, labels map[string]string) bool {

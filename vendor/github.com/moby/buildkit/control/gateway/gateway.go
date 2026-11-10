@@ -2,54 +2,36 @@ package gateway
 
 import (
 	"context"
-	"sync"
-	"time"
 
 	"github.com/moby/buildkit/client/buildid"
 	"github.com/moby/buildkit/frontend/gateway"
 	gwapi "github.com/moby/buildkit/frontend/gateway/pb"
+	"github.com/moby/buildkit/solver/errdefs"
+	"github.com/moby/buildkit/util/registrar"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
 
 type GatewayForwarder struct {
-	mu         sync.RWMutex
-	updateCond *sync.Cond
-	builds     map[string]gateway.LLBBridgeForwarder
+	registrar *registrar.Registrar[string, gateway.LLBBridgeForwarder]
 }
 
 func NewGatewayForwarder() *GatewayForwarder {
-	gwf := &GatewayForwarder{
-		builds: map[string]gateway.LLBBridgeForwarder{},
+	return &GatewayForwarder{
+		registrar: registrar.New[string, gateway.LLBBridgeForwarder](),
 	}
-	gwf.updateCond = sync.NewCond(gwf.mu.RLocker())
-	return gwf
 }
 
 func (gwf *GatewayForwarder) Register(server *grpc.Server) {
 	gwapi.RegisterLLBBridgeServer(server, gwf)
 }
 
-func (gwf *GatewayForwarder) RegisterBuild(ctx context.Context, id string, bridge gateway.LLBBridgeForwarder) error {
-	gwf.mu.Lock()
-	defer gwf.mu.Unlock()
-
-	if _, ok := gwf.builds[id]; ok {
-		return errors.Errorf("build ID %s exists", id)
-	}
-
-	gwf.builds[id] = bridge
-	gwf.updateCond.Broadcast()
-
-	return nil
+func (gwf *GatewayForwarder) RegisterBuild(ctx context.Context, id string, bridge gateway.LLBBridgeForwarder) {
+	gwf.registrar.Register(id, bridge)
 }
 
 func (gwf *GatewayForwarder) UnregisterBuild(ctx context.Context, id string) {
-	gwf.mu.Lock()
-	defer gwf.mu.Unlock()
-
-	delete(gwf.builds, id)
-	gwf.updateCond.Broadcast()
+	gwf.registrar.Discard(id)
 }
 
 func (gwf *GatewayForwarder) lookupForwarder(ctx context.Context) (gateway.LLBBridgeForwarder, error) {
@@ -58,31 +40,14 @@ func (gwf *GatewayForwarder) lookupForwarder(ctx context.Context) (gateway.LLBBr
 		return nil, errors.New("no buildid found in context")
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	go func() {
-		<-ctx.Done()
-		gwf.mu.Lock()
-		gwf.updateCond.Broadcast()
-		gwf.mu.Unlock()
-	}()
-
-	gwf.mu.RLock()
-	defer gwf.mu.RUnlock()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, errors.Errorf("no such job %s", bid)
-		default:
+	fwd, err := gwf.registrar.Get(ctx, bid)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, errors.WithStack(errdefs.NewUnknownJobError(bid))
 		}
-		fwd, ok := gwf.builds[bid]
-		if !ok {
-			gwf.updateCond.Wait()
-			continue
-		}
-		return fwd, nil
+		return nil, err
 	}
+	return fwd, nil
 }
 
 func (gwf *GatewayForwarder) ResolveImageConfig(ctx context.Context, req *gwapi.ResolveImageConfigRequest) (*gwapi.ResolveImageConfigResponse, error) {
@@ -92,6 +57,15 @@ func (gwf *GatewayForwarder) ResolveImageConfig(ctx context.Context, req *gwapi.
 	}
 
 	return fwd.ResolveImageConfig(ctx, req)
+}
+
+func (gwf *GatewayForwarder) ResolveSourceMeta(ctx context.Context, req *gwapi.ResolveSourceMetaRequest) (*gwapi.ResolveSourceMetaResponse, error) {
+	fwd, err := gwf.lookupForwarder(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "forwarding ResolveSourceMeta")
+	}
+
+	return fwd.ResolveSourceMeta(ctx, req)
 }
 
 func (gwf *GatewayForwarder) Solve(ctx context.Context, req *gwapi.SolveRequest) (*gwapi.SolveResponse, error) {
@@ -109,6 +83,14 @@ func (gwf *GatewayForwarder) ReadFile(ctx context.Context, req *gwapi.ReadFileRe
 		return nil, errors.Wrap(err, "forwarding ReadFile")
 	}
 	return fwd.ReadFile(ctx, req)
+}
+
+func (gwf *GatewayForwarder) Evaluate(ctx context.Context, req *gwapi.EvaluateRequest) (*gwapi.EvaluateResponse, error) {
+	fwd, err := gwf.lookupForwarder(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "forwarding Evaluate")
+	}
+	return fwd.Evaluate(ctx, req)
 }
 
 func (gwf *GatewayForwarder) Ping(ctx context.Context, req *gwapi.PingRequest) (*gwapi.PongResponse, error) {
@@ -169,10 +151,42 @@ func (gwf *GatewayForwarder) ReleaseContainer(ctx context.Context, req *gwapi.Re
 	return fwd.ReleaseContainer(ctx, req)
 }
 
+func (gwf *GatewayForwarder) ReadFileContainer(ctx context.Context, req *gwapi.ReadFileRequest) (*gwapi.ReadFileResponse, error) {
+	fwd, err := gwf.lookupForwarder(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "forwarding ReadFileContainer")
+	}
+	return fwd.ReadFileContainer(ctx, req)
+}
+
+func (gwf *GatewayForwarder) ReadDirContainer(ctx context.Context, req *gwapi.ReadDirRequest) (*gwapi.ReadDirResponse, error) {
+	fwd, err := gwf.lookupForwarder(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "forwarding ReadDirContainer")
+	}
+	return fwd.ReadDirContainer(ctx, req)
+}
+
+func (gwf *GatewayForwarder) StatFileContainer(ctx context.Context, req *gwapi.StatFileRequest) (*gwapi.StatFileResponse, error) {
+	fwd, err := gwf.lookupForwarder(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "forwarding StatFileContainer")
+	}
+	return fwd.StatFileContainer(ctx, req)
+}
+
 func (gwf *GatewayForwarder) ExecProcess(srv gwapi.LLBBridge_ExecProcessServer) error {
 	fwd, err := gwf.lookupForwarder(srv.Context())
 	if err != nil {
 		return errors.Wrap(err, "forwarding ExecProcess")
 	}
 	return fwd.ExecProcess(srv)
+}
+
+func (gwf *GatewayForwarder) Warn(ctx context.Context, req *gwapi.WarnRequest) (*gwapi.WarnResponse, error) {
+	fwd, err := gwf.lookupForwarder(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "forwarding Warn")
+	}
+	return fwd.Warn(ctx, req)
 }

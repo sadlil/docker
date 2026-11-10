@@ -1,23 +1,24 @@
-package images // import "github.com/docker/docker/daemon/images"
+package images
 
 import (
 	"context"
 	"fmt"
 	"strconv"
-	"sync/atomic"
 	"time"
 
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	timetypes "github.com/docker/docker/api/types/time"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/image"
-	"github.com/docker/docker/layer"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
+	"github.com/moby/moby/api/types/events"
+	imagetypes "github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/v2/daemon/internal/filters"
+	"github.com/moby/moby/v2/daemon/internal/image"
+	"github.com/moby/moby/v2/daemon/internal/layer"
+	"github.com/moby/moby/v2/daemon/internal/timestamp"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 var imagesAcceptedFilters = map[string]bool{
@@ -31,12 +32,12 @@ var imagesAcceptedFilters = map[string]bool{
 // one is in progress
 var errPruneRunning = errdefs.Conflict(errors.New("a prune operation is already running"))
 
-// ImagesPrune removes unused images
-func (i *ImageService) ImagesPrune(ctx context.Context, pruneFilters filters.Args) (*types.ImagesPruneReport, error) {
-	if !atomic.CompareAndSwapInt32(&i.pruneRunning, 0, 1) {
+// ImagePrune removes unused images
+func (i *ImageService) ImagePrune(ctx context.Context, pruneFilters filters.Args) (*imagetypes.PruneReport, error) {
+	if !i.pruneRunning.CompareAndSwap(false, true) {
 		return nil, errPruneRunning
 	}
-	defer atomic.StoreInt32(&i.pruneRunning, 0)
+	defer i.pruneRunning.Store(false)
 
 	// make sure that only accepted filters have been received
 	err := pruneFilters.Validate(imagesAcceptedFilters)
@@ -44,15 +45,11 @@ func (i *ImageService) ImagesPrune(ctx context.Context, pruneFilters filters.Arg
 		return nil, err
 	}
 
-	rep := &types.ImagesPruneReport{}
+	rep := &imagetypes.PruneReport{}
 
-	danglingOnly := true
-	if pruneFilters.Contains("dangling") {
-		if pruneFilters.ExactMatch("dangling", "false") || pruneFilters.ExactMatch("dangling", "0") {
-			danglingOnly = false
-		} else if !pruneFilters.ExactMatch("dangling", "true") && !pruneFilters.ExactMatch("dangling", "1") {
-			return nil, invalidFilter{"dangling", pruneFilters.Get("dangling")}
-		}
+	danglingOnly, err := pruneFilters.GetBoolOrDefault("dangling", true)
+	if err != nil {
+		return nil, err
 	}
 
 	until, err := getUntilFromPruneFilters(pruneFilters)
@@ -79,7 +76,7 @@ func (i *ImageService) ImagesPrune(ctx context.Context, pruneFilters filters.Arg
 			if len(i.referenceStore.References(dgst)) == 0 && len(i.imageStore.Children(id)) != 0 {
 				continue
 			}
-			if !until.IsZero() && img.Created.After(until) {
+			if !until.IsZero() && (img.Created == nil || img.Created.After(until)) {
 				continue
 			}
 			if img.Config != nil && !matchLabels(pruneFilters, img.Config.Labels) {
@@ -100,7 +97,7 @@ deleteImagesLoop:
 		default:
 		}
 
-		deletedImages := []types.ImageDeleteResponseItem{}
+		deletedImages := []imagetypes.DeleteResponse{}
 		refs := i.referenceStore.References(id.Digest())
 		if len(refs) > 0 {
 			shouldDelete := !danglingOnly
@@ -113,13 +110,15 @@ deleteImagesLoop:
 					}
 				}
 
-				// Only delete if it's untagged (i.e. repo:<none>)
+				// Only delete if it has no references which is a valid NamedTagged.
 				shouldDelete = !hasTag
 			}
 
 			if shouldDelete {
 				for _, ref := range refs {
-					imgDel, err := i.ImageDelete(ref.String(), false, true)
+					imgDel, err := i.ImageDelete(ctx, ref.String(), imagebackend.RemoveOptions{
+						PruneChildren: true,
+					})
 					if imageDeleteFailed(ref.String(), err) {
 						continue
 					}
@@ -127,8 +126,10 @@ deleteImagesLoop:
 				}
 			}
 		} else {
-			hex := id.Digest().Hex()
-			imgDel, err := i.ImageDelete(hex, false, true)
+			hex := id.Digest().Encoded()
+			imgDel, err := i.ImageDelete(ctx, hex, imagebackend.RemoveOptions{
+				PruneChildren: true,
+			})
 			if imageDeleteFailed(hex, err) {
 				continue
 			}
@@ -141,17 +142,16 @@ deleteImagesLoop:
 	// Compute how much space was freed
 	for _, d := range rep.ImagesDeleted {
 		if d.Deleted != "" {
-			chid := layer.ChainID(d.Deleted)
-			if l, ok := allLayers[chid]; ok {
+			if l, ok := allLayers[layer.ChainID(d.Deleted)]; ok {
 				rep.SpaceReclaimed += uint64(l.DiffSize())
 			}
 		}
 	}
 
 	if canceled {
-		logrus.Debugf("ImagesPrune operation cancelled: %#v", *rep)
+		log.G(ctx).Debugf("ImagePrune operation cancelled: %#v", *rep)
 	}
-	i.eventsService.Log("prune", events.ImageEventType, events.Actor{
+	i.eventsService.Log(events.ActionPrune, events.ImageEventType, events.Actor{
 		Attributes: map[string]string{
 			"reclaimed": strconv.FormatUint(rep.SpaceReclaimed, 10),
 		},
@@ -163,10 +163,10 @@ func imageDeleteFailed(ref string, err error) bool {
 	switch {
 	case err == nil:
 		return false
-	case errdefs.IsConflict(err):
+	case cerrdefs.IsConflict(err), errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return true
 	default:
-		logrus.Warnf("failed to prune image %s: %v", ref, err)
+		log.G(context.TODO()).Warnf("failed to prune image %s: %v", ref, err)
 		return true
 	}
 }
@@ -186,22 +186,16 @@ func matchLabels(pruneFilters filters.Args, labels map[string]string) bool {
 }
 
 func getUntilFromPruneFilters(pruneFilters filters.Args) (time.Time, error) {
-	until := time.Time{}
 	if !pruneFilters.Contains("until") {
-		return until, nil
+		return time.Time{}, nil
 	}
 	untilFilters := pruneFilters.Get("until")
 	if len(untilFilters) > 1 {
-		return until, fmt.Errorf("more than one until filter specified")
+		return time.Time{}, errdefs.InvalidParameter(errors.New("more than one until filter specified"))
 	}
-	ts, err := timetypes.GetTimestamp(untilFilters[0], time.Now())
+	t, err := timestamp.Parse(untilFilters[0], time.Now())
 	if err != nil {
-		return until, err
+		return time.Time{}, errdefs.InvalidParameter(fmt.Errorf("invalid value for 'until' filter: %w", err))
 	}
-	seconds, nanoseconds, err := timetypes.ParseTimestamps(ts, 0)
-	if err != nil {
-		return until, err
-	}
-	until = time.Unix(seconds, nanoseconds)
-	return until, nil
+	return t, nil
 }

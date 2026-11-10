@@ -1,51 +1,48 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerExportError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ContainerExport(context.Background(), "nothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(
+		WithMockClient(errorMock(http.StatusInternalServerError, "Server error")),
+	)
+	assert.NilError(t, err)
+
+	_, err = client.ContainerExport(t.Context(), "nothing", ContainerExportOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ContainerExport(t.Context(), "", ContainerExportOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ContainerExport(t.Context(), "    ", ContainerExportOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestContainerExport(t *testing.T) {
-	expectedURL := "/containers/container_id/export"
-	client := &Client{
-		client: newMockClient(func(r *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(r.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, r.URL)
+	const expectedURL = "/containers/container_id/export"
+	client, err := New(
+		WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+				return nil, err
 			}
-
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader([]byte("response"))),
-			}, nil
+			return mockResponse(http.StatusOK, nil, "response")(req)
 		}),
-	}
-	body, err := client.ContainerExport(context.Background(), "container_id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer body.Close()
-	content, err := io.ReadAll(body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(content) != "response" {
-		t.Fatalf("expected response to contain 'response', got %s", string(content))
-	}
+	)
+	assert.NilError(t, err)
+	res, err := client.ContainerExport(t.Context(), "container_id", ContainerExportOptions{})
+	assert.NilError(t, err)
+	defer res.Close()
+	content, err := io.ReadAll(res)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(string(content), "response"))
 }

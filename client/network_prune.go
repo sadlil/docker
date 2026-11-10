@@ -1,36 +1,39 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
+	"github.com/moby/moby/api/types/network"
 )
 
-// NetworksPrune requests the daemon to delete unused networks
-func (cli *Client) NetworksPrune(ctx context.Context, pruneFilters filters.Args) (types.NetworksPruneReport, error) {
-	var report types.NetworksPruneReport
+// NetworkPruneOptions holds parameters to prune networks.
+type NetworkPruneOptions struct {
+	Filters Filters
+}
 
-	if err := cli.NewVersionError("1.25", "network prune"); err != nil {
-		return report, err
-	}
+// NetworkPruneResult holds the result from the [Client.NetworkPrune] method.
+type NetworkPruneResult struct {
+	Report network.PruneReport
+}
 
-	query, err := getFiltersQuery(pruneFilters)
+// NetworkPrune requests the daemon to delete unused networks
+func (cli *Client) NetworkPrune(ctx context.Context, opts NetworkPruneOptions) (NetworkPruneResult, error) {
+	query := url.Values{}
+	opts.Filters.updateURLValues(query)
+
+	resp, err := cli.post(ctx, "/networks/prune", query, nil, nil)
+	defer ensureReaderClosed(resp)
 	if err != nil {
-		return report, err
+		return NetworkPruneResult{}, err
 	}
 
-	serverResp, err := cli.post(ctx, "/networks/prune", query, nil, nil)
-	defer ensureReaderClosed(serverResp)
-	if err != nil {
-		return report, err
+	var report network.PruneReport
+	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		return NetworkPruneResult{}, fmt.Errorf("Error retrieving network prune report: %v", err)
 	}
 
-	if err := json.NewDecoder(serverResp.body).Decode(&report); err != nil {
-		return report, fmt.Errorf("Error retrieving network prune report: %v", err)
-	}
-
-	return report, nil
+	return NetworkPruneResult{Report: report}, nil
 }

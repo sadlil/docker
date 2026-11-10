@@ -1,74 +1,160 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/docker/docker/api/server/router/system"
-	"github.com/docker/docker/api/types"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/internal/filters"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
+	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 )
 
-// ContainerDiskUsage returns information about container data disk usage.
-func (daemon *Daemon) ContainerDiskUsage(ctx context.Context) ([]*types.Container, error) {
-	ch := daemon.usage.DoChan("ContainerDiskUsage", func() (interface{}, error) {
+// containerDiskUsage obtains information about container data disk usage
+// and makes sure that only one calculation is performed at the same time.
+func (daemon *Daemon) containerDiskUsage(ctx context.Context, verbose bool) (*backend.ContainerDiskUsage, error) {
+	res, _, err := daemon.usageContainers.Do(ctx, verbose, func(ctx context.Context) (*backend.ContainerDiskUsage, error) {
 		// Retrieve container list
-		containers, err := daemon.Containers(&types.ContainerListOptions{
+		containers, err := daemon.Containers(ctx, &backend.ContainerListOptions{
 			Size: true,
 			All:  true,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve container list: %v", err)
 		}
-		return containers, nil
-	})
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, res.Err
+
+		du := &backend.ContainerDiskUsage{
+			ActiveCount: int64(len(containers)),
+			TotalCount:  int64(len(containers)),
 		}
-		return res.Val.([]*types.Container), nil
-	}
+		for i := range containers {
+			du.TotalSize += containers[i].SizeRw
+			switch containers[i].State {
+			case container.StateRunning, container.StatePaused, container.StateRestarting:
+				// active
+			default:
+				du.Reclaimable += containers[i].SizeRw
+				du.ActiveCount--
+			}
+
+			// Remove image manifest descriptor from the result as it should not be included.
+			// https://github.com/moby/moby/pull/49407#discussion_r1954396666
+			containers[i].ImageManifestDescriptor = nil
+		}
+
+		if verbose {
+			du.Items = containers
+		}
+
+		return du, nil
+	})
+	return res, err
+}
+
+// imageDiskUsage obtains information about image data disk usage from image service
+// and makes sure that only one calculation is performed at the same time.
+func (daemon *Daemon) imageDiskUsage(ctx context.Context, verbose bool) (*backend.ImageDiskUsage, error) {
+	du, _, err := daemon.usageImages.Do(ctx, verbose, func(ctx context.Context) (*backend.ImageDiskUsage, error) {
+		// Get all top images with extra attributes
+		images, err := daemon.imageService.Images(ctx, imagebackend.ListOptions{
+			Filters:    filters.NewArgs(),
+			SharedSize: true,
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to retrieve image list")
+		}
+
+		totalSize, _, err := daemon.usageLayer.Do(ctx, struct{}{}, func(ctx context.Context) (int64, error) {
+			return daemon.imageService.ImageDiskUsage(ctx)
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to calculate image disk usage")
+		}
+
+		du := &backend.ImageDiskUsage{
+			TotalCount: int64(len(images)),
+			TotalSize:  totalSize,
+		}
+
+		for _, img := range images {
+			switch {
+			case img.Containers < 0:
+				// No container-count information available; skip (assume it's in use).
+			case img.Containers > 0:
+				du.ActiveCount++
+			case img.Containers == 0 && img.Size != -1 && img.SharedSize != -1:
+				reclaimable := img.Size - img.SharedSize
+				du.Reclaimable += reclaimable
+			}
+		}
+
+		if verbose {
+			du.Items = images
+		}
+
+		return du, nil
+	})
+
+	return du, err
+}
+
+// localVolumesSize obtains information about volume disk usage from volumes service
+// and makes sure that only one size calculation is performed at the same time.
+func (daemon *Daemon) localVolumesSize(ctx context.Context, verbose bool) (*backend.VolumeDiskUsage, error) {
+	volumes, _, err := daemon.usageVolumes.Do(ctx, verbose, func(ctx context.Context) (*backend.VolumeDiskUsage, error) {
+		volumes, err := daemon.volumes.LocalVolumesSize(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		du := &backend.VolumeDiskUsage{
+			ActiveCount: int64(len(volumes)),
+			TotalCount:  int64(len(volumes)),
+		}
+		for _, v := range volumes {
+			if v.UsageData.Size != -1 {
+				du.TotalSize += v.UsageData.Size
+				if v.UsageData.RefCount == 0 {
+					du.Reclaimable += v.UsageData.Size
+					du.ActiveCount--
+				}
+			}
+		}
+
+		if verbose {
+			du.Items = volumes
+		}
+
+		return du, nil
+	})
+	return volumes, err
 }
 
 // SystemDiskUsage returns information about the daemon data disk usage.
 // Callers must not mutate contents of the returned fields.
-func (daemon *Daemon) SystemDiskUsage(ctx context.Context, opts system.DiskUsageOptions) (*types.DiskUsage, error) {
+func (daemon *Daemon) SystemDiskUsage(ctx context.Context, opts backend.DiskUsageOptions) (*backend.DiskUsage, error) {
 	eg, ctx := errgroup.WithContext(ctx)
 
-	var containers []*types.Container
+	du := &backend.DiskUsage{}
 	if opts.Containers {
-		eg.Go(func() error {
-			var err error
-			containers, err = daemon.ContainerDiskUsage(ctx)
+		eg.Go(func() (err error) {
+			du.Containers, err = daemon.containerDiskUsage(ctx, opts.Verbose)
 			return err
 		})
 	}
 
-	var (
-		images     []*types.ImageSummary
-		layersSize int64
-	)
 	if opts.Images {
-		eg.Go(func() error {
-			var err error
-			images, err = daemon.imageService.ImageDiskUsage(ctx)
-			return err
-		})
-		eg.Go(func() error {
-			var err error
-			layersSize, err = daemon.imageService.LayerDiskUsage(ctx)
+		eg.Go(func() (err error) {
+			du.Images, err = daemon.imageDiskUsage(ctx, opts.Verbose)
 			return err
 		})
 	}
 
-	var volumes []*types.Volume
 	if opts.Volumes {
-		eg.Go(func() error {
-			var err error
-			volumes, err = daemon.volumes.LocalVolumesSize(ctx)
+		eg.Go(func() (err error) {
+			du.Volumes, err = daemon.localVolumesSize(ctx, opts.Verbose)
 			return err
 		})
 	}
@@ -76,10 +162,6 @@ func (daemon *Daemon) SystemDiskUsage(ctx context.Context, opts system.DiskUsage
 	if err := eg.Wait(); err != nil {
 		return nil, err
 	}
-	return &types.DiskUsage{
-		LayersSize: layersSize,
-		Containers: containers,
-		Volumes:    volumes,
-		Images:     images,
-	}, nil
+
+	return du, nil
 }

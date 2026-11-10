@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -8,11 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/daemon/cluster/executor/container"
-	"github.com/docker/docker/integration-cli/checker"
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/cli/build"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/daemon/cluster/executor/container"
+	"github.com/moby/moby/v2/integration-cli/checker"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
+	"github.com/moby/moby/v2/internal/testutil"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
 	"gotest.tools/v3/poll"
@@ -23,7 +23,8 @@ import (
 func (s *DockerSwarmSuite) TestServiceHealthRun(c *testing.T) {
 	testRequires(c, DaemonIsLinux) // busybox doesn't work on Windows
 
-	d := s.AddDaemon(c, true, true)
+	ctx := testutil.GetContext(c)
+	d := s.AddDaemon(ctx, c, true, true)
 
 	// build image with health-check
 	imageName := "testhealth"
@@ -41,23 +42,23 @@ func (s *DockerSwarmSuite) TestServiceHealthRun(c *testing.T) {
 	id := strings.TrimSpace(out)
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(c, id)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, id)
 		return tasks, ""
 	}, checker.HasLen(1)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
 
 	// wait for task to start
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		task = d.GetTask(c, task.ID)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		task = d.GetTask(ctx, t, task.ID)
 		return task.Status.State, ""
 	}, checker.Equals(swarm.TaskStateRunning)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	containerID := task.Status.ContainerStatus.ContainerID
 
 	// wait for container to be healthy
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		out, _ := d.Cmd("inspect", "--format={{.State.Health.Status}}", containerID)
 		return strings.TrimSpace(out), ""
 	}, checker.Equals("healthy")), poll.WithTimeout(defaultReconciliationTimeout))
@@ -65,14 +66,14 @@ func (s *DockerSwarmSuite) TestServiceHealthRun(c *testing.T) {
 	// make it fail
 	d.Cmd("exec", containerID, "rm", "/status")
 	// wait for container to be unhealthy
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		out, _ := d.Cmd("inspect", "--format={{.State.Health.Status}}", containerID)
 		return strings.TrimSpace(out), ""
 	}, checker.Equals("unhealthy")), poll.WithTimeout(defaultReconciliationTimeout))
 
 	// Task should be terminated
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		task = d.GetTask(c, task.ID)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		task = d.GetTask(ctx, t, task.ID)
 		return task.Status.State, ""
 	}, checker.Equals(swarm.TaskStateFailed)), poll.WithTimeout(defaultReconciliationTimeout))
 
@@ -86,7 +87,8 @@ func (s *DockerSwarmSuite) TestServiceHealthRun(c *testing.T) {
 func (s *DockerSwarmSuite) TestServiceHealthStart(c *testing.T) {
 	testRequires(c, DaemonIsLinux) // busybox doesn't work on Windows
 
-	d := s.AddDaemon(c, true, true)
+	ctx := testutil.GetContext(c)
+	d := s.AddDaemon(ctx, c, true, true)
 
 	// service started from this image won't pass health check
 	imageName := "testhealth"
@@ -103,39 +105,38 @@ func (s *DockerSwarmSuite) TestServiceHealthStart(c *testing.T) {
 	id := strings.TrimSpace(out)
 
 	var tasks []swarm.Task
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		tasks = d.GetServiceTasks(c, id)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		tasks = d.GetServiceTasks(ctx, t, id)
 		return tasks, ""
 	}, checker.HasLen(1)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	task := tasks[0]
 
 	// wait for task to start
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		task = d.GetTask(c, task.ID)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		task = d.GetTask(ctx, t, task.ID)
 		return task.Status.State, ""
 	}, checker.Equals(swarm.TaskStateStarting)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	containerID := task.Status.ContainerStatus.ContainerID
 
 	// wait for health check to work
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
 		out, _ := d.Cmd("inspect", "--format={{.State.Health.FailingStreak}}", containerID)
 		failingStreak, _ := strconv.Atoi(strings.TrimSpace(out))
 		return failingStreak, ""
 	}, checker.GreaterThan(0)), poll.WithTimeout(defaultReconciliationTimeout))
 
 	// task should be blocked at starting status
-	task = d.GetTask(c, task.ID)
+	task = d.GetTask(ctx, c, task.ID)
 	assert.Equal(c, task.Status.State, swarm.TaskStateStarting)
 
 	// make it healthy
 	d.Cmd("exec", containerID, "touch", "/status")
 
 	// Task should be at running status
-	poll.WaitOn(c, pollCheck(c, func(c *testing.T) (interface{}, string) {
-		task = d.GetTask(c, task.ID)
+	poll.WaitOn(c, pollCheck(c, func(t *testing.T) (any, string) {
+		task = d.GetTask(ctx, t, task.ID)
 		return task.Status.State, ""
 	}, checker.Equals(swarm.TaskStateRunning)), poll.WithTimeout(defaultReconciliationTimeout))
-
 }

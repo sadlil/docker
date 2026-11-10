@@ -1,97 +1,102 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
-	"strings"
+	"net/url"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerListError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ContainerList(context.Background(), types.ContainerListOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(
+		WithMockClient(errorMock(http.StatusInternalServerError, "Server error")),
+	)
+	assert.NilError(t, err)
+
+	_, err = client.ContainerList(t.Context(), ContainerListOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestContainerList(t *testing.T) {
-	expectedURL := "/containers/json"
-	expectedFilters := `{"before":{"container":true},"label":{"label1":true,"label2":true}}`
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
-			query := req.URL.Query()
-			all := query.Get("all")
-			if all != "1" {
-				return nil, fmt.Errorf("all not set in URL query properly. Expected '1', got %s", all)
-			}
-			limit := query.Get("limit")
-			if limit != "0" {
-				return nil, fmt.Errorf("limit should have not be present in query. Expected '0', got %s", limit)
-			}
-			since := query.Get("since")
-			if since != "container" {
-				return nil, fmt.Errorf("since not set in URL query properly. Expected 'container', got %s", since)
-			}
-			before := query.Get("before")
-			if before != "" {
-				return nil, fmt.Errorf("before should have not be present in query, go %s", before)
-			}
-			size := query.Get("size")
-			if size != "1" {
-				return nil, fmt.Errorf("size not set in URL query properly. Expected '1', got %s", size)
-			}
-			filters := query.Get("filters")
-			if filters != expectedFilters {
-				return nil, fmt.Errorf("expected filters incoherent '%v' with actual filters %v", expectedFilters, filters)
-			}
+	const expectedURL = "/containers/json"
 
-			b, err := json.Marshal([]types.Container{
-				{
-					ID: "container_id1",
-				},
-				{
-					ID: "container_id2",
-				},
-			})
-			if err != nil {
-				return nil, err
-			}
-
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(b)),
-			}, nil
-		}),
+	tests := []struct {
+		doc      string
+		options  ContainerListOptions
+		expected url.Values
+	}{
+		{
+			doc:      "no options",
+			expected: url.Values{},
+		},
+		{
+			doc:      "size",
+			options:  ContainerListOptions{Size: true},
+			expected: url.Values{"size": []string{"1"}},
+		},
+		{
+			doc:      "all",
+			options:  ContainerListOptions{All: true},
+			expected: url.Values{"all": []string{"1"}},
+		},
+		{
+			doc:      "latest",
+			options:  ContainerListOptions{Latest: true}, //nolint:staticcheck // ignore SA1019: field is deprecated.
+			expected: url.Values{},
+		},
+		{
+			doc:      "since",
+			options:  ContainerListOptions{Since: "container"}, //nolint:staticcheck // ignore SA1019: field is deprecated.
+			expected: url.Values{},
+		},
+		{
+			doc:      "before",
+			options:  ContainerListOptions{Before: "container"}, //nolint:staticcheck // ignore SA1019: field is deprecated.
+			expected: url.Values{},
+		},
+		{
+			doc:      "limit",
+			options:  ContainerListOptions{Limit: 1},
+			expected: url.Values{"limit": []string{"1"}},
+		},
+		{
+			doc: "filters",
+			options: ContainerListOptions{
+				Filters: make(Filters).
+					Add("label", "label1").
+					Add("label", "label2").
+					Add("before", "container"),
+			},
+			expected: url.Values{"filters": []string{`{"before":{"container":true},"label":{"label1":true,"label2":true}}`}},
+		},
 	}
 
-	filters := filters.NewArgs()
-	filters.Add("label", "label1")
-	filters.Add("label", "label2")
-	filters.Add("before", "container")
-	containers, err := client.ContainerList(context.Background(), types.ContainerListOptions{
-		Size:    true,
-		All:     true,
-		Since:   "container",
-		Filters: filters,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(containers) != 2 {
-		t.Fatalf("expected 2 containers, got %v", containers)
+	for _, tc := range tests {
+		t.Run(tc.doc, func(t *testing.T) {
+			var query url.Values
+			client, err := New(
+				WithMockClient(func(req *http.Request) (*http.Response, error) {
+					if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+						return nil, err
+					}
+					query = req.URL.Query()
+
+					return mockJSONResponse(http.StatusOK, nil, []container.Summary{
+						{ID: "container_id1"},
+						{ID: "container_id2"},
+					})(req)
+				}),
+			)
+			assert.NilError(t, err)
+
+			list, err := client.ContainerList(t.Context(), tc.options)
+			assert.NilError(t, err)
+			assert.Check(t, is.Len(list.Items, 2))
+			assert.Check(t, is.DeepEqual(query, tc.expected))
+		})
 	}
 }

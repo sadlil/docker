@@ -1,75 +1,62 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"reflect"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerTopError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ContainerTop(context.Background(), "nothing", []string{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
+	_, err = client.ContainerTop(t.Context(), "nothing", ContainerTopOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ContainerTop(t.Context(), "", ContainerTopOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ContainerTop(t.Context(), "    ", ContainerTopOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestContainerTop(t *testing.T) {
-	expectedURL := "/containers/container_id/top"
+	const expectedURL = "/containers/container_id/top"
 	expectedProcesses := [][]string{
 		{"p1", "p2"},
 		{"p3"},
 	}
 	expectedTitles := []string{"title1", "title2"}
 
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
-			query := req.URL.Query()
-			args := query.Get("ps_args")
-			if args != "arg1 arg2" {
-				return nil, fmt.Errorf("args not set in URL query properly. Expected 'arg1 arg2', got %v", args)
-			}
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+			return nil, err
+		}
+		query := req.URL.Query()
+		args := query.Get("ps_args")
+		if args != "arg1 arg2" {
+			return nil, fmt.Errorf("args not set in URL query properly. Expected 'arg1 arg2', got %v", args)
+		}
+		return mockJSONResponse(http.StatusOK, nil, container.TopResponse{
+			Processes: [][]string{
+				{"p1", "p2"},
+				{"p3"},
+			},
+			Titles: []string{"title1", "title2"},
+		})(req)
+	}))
+	assert.NilError(t, err)
 
-			b, err := json.Marshal(container.ContainerTopOKBody{
-				Processes: [][]string{
-					{"p1", "p2"},
-					{"p3"},
-				},
-				Titles: []string{"title1", "title2"},
-			})
-			if err != nil {
-				return nil, err
-			}
-
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(b)),
-			}, nil
-		}),
-	}
-
-	processList, err := client.ContainerTop(context.Background(), "container_id", []string{"arg1", "arg2"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(expectedProcesses, processList.Processes) {
-		t.Fatalf("Processes: expected %v, got %v", expectedProcesses, processList.Processes)
-	}
-	if !reflect.DeepEqual(expectedTitles, processList.Titles) {
-		t.Fatalf("Titles: expected %v, got %v", expectedTitles, processList.Titles)
-	}
+	processList, err := client.ContainerTop(t.Context(), "container_id", ContainerTopOptions{
+		Arguments: []string{"arg1", "arg2"},
+	})
+	assert.NilError(t, err)
+	assert.Check(t, is.DeepEqual(expectedProcesses, processList.Processes))
+	assert.Check(t, is.DeepEqual(expectedTitles, processList.Titles))
 }

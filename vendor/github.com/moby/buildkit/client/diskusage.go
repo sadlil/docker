@@ -1,8 +1,9 @@
 package client
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 	"time"
 
 	controlapi "github.com/moby/buildkit/api/services/control"
@@ -10,18 +11,18 @@ import (
 )
 
 type UsageInfo struct {
-	ID      string
-	Mutable bool
-	InUse   bool
-	Size    int64
+	ID      string `json:"id"`
+	Mutable bool   `json:"mutable"`
+	InUse   bool   `json:"inUse"`
+	Size    int64  `json:"size"`
 
-	CreatedAt   time.Time
-	LastUsedAt  *time.Time
-	UsageCount  int
-	Parent      string
-	Description string
-	RecordType  UsageRecordType
-	Shared      bool
+	CreatedAt   time.Time       `json:"createdAt"`
+	LastUsedAt  *time.Time      `json:"lastUsedAt"`
+	UsageCount  int             `json:"usageCount"`
+	Parents     []string        `json:"parents"`
+	Description string          `json:"description"`
+	RecordType  UsageRecordType `json:"recordType"`
+	Shared      bool            `json:"shared"`
 }
 
 func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*UsageInfo, error) {
@@ -30,8 +31,8 @@ func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*Usa
 		o.SetDiskUsageOption(info)
 	}
 
-	req := &controlapi.DiskUsageRequest{Filter: info.Filter}
-	resp, err := c.controlClient().DiskUsage(ctx, req)
+	req := &controlapi.DiskUsageRequest{Filter: info.Filter, AgeLimit: int64(info.AgeLimit)}
+	resp, err := c.ControlClient().DiskUsage(ctx, req)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to call diskusage")
 	}
@@ -43,24 +44,26 @@ func (c *Client) DiskUsage(ctx context.Context, opts ...DiskUsageOption) ([]*Usa
 			ID:          d.ID,
 			Mutable:     d.Mutable,
 			InUse:       d.InUse,
-			Size:        d.Size_,
-			Parent:      d.Parent,
-			CreatedAt:   d.CreatedAt,
+			Size:        d.Size,
+			Parents:     d.Parents,
+			CreatedAt:   d.CreatedAt.AsTime(),
 			Description: d.Description,
 			UsageCount:  int(d.UsageCount),
-			LastUsedAt:  d.LastUsedAt,
-			RecordType:  UsageRecordType(d.RecordType),
-			Shared:      d.Shared,
+			LastUsedAt: func() *time.Time {
+				if d.LastUsedAt != nil {
+					ts := d.LastUsedAt.AsTime()
+					return &ts
+				}
+				return nil
+			}(),
+			RecordType: UsageRecordType(d.RecordType),
+			Shared:     d.Shared,
 		})
 	}
 
-	sort.Slice(du, func(i, j int) bool {
-		if du[i].Size == du[j].Size {
-			return du[i].ID > du[j].ID
-		}
-		return du[i].Size > du[j].Size
+	slices.SortFunc(du, func(a, b *UsageInfo) int {
+		return cmp.Or(cmp.Compare(a.Size, b.Size), cmp.Compare(a.ID, b.ID))
 	})
-
 	return du, nil
 }
 
@@ -69,7 +72,8 @@ type DiskUsageOption interface {
 }
 
 type DiskUsageInfo struct {
-	Filter []string
+	Filter   []string
+	AgeLimit time.Duration
 }
 
 type UsageRecordType string
@@ -82,3 +86,15 @@ const (
 	UsageRecordTypeCacheMount  UsageRecordType = "exec.cachemount"
 	UsageRecordTypeRegular     UsageRecordType = "regular"
 )
+
+type diskUsageOptionFunc func(*DiskUsageInfo)
+
+func (f diskUsageOptionFunc) SetDiskUsageOption(info *DiskUsageInfo) {
+	f(info)
+}
+
+func WithAgeLimit(age time.Duration) DiskUsageOption {
+	return diskUsageOptionFunc(func(info *DiskUsageInfo) {
+		info.AgeLimit = age
+	})
+}

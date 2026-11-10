@@ -1,119 +1,137 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerCreateError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ContainerCreate(context.Background(), nil, nil, nil, nil, "nothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error while testing StatusInternalServerError, got %T", err)
-	}
+	client, err := New(
+		WithMockClient(errorMock(http.StatusInternalServerError, "Server error")),
+	)
+	assert.NilError(t, err)
 
-	// 404 doesn't automatically means an unknown image
-	client = &Client{
-		client: newMockClient(errorMock(http.StatusNotFound, "Server error")),
-	}
-	_, err = client.ContainerCreate(context.Background(), nil, nil, nil, nil, "nothing")
-	if err == nil || !IsErrNotFound(err) {
-		t.Fatalf("expected a Server Error while testing StatusNotFound, got %T", err)
-	}
+	_, err = client.ContainerCreate(t.Context(), ContainerCreateOptions{Config: nil, Name: "nothing"})
+	assert.Error(t, err, "config.Image or Image is required")
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+
+	_, err = client.ContainerCreate(t.Context(), ContainerCreateOptions{Config: &container.Config{}, Name: "nothing"})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
 }
 
 func TestContainerCreateImageNotFound(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusNotFound, "No such image")),
-	}
-	_, err := client.ContainerCreate(context.Background(), &container.Config{Image: "unknown_image"}, nil, nil, nil, "unknown")
-	if err == nil || !IsErrNotFound(err) {
-		t.Fatalf("expected an imageNotFound error, got %v, %T", err, err)
-	}
+	client, err := New(
+		WithMockClient(errorMock(http.StatusNotFound, "No such image")),
+	)
+	assert.NilError(t, err)
+
+	_, err = client.ContainerCreate(t.Context(), ContainerCreateOptions{Config: &container.Config{Image: "unknown_image"}, Name: "unknown"})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsNotFound))
 }
 
 func TestContainerCreateWithName(t *testing.T) {
-	expectedURL := "/containers/create"
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
+	const expectedURL = "/containers/create"
+	client, err := New(
+		WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+				return nil, err
 			}
 			name := req.URL.Query().Get("name")
 			if name != "container_name" {
 				return nil, fmt.Errorf("container name not set in URL query properly. Expected `container_name`, got %s", name)
 			}
-			b, err := json.Marshal(container.ContainerCreateCreatedBody{
+			return mockJSONResponse(http.StatusOK, nil, container.CreateResponse{
 				ID: "container_id",
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(b)),
-			}, nil
+			})(req)
 		}),
-	}
+	)
+	assert.NilError(t, err)
 
-	r, err := client.ContainerCreate(context.Background(), nil, nil, nil, nil, "container_name")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.ID != "container_id" {
-		t.Fatalf("expected `container_id`, got %s", r.ID)
-	}
+	r, err := client.ContainerCreate(t.Context(), ContainerCreateOptions{Config: &container.Config{Image: "test"}, Name: "container_name"})
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(r.ID, "container_id"))
 }
 
-// TestContainerCreateAutoRemove validates that a client using API 1.24 always disables AutoRemove. When using API 1.25
-// or up, AutoRemove should not be disabled.
 func TestContainerCreateAutoRemove(t *testing.T) {
-	autoRemoveValidator := func(expectedValue bool) func(req *http.Request) (*http.Response, error) {
-		return func(req *http.Request) (*http.Response, error) {
-			var config configWrapper
+	client, err := New(
+		WithMockClient(func(req *http.Request) (*http.Response, error) {
+			var config container.CreateRequest
+			if err := json.NewDecoder(req.Body).Decode(&config); err != nil {
+				return nil, err
+			}
+			if !config.HostConfig.AutoRemove {
+				return nil, errors.New("expected AutoRemove to be enabled")
+			}
+			return mockJSONResponse(http.StatusOK, nil, container.CreateResponse{
+				ID: "container_id",
+			})(req)
+		}),
+	)
+	assert.NilError(t, err)
+
+	resp, err := client.ContainerCreate(t.Context(), ContainerCreateOptions{Config: &container.Config{Image: "test"}, HostConfig: &container.HostConfig{AutoRemove: true}})
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(resp.ID, "container_id"))
+}
+
+// TestContainerCreateConnectionError verifies that connection errors occurring
+// during API-version negotiation are not shadowed by API-version errors.
+//
+// Regression test for https://github.com/docker/cli/issues/4890
+func TestContainerCreateConnectionError(t *testing.T) {
+	client, err := New(WithHost("tcp://no-such-host.invalid"))
+	assert.NilError(t, err)
+
+	_, err = client.ContainerCreate(t.Context(), ContainerCreateOptions{Config: &container.Config{Image: "test"}})
+	assert.Check(t, is.ErrorType(err, IsErrConnectionFailed))
+}
+
+// TestContainerCreateCapabilities verifies that CapAdd and CapDrop capabilities
+// are normalized to their canonical form.
+func TestContainerCreateCapabilities(t *testing.T) {
+	inputCaps := []string{
+		"all",
+		"ALL",
+		"capability_b",
+		"capability_a",
+		"capability_c",
+		"CAPABILITY_D",
+		"CAP_CAPABILITY_D",
+	}
+
+	expectedCaps := []string{
+		"ALL",
+		"CAP_CAPABILITY_A",
+		"CAP_CAPABILITY_B",
+		"CAP_CAPABILITY_C",
+		"CAP_CAPABILITY_D",
+	}
+
+	client, err := New(
+		WithMockClient(func(req *http.Request) (*http.Response, error) {
+			var config container.CreateRequest
 
 			if err := json.NewDecoder(req.Body).Decode(&config); err != nil {
 				return nil, err
 			}
-			if config.HostConfig.AutoRemove != expectedValue {
-				return nil, fmt.Errorf("expected AutoRemove to be %v, got %v", expectedValue, config.HostConfig.AutoRemove)
-			}
-			b, err := json.Marshal(container.ContainerCreateCreatedBody{
-				ID: "container_id",
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(b)),
-			}, nil
-		}
-	}
+			assert.Check(t, is.DeepEqual(config.HostConfig.CapAdd, expectedCaps))
+			assert.Check(t, is.DeepEqual(config.HostConfig.CapDrop, expectedCaps))
 
-	client := &Client{
-		client:  newMockClient(autoRemoveValidator(false)),
-		version: "1.24",
-	}
-	if _, err := client.ContainerCreate(context.Background(), nil, &container.HostConfig{AutoRemove: true}, nil, nil, ""); err != nil {
-		t.Fatal(err)
-	}
-	client = &Client{
-		client:  newMockClient(autoRemoveValidator(true)),
-		version: "1.25",
-	}
-	if _, err := client.ContainerCreate(context.Background(), nil, &container.HostConfig{AutoRemove: true}, nil, nil, ""); err != nil {
-		t.Fatal(err)
-	}
+			return mockJSONResponse(http.StatusOK, nil, container.CreateResponse{
+				ID: "container_id",
+			})(req)
+		}),
+	)
+	assert.NilError(t, err)
+
+	_, err = client.ContainerCreate(t.Context(), ContainerCreateOptions{Config: &container.Config{Image: "test"}, HostConfig: &container.HostConfig{CapAdd: inputCaps, CapDrop: inputCaps}})
+	assert.NilError(t, err)
 }

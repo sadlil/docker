@@ -1,31 +1,35 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"strconv"
 	"time"
 
-	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/errdefs"
 )
 
 // ContainerResize changes the size of the TTY of the process running
 // in the container with the given name to the given height and width.
-func (daemon *Daemon) ContainerResize(name string, height, width int) error {
+func (daemon *Daemon) ContainerResize(ctx context.Context, name string, height, width uint32) error {
 	container, err := daemon.GetContainer(name)
 	if err != nil {
 		return err
 	}
 
-	if !container.IsRunning() {
-		return errNotRunning(container.ID)
+	container.Lock()
+	tsk, err := container.GetRunningTask()
+	container.Unlock()
+	if err != nil {
+		return err
 	}
 
-	if err = daemon.containerd.ResizeTerminal(context.Background(), container.ID, libcontainerdtypes.InitProcessName, width, height); err == nil {
-		attributes := map[string]string{
-			"height": fmt.Sprintf("%d", height),
-			"width":  fmt.Sprintf("%d", width),
-		}
-		daemon.LogContainerEventWithAttributes(container, "resize", attributes)
+	if err = tsk.Resize(context.WithoutCancel(ctx), width, height); err == nil {
+		daemon.LogContainerEventWithAttributes(container, events.ActionResize, map[string]string{
+			"height": strconv.FormatUint(uint64(height), 10),
+			"width":  strconv.FormatUint(uint64(width), 10),
+		})
 	}
 	return err
 }
@@ -33,7 +37,7 @@ func (daemon *Daemon) ContainerResize(name string, height, width int) error {
 // ContainerExecResize changes the size of the TTY of the process
 // running in the exec with the given name to the given height and
 // width.
-func (daemon *Daemon) ContainerExecResize(name string, height, width int) error {
+func (daemon *Daemon) ContainerExecResize(ctx context.Context, name string, height, width uint32) error {
 	ec, err := daemon.getExecConfig(name)
 	if err != nil {
 		return err
@@ -46,8 +50,12 @@ func (daemon *Daemon) ContainerExecResize(name string, height, width int) error 
 
 	select {
 	case <-ec.Started:
-		return daemon.containerd.ResizeTerminal(context.Background(), ec.ContainerID, ec.ID, width, height)
+		// An error may have occurred, so ec.Process may be nil.
+		if ec.Process == nil {
+			return errdefs.InvalidParameter(errors.New("exec process is not started"))
+		}
+		return ec.Process.Resize(context.WithoutCancel(ctx), width, height)
 	case <-timeout.C:
-		return fmt.Errorf("timeout waiting for exec session ready")
+		return errors.New("timeout waiting for exec session ready")
 	}
 }

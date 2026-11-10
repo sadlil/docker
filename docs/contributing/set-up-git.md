@@ -49,7 +49,7 @@ target="_blank">moby/moby repository</a>.
    ```
 
     In Windows, you'll work in your Docker Quickstart Terminal window instead of
-    Powershell or a `cmd` window.
+    PowerShell or a `cmd` window.
 
 6. Create a `repos` directory.
 
@@ -66,9 +66,10 @@ target="_blank">moby/moby repository</a>.
 8. Clone the fork to your local host into a repository called `moby-fork`.
 
    ```bash
-   $ git clone https://github.com/moxiegirl/moby.git moby-fork
+   $ git clone https://github.com/YOUR_ACCOUNT/moby.git moby-fork
    ```
 
+    In the command above replace `YOUR_ACCOUNT` with your GitHub username.
     Naming your local repo `moby-fork` should help make these instructions
     easier to follow; experienced coders don't typically change the name.
 

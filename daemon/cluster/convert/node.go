@@ -1,12 +1,12 @@
-package convert // import "github.com/docker/docker/daemon/cluster/convert"
+package convert
 
 import (
 	"fmt"
 	"strings"
 
-	types "github.com/docker/docker/api/types/swarm"
-	swarmapi "github.com/docker/swarmkit/api"
 	gogotypes "github.com/gogo/protobuf/types"
+	types "github.com/moby/moby/api/types/swarm"
+	swarmapi "github.com/moby/swarmkit/v2/api"
 )
 
 // NodeFromGRPC converts a grpc Node to a Node.
@@ -55,6 +55,25 @@ func NodeFromGRPC(n swarmapi.Node) types.Node {
 			node.Description.TLSInfo.TrustRoot = string(n.Description.TLSInfo.TrustRoot)
 			node.Description.TLSInfo.CertIssuerPublicKey = n.Description.TLSInfo.CertIssuerPublicKey
 			node.Description.TLSInfo.CertIssuerSubject = n.Description.TLSInfo.CertIssuerSubject
+		}
+		for _, csi := range n.Description.CSIInfo {
+			if csi != nil {
+				convertedInfo := types.NodeCSIInfo{
+					PluginName:        csi.PluginName,
+					NodeID:            csi.NodeID,
+					MaxVolumesPerNode: csi.MaxVolumesPerNode,
+				}
+
+				if csi.AccessibleTopology != nil {
+					convertedInfo.AccessibleTopology = &types.Topology{
+						Segments: csi.AccessibleTopology.Segments,
+					}
+				}
+
+				node.Description.CSIInfo = append(
+					node.Description.CSIInfo, convertedInfo,
+				)
+			}
 		}
 	}
 

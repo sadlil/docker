@@ -1,11 +1,13 @@
-package vfs // import "github.com/docker/docker/daemon/graphdriver/vfs"
+package vfs
 
 import (
-	"github.com/docker/docker/quota"
-	"github.com/sirupsen/logrus"
+	"context"
+	"errors"
+
+	"github.com/containerd/log"
+	"github.com/moby/moby/v2/daemon/internal/quota"
 )
 
-//nolint:structcheck
 type driverQuota struct {
 	quotaCtl *quota.Control
 	quotaOpt quota.Quota
@@ -14,8 +16,8 @@ type driverQuota struct {
 func setupDriverQuota(driver *Driver) {
 	if quotaCtl, err := quota.NewControl(driver.home); err == nil {
 		driver.quotaCtl = quotaCtl
-	} else if err != quota.ErrQuotaNotSupported {
-		logrus.Warnf("Unable to setup quota: %v\n", err)
+	} else if !errors.Is(err, quota.ErrQuotaNotSupported) {
+		log.G(context.TODO()).Warnf("Unable to setup quota: %v\n", err)
 	}
 }
 

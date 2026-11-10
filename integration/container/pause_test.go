@@ -1,18 +1,15 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
-	"context"
+	"errors"
 	"io"
 	"testing"
-	"time"
 
-	containerderrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/testutil/request"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
@@ -23,78 +20,72 @@ func TestPause(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows" && testEnv.DaemonInfo.Isolation == "process")
 	skip.If(t, testEnv.DaemonInfo.CgroupDriver == "none")
 
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-	cID := container.Run(ctx, t, client)
-	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
+	cID := container.Run(ctx, t, apiClient)
 
-	since := request.DaemonUnixTime(ctx, t, client, testEnv)
+	since := request.DaemonUnixTime(ctx, t, apiClient, testEnv)
 
-	err := client.ContainerPause(ctx, cID)
+	_, err := apiClient.ContainerPause(ctx, cID, client.ContainerPauseOptions{})
 	assert.NilError(t, err)
 
-	inspect, err := client.ContainerInspect(ctx, cID)
+	inspect, err := apiClient.ContainerInspect(ctx, cID, client.ContainerInspectOptions{})
 	assert.NilError(t, err)
-	assert.Check(t, is.Equal(true, inspect.State.Paused))
+	assert.Check(t, is.Equal(true, inspect.Container.State.Paused))
 
-	err = client.ContainerUnpause(ctx, cID)
+	_, err = apiClient.ContainerUnpause(ctx, cID, client.ContainerUnpauseOptions{})
 	assert.NilError(t, err)
 
-	until := request.DaemonUnixTime(ctx, t, client, testEnv)
+	until := request.DaemonUnixTime(ctx, t, apiClient, testEnv)
 
-	messages, errs := client.Events(ctx, types.EventsOptions{
+	result := apiClient.Events(ctx, client.EventsListOptions{
 		Since:   since,
 		Until:   until,
-		Filters: filters.NewArgs(filters.Arg("container", cID)),
+		Filters: make(client.Filters).Add(string(events.ContainerEventType), cID),
 	})
-	assert.Check(t, is.DeepEqual([]string{"pause", "unpause"}, getEventActions(t, messages, errs)))
+	messages := result.Messages
+	errs := result.Err
+	assert.Check(t, is.DeepEqual([]events.Action{events.ActionPause, events.ActionUnPause}, getEventActions(t, messages, errs)))
 }
 
 func TestPauseFailsOnWindowsServerContainers(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType != "windows" || testEnv.DaemonInfo.Isolation != "process")
 
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-	cID := container.Run(ctx, t, client)
-	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
-
-	err := client.ContainerPause(ctx, cID)
-	assert.Check(t, is.ErrorContains(err, containerderrdefs.ErrNotImplemented.Error()))
+	cID := container.Run(ctx, t, apiClient)
+	_, err := apiClient.ContainerPause(ctx, cID, client.ContainerPauseOptions{})
+	assert.Check(t, is.ErrorContains(err, cerrdefs.ErrNotImplemented.Error()))
 }
 
 func TestPauseStopPausedContainer(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.31"), "broken in earlier versions")
 	skip.If(t, testEnv.DaemonInfo.CgroupDriver == "none")
-	defer setupTest(t)()
-	client := testEnv.APIClient()
-	ctx := context.Background()
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-	cID := container.Run(ctx, t, client)
-	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
-
-	err := client.ContainerPause(ctx, cID)
+	cID := container.Run(ctx, t, apiClient)
+	_, err := apiClient.ContainerPause(ctx, cID, client.ContainerPauseOptions{})
 	assert.NilError(t, err)
 
-	err = client.ContainerStop(ctx, cID, nil)
+	_, err = apiClient.ContainerStop(ctx, cID, client.ContainerStopOptions{})
 	assert.NilError(t, err)
 
-	poll.WaitOn(t, container.IsStopped(ctx, client, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID))
 }
 
-func getEventActions(t *testing.T, messages <-chan events.Message, errs <-chan error) []string {
-	var actions []string
+func getEventActions(t *testing.T, messages <-chan events.Message, errs <-chan error) []events.Action {
+	t.Helper()
+	var actions []events.Action
 	for {
 		select {
 		case err := <-errs:
-			assert.Check(t, err == nil || err == io.EOF)
+			assert.Check(t, err == nil || errors.Is(err, io.EOF))
 			return actions
 		case e := <-messages:
-			actions = append(actions, e.Status)
+			actions = append(actions, e.Action)
 		}
 	}
 }

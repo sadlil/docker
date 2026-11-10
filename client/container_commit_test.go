@@ -1,43 +1,50 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerCommitError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ContainerCommit(context.Background(), "nothing", types.ContainerCommitOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(
+		WithMockClient(errorMock(http.StatusInternalServerError, "Server error")),
+	)
+	assert.NilError(t, err)
+
+	_, err = client.ContainerCommit(t.Context(), "nothing", ContainerCommitOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ContainerCommit(t.Context(), "", ContainerCommitOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ContainerCommit(t.Context(), "    ", ContainerCommitOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestContainerCommit(t *testing.T) {
-	expectedURL := "/commit"
-	expectedContainerID := "container_id"
-	specifiedReference := "repository_name:tag"
-	expectedRepositoryName := "repository_name"
-	expectedTag := "tag"
-	expectedComment := "comment"
-	expectedAuthor := "author"
+	const (
+		expectedURL            = "/commit"
+		expectedContainerID    = "container_id"
+		specifiedReference     = "repository_name:tag"
+		expectedRepositoryName = "docker.io/library/repository_name"
+		expectedTag            = "tag"
+		expectedComment        = "comment"
+		expectedAuthor         = "author"
+	)
 	expectedChanges := []string{"change1", "change2"}
 
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
+	client, err := New(
+		WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+				return nil, err
 			}
 			query := req.URL.Query()
 			containerID := query.Get("container")
@@ -68,30 +75,20 @@ func TestContainerCommit(t *testing.T) {
 			if len(changes) != len(expectedChanges) {
 				return nil, fmt.Errorf("expected container changes size to be '%d', got %d", len(expectedChanges), len(changes))
 			}
-			b, err := json.Marshal(types.IDResponse{
+			return mockJSONResponse(http.StatusOK, nil, container.CommitResponse{
 				ID: "new_container_id",
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(b)),
-			}, nil
+			})(req)
 		}),
-	}
+	)
+	assert.NilError(t, err)
 
-	r, err := client.ContainerCommit(context.Background(), expectedContainerID, types.ContainerCommitOptions{
+	r, err := client.ContainerCommit(t.Context(), expectedContainerID, ContainerCommitOptions{
 		Reference: specifiedReference,
 		Comment:   expectedComment,
 		Author:    expectedAuthor,
 		Changes:   expectedChanges,
-		Pause:     false,
+		NoPause:   true,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.ID != "new_container_id" {
-		t.Fatalf("expected `new_container_id`, got %s", r.ID)
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(r.ID, "new_container_id"))
 }

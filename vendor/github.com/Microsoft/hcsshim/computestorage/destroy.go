@@ -1,22 +1,24 @@
+//go:build windows
+
 package computestorage
 
 import (
 	"context"
+	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/Microsoft/hcsshim/internal/oc"
+	"github.com/Microsoft/hcsshim/internal/ot"
 	"github.com/pkg/errors"
-	"go.opencensus.io/trace"
 )
 
 // DestroyLayer deletes a container layer.
 //
 // `layerPath` is a path to a directory containing the layer to export.
 func DestroyLayer(ctx context.Context, layerPath string) (err error) {
-	title := "hcsshim.DestroyLayer"
-	ctx, span := trace.StartSpan(ctx, title) //nolint:ineffassign,staticcheck
+	title := "hcsshim::DestroyLayer"
+	ctx, span := ot.StartSpan(ctx, title) //nolint:ineffassign,staticcheck
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(trace.StringAttribute("layerPath", layerPath))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(attribute.String("layerPath", layerPath))
 
 	err = hcsDestroyLayer(layerPath)
 	if err != nil {

@@ -1,7 +1,6 @@
 //go:build race
-// +build race
 
-package loggerutils // import "github.com/docker/docker/daemon/logger/loggerutils"
+package loggerutils
 
 import (
 	"context"
@@ -11,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/pkg/tailfile"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/pkg/tailfile"
 	"golang.org/x/sync/errgroup"
 	"gotest.tools/v3/assert"
 )
@@ -28,30 +27,30 @@ func TestConcurrentLogging(t *testing.T) {
 		maxFiles = 3
 		compress = true
 	)
-	getTailReader := func(ctx context.Context, r SizeReaderAt, lines int) (io.Reader, int, error) {
+	getTailReader := func(ctx context.Context, r SizeReaderAt, lines int) (SizeReaderAt, int, error) {
 		return tailfile.NewTailReader(ctx, r, lines)
 	}
 	createDecoder := func(io.Reader) Decoder {
 		return dummyDecoder{}
 	}
-	marshal := func(msg *logger.Message) ([]byte, error) {
+	marshal := func(msg *logger.Message) []byte {
 		return []byte(fmt.Sprintf(
 			"Line=%q Source=%q Timestamp=%v Attrs=%v PLogMetaData=%#v Err=%v",
 			msg.Line, msg.Source, msg.Timestamp, msg.Attrs, msg.PLogMetaData, msg.Err,
-		)), nil
+		))
 	}
 	g, ctx := errgroup.WithContext(context.Background())
 	for ct := 0; ct < containers; ct++ {
 		ct := ct
 		dir := t.TempDir()
-		g.Go(func() (err error) {
-			logfile, err := NewLogFile(filepath.Join(dir, "log.log"), capacity, maxFiles, compress, marshal, createDecoder, 0644, getTailReader)
+		g.Go(func() (retErr error) {
+			logfile, err := NewLogFile(filepath.Join(dir, "log.log"), capacity, maxFiles, compress, createDecoder, 0o644, getTailReader)
 			if err != nil {
 				return err
 			}
 			defer func() {
-				if cErr := logfile.Close(); cErr != nil && err == nil {
-					err = cErr
+				if err := logfile.Close(); err != nil && retErr == nil {
+					retErr = err
 				}
 			}()
 			lg, ctx := errgroup.WithContext(ctx)
@@ -64,13 +63,16 @@ func TestConcurrentLogging(t *testing.T) {
 							return ctx.Err()
 						default:
 						}
+						timestamp := time.Now()
 						msg := logger.NewMessage()
 						msg.Line = append(msg.Line, fmt.Sprintf("container=%v logger=%v msg=%v", ct, ln, m)...)
 						msg.Source = "stdout"
-						msg.Timestamp = time.Now()
+						msg.Timestamp = timestamp
 						msg.Attrs = append(msg.Attrs, backend.LogAttr{Key: "foo", Value: "bar"})
 						msg.PLogMetaData = &backend.PartialLogMetaData{ID: fmt.Sprintf("%v %v %v", ct, ln, m), Ordinal: 1, Last: true}
-						if err := logfile.WriteLogEntry(msg); err != nil {
+						marshalled := marshal(msg)
+						logger.PutMessage(msg)
+						if err := logfile.WriteLogEntry(timestamp, marshalled); err != nil {
 							return err
 						}
 					}

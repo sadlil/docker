@@ -1,13 +1,15 @@
-package convert // import "github.com/docker/docker/daemon/cluster/convert"
+package convert
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 
-	types "github.com/docker/docker/api/types/swarm"
-	swarmapi "github.com/docker/swarmkit/api"
-	"github.com/docker/swarmkit/ca"
 	gogotypes "github.com/gogo/protobuf/types"
+	types "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/internal/sliceutil"
+	swarmapi "github.com/moby/swarmkit/v2/api"
+	"github.com/moby/swarmkit/v2/ca"
 )
 
 // SwarmFromGRPC converts a grpc Cluster to a Swarm.
@@ -40,7 +42,7 @@ func SwarmFromGRPC(c swarmapi.Cluster) types.Swarm {
 				TrustRoot: string(c.RootCA.CACert),
 			},
 			RootRotationInProgress: c.RootCA.RootRotation != nil,
-			DefaultAddrPool:        c.DefaultAddressPool,
+			DefaultAddrPool:        sliceutil.Map(c.DefaultAddressPool, func(s string) netip.Prefix { pfx, _ := netip.ParsePrefix(s); return pfx }),
 			SubnetSize:             c.SubnetSize,
 			DataPathPort:           c.VXLANUDPPort,
 		},

@@ -1,7 +1,6 @@
 //go:build !windows
-// +build !windows
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"testing"
@@ -12,8 +11,8 @@ import (
 func TestContainerTopValidatePSArgs(t *testing.T) {
 	tests := map[string]bool{
 		"ae -o uid=PID":             true,
-		"ae -o \"uid= PID\"":        true,  // ascii space (0x20)
-		"ae -o \"uid= PID\"":        false, // unicode space (U+2003, 0xe2 0x80 0x83)
+		`ae -o "uid= PID"`:          true,  // ascii space (0x20)
+		`ae -o "uid= PID"`:          false, // unicode space (U+2003, 0xe2 0x80 0x83)
 		"ae o uid=PID":              true,
 		"aeo uid=PID":               true,
 		"ae -O uid=PID":             true,
@@ -86,7 +85,6 @@ func TestContainerTopParsePSOutput(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(string(tc.output), func(t *testing.T) {
 			_, err := parsePSOutput(tc.output, tc.pids)
 			if tc.errExpected && err == nil {

@@ -10,16 +10,19 @@ import (
 )
 
 var enabledCaps = map[string]struct{}{
-	"moby.buildkit.frontend.inputs":      {},
-	"moby.buildkit.frontend.subrequests": {},
+	"moby.buildkit.frontend.inputs":         {},
+	"moby.buildkit.frontend.subrequests":    {},
+	"moby.buildkit.frontend.contexts":       {},
+	"moby.buildkit.frontend.gitquerystring": {},
+	"moby.buildkit.frontend.contexts.zstd":  {},
 }
 
 func validateCaps(req string) (forward bool, err error) {
 	if req == "" {
 		return
 	}
-	caps := strings.Split(req, ",")
-	for _, c := range caps {
+	caps := strings.SplitSeq(req, ",")
+	for c := range caps {
 		parts := strings.SplitN(c, "+", 2)
 		if _, ok := enabledCaps[parts[0]]; !ok {
 			err = stack.Enable(grpcerrors.WrapCode(errdefs.NewUnsupportedFrontendCapError(parts[0]), codes.Unimplemented))

@@ -1,70 +1,29 @@
-package network // import "github.com/docker/docker/integration/network"
+package network
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
-	"os/exec"
-	"strings"
+	"slices"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/integration/internal/network"
-	"github.com/docker/docker/testutil/daemon"
-	"github.com/docker/docker/testutil/request"
+	cerrdefs "github.com/containerd/errdefs"
+	networktypes "github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/swarm"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"gotest.tools/v3/assert"
+
 	is "gotest.tools/v3/assert/cmp"
-	"gotest.tools/v3/icmd"
-	"gotest.tools/v3/skip"
+	"gotest.tools/v3/poll"
 )
 
-func TestRunContainerWithBridgeNone(t *testing.T) {
-	skip.If(t, testEnv.IsRemoteDaemon, "cannot start daemon on remote test run")
-	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
-	skip.If(t, testEnv.IsUserNamespace)
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
-
-	d := daemon.New(t)
-	d.StartWithBusybox(t, "-b", "none")
-	defer d.Stop(t)
-
-	c := d.NewClientT(t)
-	ctx := context.Background()
-
-	id1 := container.Run(ctx, t, c)
-	defer c.ContainerRemove(ctx, id1, types.ContainerRemoveOptions{Force: true})
-
-	result, err := container.Exec(ctx, c, id1, []string{"ip", "l"})
-	assert.NilError(t, err)
-	assert.Check(t, is.Equal(false, strings.Contains(result.Combined(), "eth0")), "There shouldn't be eth0 in container in default(bridge) mode when bridge network is disabled")
-
-	id2 := container.Run(ctx, t, c, container.WithNetworkMode("bridge"))
-	defer c.ContainerRemove(ctx, id2, types.ContainerRemoveOptions{Force: true})
-
-	result, err = container.Exec(ctx, c, id2, []string{"ip", "l"})
-	assert.NilError(t, err)
-	assert.Check(t, is.Equal(false, strings.Contains(result.Combined(), "eth0")), "There shouldn't be eth0 in container in bridge mode when bridge network is disabled")
-
-	nsCommand := "ls -l /proc/self/ns/net | awk -F '->' '{print $2}'"
-	cmd := exec.Command("sh", "-c", nsCommand)
-	stdout := bytes.NewBuffer(nil)
-	cmd.Stdout = stdout
-	err = cmd.Run()
-	assert.NilError(t, err, "Failed to get current process network namespace: %+v", err)
-
-	id3 := container.Run(ctx, t, c, container.WithNetworkMode("host"))
-	defer c.ContainerRemove(ctx, id3, types.ContainerRemoveOptions{Force: true})
-
-	result, err = container.Exec(ctx, c, id3, []string{"sh", "-c", nsCommand})
-	assert.NilError(t, err)
-	assert.Check(t, is.Equal(stdout.String(), result.Combined()), "The network namespace of container should be the same with host when --net=host and bridge network is disabled")
-}
-
+// TestNetworkInvalidJSON tests that POST endpoints that expect a body return
+// the correct error when sending invalid JSON requests.
 func TestNetworkInvalidJSON(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
+	// POST endpoints that accept / expect a JSON body;
 	endpoints := []string{
 		"/networks/create",
 		"/networks/bridge/connect",
@@ -72,25 +31,52 @@ func TestNetworkInvalidJSON(t *testing.T) {
 	}
 
 	for _, ep := range endpoints {
-		ep := ep
-		t.Run(ep, func(t *testing.T) {
+		t.Run(ep[1:], func(t *testing.T) {
 			t.Parallel()
+			ctx := testutil.StartSpan(ctx, t)
 
-			res, body, err := request.Post(ep, request.RawString("{invalid json"), request.JSON)
-			assert.NilError(t, err)
-			assert.Equal(t, res.StatusCode, http.StatusBadRequest)
+			t.Run("invalid content type", func(t *testing.T) {
+				ctx := testutil.StartSpan(ctx, t)
+				res, body, err := request.Post(ctx, ep, request.RawString("{}"), request.ContentType("text/plain"))
+				assert.NilError(t, err)
+				assert.Check(t, is.Equal(res.StatusCode, http.StatusBadRequest))
 
-			buf, err := request.ReadBody(body)
-			assert.NilError(t, err)
-			assert.Check(t, is.Contains(string(buf), "invalid character 'i' looking for beginning of object key string"))
+				buf, err := request.ReadBody(body)
+				assert.NilError(t, err)
+				assert.Check(t, is.Contains(string(buf), "unsupported Content-Type header (text/plain): must be 'application/json'"))
+			})
 
-			res, body, err = request.Post(ep, request.JSON)
-			assert.NilError(t, err)
-			assert.Equal(t, res.StatusCode, http.StatusBadRequest)
+			t.Run("invalid JSON", func(t *testing.T) {
+				ctx := testutil.StartSpan(ctx, t)
+				res, body, err := request.Post(ctx, ep, request.RawString("{invalid json"), request.JSON)
+				assert.NilError(t, err)
+				assert.Check(t, is.Equal(res.StatusCode, http.StatusBadRequest))
 
-			buf, err = request.ReadBody(body)
-			assert.NilError(t, err)
-			assert.Check(t, is.Contains(string(buf), "got EOF while reading request body"))
+				buf, err := request.ReadBody(body)
+				assert.NilError(t, err)
+				assert.Check(t, is.Contains(string(buf), "invalid JSON: invalid character 'i' looking for beginning of object key string"))
+			})
+
+			t.Run("extra content after JSON", func(t *testing.T) {
+				ctx := testutil.StartSpan(ctx, t)
+				res, body, err := request.Post(ctx, ep, request.RawString(`{} trailing content`), request.JSON)
+				assert.NilError(t, err)
+				assert.Check(t, is.Equal(res.StatusCode, http.StatusBadRequest))
+
+				buf, err := request.ReadBody(body)
+				assert.NilError(t, err)
+				assert.Check(t, is.Contains(string(buf), "unexpected content after JSON"))
+			})
+
+			t.Run("empty body", func(t *testing.T) {
+				ctx := testutil.StartSpan(ctx, t)
+				// empty body should not produce an 500 internal server error, or
+				// any 5XX error (this is assuming the request does not produce
+				// an internal server error for another reason, but it shouldn't)
+				res, _, err := request.Post(ctx, ep, request.RawString(``), request.JSON)
+				assert.NilError(t, err)
+				assert.Check(t, res.StatusCode < http.StatusInternalServerError)
+			})
 		})
 	}
 }
@@ -98,7 +84,7 @@ func TestNetworkInvalidJSON(t *testing.T) {
 // TestNetworkList verifies that /networks returns a list of networks either
 // with, or without a trailing slash (/networks/). Regression test for https://github.com/moby/moby/issues/24595
 func TestNetworkList(t *testing.T) {
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
 	endpoints := []string{
 		"/networks",
@@ -106,17 +92,17 @@ func TestNetworkList(t *testing.T) {
 	}
 
 	for _, ep := range endpoints {
-		ep := ep
 		t.Run(ep, func(t *testing.T) {
+			ctx := testutil.StartSpan(ctx, t)
 			t.Parallel()
 
-			res, body, err := request.Get(ep, request.JSON)
+			res, body, err := request.Get(ctx, ep, request.JSON)
 			assert.NilError(t, err)
 			assert.Equal(t, res.StatusCode, http.StatusOK)
 
 			buf, err := request.ReadBody(body)
 			assert.NilError(t, err)
-			var nws []types.NetworkResource
+			var nws []networktypes.Inspect
 			err = json.Unmarshal(buf, &nws)
 			assert.NilError(t, err)
 			assert.Assert(t, len(nws) > 0)
@@ -124,28 +110,111 @@ func TestNetworkList(t *testing.T) {
 	}
 }
 
-func TestHostIPv4BridgeLabel(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows")
-	skip.If(t, testEnv.IsRemoteDaemon)
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
-	d := daemon.New(t)
-	d.Start(t)
-	defer d.Stop(t)
-	c := d.NewClientT(t)
-	defer c.Close()
-	ctx := context.Background()
+func TestAPINetworkGetDefaults(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
 
-	ipv4SNATAddr := "172.0.0.172"
-	// Create a bridge network with --opt com.docker.network.host_ipv4=172.0.0.172
-	bridgeName := "hostIPv4Bridge"
-	network.CreateNoError(ctx, t, c, bridgeName,
-		network.WithDriver("bridge"),
-		network.WithOption("com.docker.network.host_ipv4", ipv4SNATAddr),
-		network.WithOption("com.docker.network.bridge.name", bridgeName),
-	)
-	out, err := c.NetworkInspect(ctx, bridgeName, types.NetworkInspectOptions{Verbose: true})
+	defaults := []string{"bridge", "host", "none"}
+	if testEnv.DaemonInfo.OSType == "windows" {
+		defaults = []string{"nat", "none"}
+	}
+
+	for _, netName := range defaults {
+		assert.Assert(t, IsNetworkAvailable(ctx, apiClient, netName))
+	}
+}
+
+func TestAPINetworkFilter(t *testing.T) {
+	networkName := "bridge"
+	if testEnv.DaemonInfo.OSType == "windows" {
+		networkName = "nat"
+	}
+
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	res, err := apiClient.NetworkList(ctx, client.NetworkListOptions{
+		Filters: make(client.Filters).Add("name", networkName),
+	})
+
 	assert.NilError(t, err)
-	assert.Assert(t, len(out.IPAM.Config) > 0)
-	// Make sure the SNAT rule exists
-	icmd.RunCommand("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", out.IPAM.Config[0].Subnet, "!", "-o", bridgeName, "-j", "SNAT", "--to-source", ipv4SNATAddr).Assert(t, icmd.Success)
+
+	found := false
+	for _, nw := range res.Items {
+		if nw.Name == networkName {
+			found = true
+		}
+	}
+	assert.Assert(t, found, networkName+" is not found")
+}
+
+func TestNetworkInspectWithScope(t *testing.T) {
+	ctx := setupTest(t)
+
+	d := swarm.NewSwarm(ctx, t, testEnv)
+	defer d.Stop(t)
+
+	cli := d.NewClientT(t) // IMPORTANT: talk to swarm daemon
+
+	name := "test-scoped-network"
+	create, err := cli.NetworkCreate(ctx, name, client.NetworkCreateOptions{Driver: "overlay"})
+	assert.NilError(t, err)
+
+	var inspect client.NetworkInspectResult
+	poll.WaitOn(t, func(_ poll.LogT) poll.Result {
+		var err error
+		inspect, err = cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
+		if err != nil {
+			return poll.Continue("waiting for network %s to be inspectable: %v", name, err)
+		}
+		return poll.Success()
+	}, swarm.NetworkPoll)
+	assert.Check(t, is.Equal("swarm", inspect.Network.Scope))
+	assert.Check(t, is.Equal(create.ID, inspect.Network.ID))
+
+	_, err = cli.NetworkInspect(ctx, name, client.NetworkInspectOptions{Scope: "local"})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsNotFound))
+}
+
+func TestCreateDeletePredefinedNetworks(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	// Predefined networks differ per OS.
+	predefined := []string{"bridge", "host", "none"}
+	if testEnv.DaemonInfo.OSType == "windows" {
+		predefined = []string{"nat", "none"}
+	}
+
+	// Verify the daemon actually has those networks.
+	res, err := apiClient.NetworkList(ctx, client.NetworkListOptions{})
+	assert.NilError(t, err)
+
+	var actual []string
+	for _, nw := range res.Items {
+		if slices.Contains(predefined, nw.Name) {
+			actual = append(actual, nw.Name)
+		}
+	}
+	slices.Sort(actual)
+	slices.Sort(predefined)
+	assert.Check(t, is.DeepEqual(actual, predefined))
+
+	for _, name := range predefined {
+		t.Run(name, func(t *testing.T) {
+			// Creating a predefined network must fail.
+			_, err := apiClient.NetworkCreate(ctx, name, client.NetworkCreateOptions{})
+			assert.Check(t, is.ErrorContains(err, "operation is not permitted on predefined"))
+			assert.Check(t, is.ErrorType(err, cerrdefs.IsPermissionDenied))
+
+			// Deleting a predefined network must fail.
+			_, err = apiClient.NetworkRemove(ctx, name, client.NetworkRemoveOptions{})
+			assert.Check(t, is.ErrorContains(err, "is a pre-defined network and cannot be removed"))
+			assert.Check(t, is.ErrorType(err, cerrdefs.IsPermissionDenied))
+
+			// Sanity: it should still exist.
+			_, err = apiClient.NetworkInspect(ctx, name, client.NetworkInspectOptions{})
+			assert.NilError(t, err)
+		})
+	}
 }

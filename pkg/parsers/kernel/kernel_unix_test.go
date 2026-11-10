@@ -1,7 +1,6 @@
 //go:build !windows
-// +build !windows
 
-package kernel // import "github.com/docker/docker/pkg/parsers/kernel"
+package kernel
 
 import (
 	"fmt"
@@ -9,9 +8,7 @@ import (
 )
 
 func assertParseRelease(t *testing.T, release string, b *VersionInfo, result int) {
-	var (
-		a *VersionInfo
-	)
+	var a *VersionInfo
 	a, _ = ParseRelease(release)
 
 	if r := CompareKernelVersion(*a, *b); r != result {

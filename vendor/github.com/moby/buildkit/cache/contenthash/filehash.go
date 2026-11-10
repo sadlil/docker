@@ -2,12 +2,14 @@ package contenthash
 
 import (
 	"archive/tar"
-	"crypto/sha256"
+	"encoding/hex"
 	"hash"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/moby/buildkit/util/cachedigest"
+	"github.com/pkg/errors"
 	fstypes "github.com/tonistiigi/fsutil/types"
 )
 
@@ -24,7 +26,7 @@ func NewFileHash(path string, fi os.FileInfo) (hash.Hash, error) {
 
 	stat := &fstypes.Stat{
 		Mode:     uint32(fi.Mode()),
-		Size_:    fi.Size(),
+		Size:     fi.Size(),
 		ModTime:  fi.ModTime().UnixNano(),
 		Linkname: link,
 	}
@@ -40,17 +42,19 @@ func NewFileHash(path string, fi os.FileInfo) (hash.Hash, error) {
 }
 
 func NewFromStat(stat *fstypes.Stat) (hash.Hash, error) {
-	// Clear the socket bit since archive/tar.FileInfoHeader does not handle it
-	stat.Mode &^= uint32(os.ModeSocket)
+	// Clear the socket and irregular bits since archive/tar.FileInfoHeader does not handle them
+	stat.Mode &^= uint32(os.ModeSocket | os.ModeIrregular)
 
 	fi := &statInfo{stat}
 	hdr, err := tar.FileInfoHeader(fi, stat.Linkname)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to checksum file %s", stat.Path)
 	}
 	hdr.Name = "" // note: empty name is different from current has in docker build. Name is added on recursive directory scan instead
 	hdr.Devmajor = stat.Devmajor
 	hdr.Devminor = stat.Devminor
+	hdr.Uid = int(stat.Uid)
+	hdr.Gid = int(stat.Gid)
 
 	if len(stat.Xattrs) > 0 {
 		hdr.PAXRecords = make(map[string]string, len(stat.Xattrs))
@@ -59,13 +63,14 @@ func NewFromStat(stat *fstypes.Stat) (hash.Hash, error) {
 		}
 	}
 	// fmt.Printf("hdr: %#v\n", hdr)
-	tsh := &tarsumHash{hdr: hdr, Hash: sha256.New()}
+	h := cachedigest.NewHash(cachedigest.TypeFile)
+	tsh := &tarsumHash{hdr: hdr, Hash: h}
 	tsh.Reset() // initialize header
 	return tsh, nil
 }
 
 type tarsumHash struct {
-	hash.Hash
+	*cachedigest.Hash
 	hdr *tar.Header
 }
 
@@ -76,25 +81,43 @@ func (tsh *tarsumHash) Reset() {
 	WriteV1TarsumHeaders(tsh.hdr, tsh.Hash)
 }
 
+func (tsh *tarsumHash) Write(p []byte) (n int, err error) {
+	n, err = tsh.WriteNoDebug(p)
+	if n > 0 {
+		tsh.hdr.Size += int64(n)
+	}
+	return n, err
+}
+
+func (tsh *tarsumHash) Sum(_ []byte) []byte {
+	b, _ := hex.DecodeString(tsh.Hash.Sum().Hex())
+	return b
+}
+
 type statInfo struct {
 	*fstypes.Stat
 }
 
 func (s *statInfo) Name() string {
-	return filepath.Base(s.Stat.Path)
+	return filepath.Base(s.Path)
 }
+
 func (s *statInfo) Size() int64 {
-	return s.Stat.Size_
+	return s.Stat.Size
 }
+
 func (s *statInfo) Mode() os.FileMode {
 	return os.FileMode(s.Stat.Mode)
 }
+
 func (s *statInfo) ModTime() time.Time {
 	return time.Unix(s.Stat.ModTime/1e9, s.Stat.ModTime%1e9)
 }
+
 func (s *statInfo) IsDir() bool {
 	return s.Mode().IsDir()
 }
-func (s *statInfo) Sys() interface{} {
+
+func (s *statInfo) Sys() any {
 	return s.Stat
 }

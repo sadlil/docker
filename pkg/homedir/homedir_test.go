@@ -1,4 +1,4 @@
-package homedir // import "github.com/docker/docker/pkg/homedir"
+package homedir
 
 import (
 	"path/filepath"
@@ -13,12 +13,5 @@ func TestGet(t *testing.T) {
 
 	if !filepath.IsAbs(home) {
 		t.Fatalf("returned path is not absolute: %s", home)
-	}
-}
-
-func TestGetShortcutString(t *testing.T) {
-	shortcut := GetShortcutString()
-	if shortcut == "" {
-		t.Fatal("returned shortcut string is empty")
 	}
 }

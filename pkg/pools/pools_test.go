@@ -1,4 +1,4 @@
-package pools // import "github.com/docker/docker/pkg/pools"
+package pools
 
 import (
 	"bufio"
@@ -97,7 +97,7 @@ func TestBufioWriterPoolPutAndGet(t *testing.T) {
 	writer := BufioWriter32KPool.Get(bw)
 	assert.Assert(t, writer != nil)
 
-	written, err := writer.Write([]byte("foobar"))
+	written, err := writer.WriteString("foobar")
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(6, written))
 
@@ -109,14 +109,14 @@ func TestBufioWriterPoolPutAndGet(t *testing.T) {
 	buf.Reset()
 	BufioWriter32KPool.Put(writer)
 	// Try to write something
-	if _, err = writer.Write([]byte("barfoo")); err != nil {
+	if _, err = writer.WriteString("barfoo"); err != nil {
 		t.Fatal(err)
 	}
 	// If we now try to flush it, it should panic (the writer is nil)
 	// recover it
 	defer func() {
 		if r := recover(); r == nil {
-			t.Fatal("Trying to flush the writter should have 'paniced', did not.")
+			t.Fatal("Trying to flush the writer should have 'panicked', did not.")
 		}
 	}()
 	writer.Flush()

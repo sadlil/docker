@@ -19,12 +19,12 @@ package ttrpc
 import (
 	"fmt"
 
-	"github.com/gogo/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 type codec struct{}
 
-func (c codec) Marshal(msg interface{}) ([]byte, error) {
+func (c codec) Marshal(msg any) ([]byte, error) {
 	switch v := msg.(type) {
 	case proto.Message:
 		return proto.Marshal(v)
@@ -33,7 +33,7 @@ func (c codec) Marshal(msg interface{}) ([]byte, error) {
 	}
 }
 
-func (c codec) Unmarshal(p []byte, msg interface{}) error {
+func (c codec) Unmarshal(p []byte, msg any) error {
 	switch v := msg.(type) {
 	case proto.Message:
 		return proto.Unmarshal(p, v)

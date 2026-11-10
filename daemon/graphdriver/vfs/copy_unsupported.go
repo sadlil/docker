@@ -1,10 +1,12 @@
 //go:build !linux
-// +build !linux
 
-package vfs // import "github.com/docker/docker/daemon/graphdriver/vfs"
+package vfs
 
-import "github.com/docker/docker/pkg/chrootarchive"
+import (
+	"github.com/moby/go-archive/chrootarchive"
+	"github.com/moby/sys/user"
+)
 
 func dirCopy(srcDir, dstDir string) error {
-	return chrootarchive.NewArchiver(nil).CopyWithTar(srcDir, dstDir)
+	return chrootarchive.NewArchiver(user.IdentityMapping{}).CopyWithTar(srcDir, dstDir)
 }

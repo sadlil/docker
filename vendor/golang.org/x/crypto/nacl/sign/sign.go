@@ -4,27 +4,22 @@
 
 // Package sign signs small messages using public-key cryptography.
 //
-// Sign uses Ed25519 to sign messages. The length of messages is not hidden.
-// Messages should be small because:
-// 1. The whole message needs to be held in memory to be processed.
-// 2. Using large messages pressures implementations on small machines to process
-// plaintext without verifying the signature. This is very dangerous, and this API
-// discourages it, but a protocol that uses excessive message sizes might present
-// some implementations with no other choice.
-// 3. Performance may be improved by working with messages that fit into data caches.
-// Thus large amounts of data should be chunked so that each message is small.
+// This package is interoperable with [libsodium], as well as [TweetNaCl].
 //
-// This package is not interoperable with the current release of NaCl
-// (https://nacl.cr.yp.to/sign.html), which does not support Ed25519 yet. However,
-// it is compatible with the NaCl fork libsodium (https://www.libsodium.org), as well
-// as TweetNaCl (https://tweetnacl.cr.yp.to/).
+// The sign package is essentially a wrapper for the Ed25519 signature
+// algorithm (implemented by crypto/ed25519). It is [frozen] and is not accepting
+// new features.
+//
+// [libsodium]: https://libsodium.gitbook.io/doc/public-key_cryptography/public-key_signatures
+// [TweetNaCl]: https://tweetnacl.cr.yp.to/
+// [frozen]: https://go.dev/wiki/Frozen
 package sign
 
 import (
+	"crypto/ed25519"
 	"io"
 
-	"golang.org/x/crypto/ed25519"
-	"golang.org/x/crypto/internal/subtle"
+	"golang.org/x/crypto/internal/alias"
 )
 
 // Overhead is the number of bytes of overhead when signing a message.
@@ -48,7 +43,7 @@ func GenerateKey(rand io.Reader) (publicKey *[32]byte, privateKey *[64]byte, err
 func Sign(out, message []byte, privateKey *[64]byte) []byte {
 	sig := ed25519.Sign(ed25519.PrivateKey((*privateKey)[:]), message)
 	ret, out := sliceForAppend(out, Overhead+len(message))
-	if subtle.AnyOverlap(out, message) {
+	if alias.AnyOverlap(out, message) {
 		panic("nacl: invalid buffer overlap")
 	}
 	copy(out, sig)
@@ -67,7 +62,7 @@ func Open(out, signedMessage []byte, publicKey *[32]byte) ([]byte, bool) {
 		return nil, false
 	}
 	ret, out := sliceForAppend(out, len(signedMessage)-Overhead)
-	if subtle.AnyOverlap(out, signedMessage) {
+	if alias.AnyOverlap(out, signedMessage) {
 		panic("nacl: invalid buffer overlap")
 	}
 	copy(out, signedMessage[Overhead:])

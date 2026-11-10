@@ -1,37 +1,41 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
-	"io"
 	"net/url"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/swarm"
+	"github.com/moby/moby/api/types/swarm"
 )
 
-// ServiceInspectWithRaw returns the service information and the raw data.
-func (cli *Client) ServiceInspectWithRaw(ctx context.Context, serviceID string, opts types.ServiceInspectOptions) (swarm.Service, []byte, error) {
-	if serviceID == "" {
-		return swarm.Service{}, nil, objectNotFoundError{object: "service", id: serviceID}
+// ServiceInspectOptions holds parameters related to the service inspect operation.
+type ServiceInspectOptions struct {
+	InsertDefaults bool
+}
+
+// ServiceInspectResult represents the result of a service inspect operation.
+type ServiceInspectResult struct {
+	Service swarm.Service
+	Raw     json.RawMessage
+}
+
+// ServiceInspect retrieves detailed information about a specific service by its ID.
+func (cli *Client) ServiceInspect(ctx context.Context, serviceID string, options ServiceInspectOptions) (ServiceInspectResult, error) {
+	serviceID, err := trimID("service", serviceID)
+	if err != nil {
+		return ServiceInspectResult{}, err
 	}
+
 	query := url.Values{}
-	query.Set("insertDefaults", fmt.Sprintf("%v", opts.InsertDefaults))
-	serverResp, err := cli.get(ctx, "/services/"+serviceID, query, nil)
-	defer ensureReaderClosed(serverResp)
+	if options.InsertDefaults {
+		query.Set("insertDefaults", "1")
+	}
+	resp, err := cli.get(ctx, "/services/"+serviceID, query, nil)
 	if err != nil {
-		return swarm.Service{}, nil, wrapResponseError(err, serverResp, "service", serviceID)
+		return ServiceInspectResult{}, err
 	}
 
-	body, err := io.ReadAll(serverResp.body)
-	if err != nil {
-		return swarm.Service{}, nil, err
-	}
-
-	var response swarm.Service
-	rdr := bytes.NewReader(body)
-	err = json.NewDecoder(rdr).Decode(&response)
-	return response, body, err
+	var out ServiceInspectResult
+	out.Raw, err = decodeWithRaw(resp, &out.Service)
+	return out, err
 }

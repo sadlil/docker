@@ -1,15 +1,17 @@
+//go:build windows
+
 package wclayer
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"strings"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/hcsshim/internal/hcserror"
-	"github.com/Microsoft/hcsshim/internal/oc"
-	"go.opencensus.io/trace"
+	"github.com/Microsoft/hcsshim/internal/ot"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ExportLayer will create a folder at exportFolderPath and fill that folder with
@@ -19,13 +21,13 @@ import (
 // perform the export.
 func ExportLayer(ctx context.Context, path string, exportFolderPath string, parentLayerPaths []string) (err error) {
 	title := "hcsshim::ExportLayer"
-	ctx, span := trace.StartSpan(ctx, title)
+	ctx, span := ot.StartSpan(ctx, title)
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(
-		trace.StringAttribute("path", path),
-		trace.StringAttribute("exportFolderPath", exportFolderPath),
-		trace.StringAttribute("parentLayerPaths", strings.Join(parentLayerPaths, ", ")))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(
+		attribute.String("path", path),
+		attribute.String("exportFolderPath", exportFolderPath),
+		attribute.String("parentLayerPaths", strings.Join(parentLayerPaths, ", ")))
 
 	// Generate layer descriptors
 	layers, err := layerPathsToDescriptors(ctx, parentLayerPaths)
@@ -40,9 +42,16 @@ func ExportLayer(ctx context.Context, path string, exportFolderPath string, pare
 	return nil
 }
 
+// LayerReader is an interface that supports reading an existing container image layer.
 type LayerReader interface {
+	// Next advances to the next file and returns the name, size, and file info
 	Next() (string, int64, *winio.FileBasicInfo, error)
+	// LinkInfo returns the number of links and the file identifier for the current file.
+	LinkInfo() (uint32, *winio.FileIDInfo, error)
+	// Read reads data from the current file, in the format of a Win32 backup stream, and
+	// returns the number of bytes read.
 	Read(b []byte) (int, error)
+	// Close finishes the layer reading process and releases any resources.
 	Close() error
 }
 
@@ -50,18 +59,23 @@ type LayerReader interface {
 // The caller must have taken the SeBackupPrivilege privilege
 // to call this and any methods on the resulting LayerReader.
 func NewLayerReader(ctx context.Context, path string, parentLayerPaths []string) (_ LayerReader, err error) {
-	ctx, span := trace.StartSpan(ctx, "hcsshim::NewLayerReader")
+	ctx, span := ot.StartSpan(ctx, "hcsshim::NewLayerReader")
 	defer func() {
 		if err != nil {
-			oc.SetSpanStatus(span, err)
+			ot.SetSpanStatus(span, err)
 			span.End()
 		}
 	}()
-	span.AddAttributes(
-		trace.StringAttribute("path", path),
-		trace.StringAttribute("parentLayerPaths", strings.Join(parentLayerPaths, ", ")))
+	span.SetAttributes(
+		attribute.String("path", path),
+		attribute.String("parentLayerPaths", strings.Join(parentLayerPaths, ", ")))
 
-	exportPath, err := ioutil.TempDir("", "hcs")
+	if len(parentLayerPaths) == 0 {
+		// This is a base layer. It gets exported differently.
+		return newBaseLayerReader(path, span), nil
+	}
+
+	exportPath, err := os.MkdirTemp("", "hcs")
 	if err != nil {
 		return nil, err
 	}
@@ -79,14 +93,14 @@ func NewLayerReader(ctx context.Context, path string, parentLayerPaths []string)
 
 type legacyLayerReaderWrapper struct {
 	ctx context.Context
-	s   *trace.Span
+	s   trace.Span
 
 	*legacyLayerReader
 }
 
 func (r *legacyLayerReaderWrapper) Close() (err error) {
 	defer r.s.End()
-	defer func() { oc.SetSpanStatus(r.s, err) }()
+	defer func() { ot.SetSpanStatus(r.s, err) }()
 
 	err = r.legacyLayerReader.Close()
 	os.RemoveAll(r.root)

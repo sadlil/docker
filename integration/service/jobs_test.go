@@ -1,12 +1,11 @@
 package service
 
 import (
-	"context"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/integration/internal/swarm"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/swarm"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
@@ -21,21 +20,21 @@ func TestCreateJob(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	defer setupTest(t)
+	ctx := setupTest(t)
 
-	d := swarm.NewSwarm(t, testEnv)
+	d := swarm.NewSwarm(ctx, t, testEnv)
 	defer d.Stop(t)
 
-	client := d.NewClientT(t)
-	defer client.Close()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
 	for _, mode := range []swarmtypes.ServiceMode{
 		{ReplicatedJob: &swarmtypes.ReplicatedJob{}},
 		{GlobalJob: &swarmtypes.GlobalJob{}},
 	} {
-		id := swarm.CreateService(t, d, swarm.ServiceWithMode(mode))
+		id := swarm.CreateService(ctx, t, d, swarm.ServiceWithMode(mode))
 
-		poll.WaitOn(t, swarm.RunningTasksCount(client, id, 1), swarm.ServicePoll)
+		poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, id, 1), swarm.ServicePoll)
 	}
 }
 
@@ -44,6 +43,8 @@ func TestCreateJob(t *testing.T) {
 func TestReplicatedJob(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
+
+	ctx := setupTest(t)
 
 	// we need variables, because the replicas field takes a pointer
 	maxConcurrent := uint64(2)
@@ -56,15 +57,13 @@ func TestReplicatedJob(t *testing.T) {
 	// after 15 seconds. this means 7 completions ought not be too many.
 	total := uint64(7)
 
-	defer setupTest(t)
-
-	d := swarm.NewSwarm(t, testEnv)
+	d := swarm.NewSwarm(ctx, t, testEnv)
 	defer d.Stop(t)
 
-	client := d.NewClientT(t)
-	defer client.Close()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
-	id := swarm.CreateService(t, d,
+	id := swarm.CreateService(ctx, t, d,
 		swarm.ServiceWithMode(swarmtypes.ServiceMode{
 			ReplicatedJob: &swarmtypes.ReplicatedJob{
 				MaxConcurrent:    &maxConcurrent,
@@ -75,33 +74,30 @@ func TestReplicatedJob(t *testing.T) {
 		swarm.ServiceWithCommand([]string{"true"}),
 	)
 
-	service, _, err := client.ServiceInspectWithRaw(
-		context.Background(), id, types.ServiceInspectOptions{},
+	result, err := apiClient.ServiceInspect(
+		ctx, id, client.ServiceInspectOptions{},
 	)
 	assert.NilError(t, err)
 
-	poll.WaitOn(t, swarm.JobComplete(client, service), swarm.ServicePoll)
+	poll.WaitOn(t, swarm.JobComplete(ctx, apiClient, result.Service), swarm.ServicePoll)
 }
 
-// TestUpdateJob tests that a job can be updated, and that it runs with the
+// TestUpdateReplicatedJob tests that a job can be updated, and that it runs with the
 // correct parameters.
 func TestUpdateReplicatedJob(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	defer setupTest(t)()
+	ctx := setupTest(t)
 
-	d := swarm.NewSwarm(t, testEnv)
+	d := swarm.NewSwarm(ctx, t, testEnv)
 	defer d.Stop(t)
 
-	client := d.NewClientT(t)
-	defer client.Close()
-
-	// avoid writing "context.Background()" over and over again
-	ctx := context.Background()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
 	// Create the job service
-	id := swarm.CreateService(t, d,
+	id := swarm.CreateService(ctx, t, d,
 		swarm.ServiceWithMode(swarmtypes.ServiceMode{
 			ReplicatedJob: &swarmtypes.ReplicatedJob{
 				// use the default, empty values.
@@ -111,33 +107,35 @@ func TestUpdateReplicatedJob(t *testing.T) {
 		swarm.ServiceWithCommand([]string{"true"}),
 	)
 
-	service, _, err := client.ServiceInspectWithRaw(
-		ctx, id, types.ServiceInspectOptions{},
+	result, err := apiClient.ServiceInspect(
+		ctx, id, client.ServiceInspectOptions{},
 	)
 	assert.NilError(t, err)
 
 	// wait for the job to completed
-	poll.WaitOn(t, swarm.JobComplete(client, service), swarm.ServicePoll)
+	poll.WaitOn(t, swarm.JobComplete(ctx, apiClient, result.Service), swarm.ServicePoll)
 
 	// update the job.
-	spec := service.Spec
+	spec := result.Service.Spec
 	spec.TaskTemplate.ForceUpdate++
 
-	_, err = client.ServiceUpdate(
-		ctx, id, service.Version, spec, types.ServiceUpdateOptions{},
+	_, err = apiClient.ServiceUpdate(ctx, id, client.ServiceUpdateOptions{
+		Version: result.Service.Version,
+		Spec:    spec,
+	},
 	)
 	assert.NilError(t, err)
 
-	service2, _, err := client.ServiceInspectWithRaw(
-		ctx, id, types.ServiceInspectOptions{},
+	result2, err := apiClient.ServiceInspect(
+		ctx, id, client.ServiceInspectOptions{},
 	)
 	assert.NilError(t, err)
 
 	// assert that the job iteration has increased
 	assert.Assert(t,
-		service.JobStatus.JobIteration.Index < service2.JobStatus.JobIteration.Index,
+		result.Service.JobStatus.JobIteration.Index < result2.Service.JobStatus.JobIteration.Index,
 	)
 
 	// now wait for the service to complete a second time.
-	poll.WaitOn(t, swarm.JobComplete(client, service2), swarm.ServicePoll)
+	poll.WaitOn(t, swarm.JobComplete(ctx, apiClient, result2.Service), swarm.ServicePoll)
 }

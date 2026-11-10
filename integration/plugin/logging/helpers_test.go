@@ -6,12 +6,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
-	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/testutil/fixtures/plugin"
 	"github.com/moby/locker"
+	plugintypes "github.com/moby/moby/api/types/plugin"
+	"github.com/moby/moby/v2/internal/testutil/fixtures/plugin"
 	"github.com/pkg/errors"
+	"gotest.tools/v3/assert"
 )
 
 var pluginBuildLock = locker.New()
@@ -45,23 +45,20 @@ func withSockPath(name string) func(*plugin.Config) {
 	}
 }
 
-func createPlugin(t *testing.T, client plugin.CreateClient, alias, bin string, opts ...plugin.CreateOpt) {
+func createPlugin(ctx context.Context, t *testing.T, client plugin.CreateClient, alias, bin string, opts ...plugin.CreateOpt) {
+	t.Helper()
+
 	pluginBin := ensurePlugin(t, bin)
 
 	opts = append(opts, withSockPath("plugin.sock"))
 	opts = append(opts, plugin.WithBinary(pluginBin))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	err := plugin.Create(ctx, client, alias, opts...)
-	cancel()
-
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NilError(t, err)
 }
 
 func asLogDriver(cfg *plugin.Config) {
-	cfg.Interface.Types = []types.PluginInterfaceType{
+	cfg.Interface.Types = []plugintypes.CapabilityID{
 		{Capability: "logdriver", Prefix: "docker", Version: "1.0"},
 	}
 }

@@ -1,33 +1,35 @@
-package container // import "github.com/docker/docker/daemon/cluster/executor/container"
+package container
 
 import (
-	"errors"
+	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"math"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 
-	"github.com/sirupsen/logrus"
-
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/api/types"
-	enginecontainer "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	enginemount "github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	volumetypes "github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/daemon/cluster/convert"
-	executorpkg "github.com/docker/docker/daemon/cluster/executor"
-	clustertypes "github.com/docker/docker/daemon/cluster/provider"
-	netconst "github.com/docker/docker/libnetwork/datastore"
-	"github.com/docker/go-connections/nat"
-	"github.com/docker/go-units"
-	"github.com/docker/swarmkit/agent/exec"
-	"github.com/docker/swarmkit/api"
-	"github.com/docker/swarmkit/api/genericresource"
-	"github.com/docker/swarmkit/template"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
 	gogotypes "github.com/gogo/protobuf/types"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	enginemount "github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/volume"
+	"github.com/moby/moby/v2/daemon/cluster/convert"
+	executorpkg "github.com/moby/moby/v2/daemon/cluster/executor"
+	clustertypes "github.com/moby/moby/v2/daemon/cluster/provider"
+	"github.com/moby/moby/v2/daemon/internal/filters"
+	"github.com/moby/moby/v2/daemon/internal/netiputil"
+	"github.com/moby/moby/v2/daemon/libnetwork/scope"
+	"github.com/moby/moby/v2/internal/sliceutil"
+	"github.com/moby/swarmkit/v2/agent/exec"
+	"github.com/moby/swarmkit/v2/api"
+	"github.com/moby/swarmkit/v2/api/genericresource"
+	"github.com/moby/swarmkit/v2/template"
 )
 
 const (
@@ -38,8 +40,8 @@ const (
 // containerConfig converts task properties into docker container compatible
 // components.
 type containerConfig struct {
-	task                *api.Task
-	networksAttachments map[string]*api.NetworkAttachment
+	task     *api.Task
+	networks map[string]*api.Network
 }
 
 // newContainerConfig returns a validated container config. No methods should
@@ -54,21 +56,28 @@ func (c *containerConfig) setTask(t *api.Task, node *api.NodeDescription) error 
 		return exec.ErrRuntimeUnsupported
 	}
 
-	container := t.Spec.GetContainer()
-	if container != nil {
-		if container.Image == "" {
+	ctr := t.Spec.GetContainer()
+	if ctr != nil {
+		if ctr.Image == "" {
 			return ErrImageRequired
 		}
 
-		if err := validateMounts(container.Mounts); err != nil {
+		if err := validateMounts(ctr.Mounts); err != nil {
 			return err
 		}
 	}
 
 	// index the networks by name
-	c.networksAttachments = make(map[string]*api.NetworkAttachment, len(t.Networks))
+	c.networks = make(map[string]*api.Network, len(t.Networks))
 	for _, attachment := range t.Networks {
-		c.networksAttachments[attachment.Network.Spec.Annotations.Name] = attachment
+		// It looks like using a map is only for convenience, but not used
+		// for validation, nor for looking up the network by name. The name
+		// is part of the Network's properties (Network.Spec.Annotations.Name),
+		// and effectively only used for debugging; we should consider to
+		// change it to a slice.
+		//
+		// TODO(thaJeztah): should this check for empty and duplicate names?
+		c.networks[attachment.Network.Spec.Annotations.Name] = attachment.Network
 	}
 
 	c.task = t
@@ -117,7 +126,7 @@ func (c *containerConfig) name() string {
 		return c.task.Annotations.Name
 	}
 
-	slot := fmt.Sprint(c.task.Slot)
+	slot := strconv.FormatUint(c.task.Slot, 10)
 	if slot == "" || c.task.Slot == 0 {
 		slot = c.task.NodeID
 	}
@@ -135,8 +144,8 @@ func (c *containerConfig) image() string {
 	return reference.FamiliarString(reference.TagNameOnly(ref))
 }
 
-func (c *containerConfig) portBindings() nat.PortMap {
-	portBindings := nat.PortMap{}
+func (c *containerConfig) portBindings() network.PortMap {
+	portBindings := network.PortMap{}
 	if c.task.Endpoint == nil {
 		return portBindings
 	}
@@ -146,8 +155,16 @@ func (c *containerConfig) portBindings() nat.PortMap {
 			continue
 		}
 
-		port := nat.Port(fmt.Sprintf("%d/%s", portConfig.TargetPort, strings.ToLower(portConfig.Protocol.String())))
-		binding := []nat.PortBinding{
+		if portConfig.TargetPort > math.MaxUint16 {
+			continue
+		}
+
+		port, ok := network.PortFrom(uint16(portConfig.TargetPort), network.IPProtocol(portConfig.Protocol.String()))
+		if !ok {
+			continue
+		}
+
+		binding := []network.PortBinding{
 			{},
 		}
 
@@ -160,7 +177,7 @@ func (c *containerConfig) portBindings() nat.PortMap {
 	return portBindings
 }
 
-func (c *containerConfig) isolation() enginecontainer.Isolation {
+func (c *containerConfig) isolation() container.Isolation {
 	return convert.IsolationFromGRPC(c.spec().Isolation)
 }
 
@@ -172,8 +189,8 @@ func (c *containerConfig) init() *bool {
 	return &init
 }
 
-func (c *containerConfig) exposedPorts() map[nat.Port]struct{} {
-	exposedPorts := make(map[nat.Port]struct{})
+func (c *containerConfig) exposedPorts() map[network.Port]struct{} {
+	exposedPorts := make(map[network.Port]struct{})
 	if c.task.Endpoint == nil {
 		return exposedPorts
 	}
@@ -183,18 +200,26 @@ func (c *containerConfig) exposedPorts() map[nat.Port]struct{} {
 			continue
 		}
 
-		port := nat.Port(fmt.Sprintf("%d/%s", portConfig.TargetPort, strings.ToLower(portConfig.Protocol.String())))
+		if portConfig.TargetPort > math.MaxUint16 {
+			continue
+		}
+
+		port, ok := network.PortFrom(uint16(portConfig.TargetPort), network.IPProtocol(portConfig.Protocol.String()))
+		if !ok {
+			continue
+		}
+
 		exposedPorts[port] = struct{}{}
 	}
 
 	return exposedPorts
 }
 
-func (c *containerConfig) config() *enginecontainer.Config {
+func (c *containerConfig) config() *container.Config {
 	genericEnvs := genericresource.EnvFormat(c.task.AssignedGenericResources, "DOCKER_RESOURCE")
 	env := append(c.spec().Env, genericEnvs...)
 
-	config := &enginecontainer.Config{
+	config := &container.Config{
 		Labels:       c.labels(),
 		StopSignal:   c.spec().StopSignal,
 		Tty:          c.spec().TTY,
@@ -237,30 +262,56 @@ func (c *containerConfig) labels() map[string]string {
 	)
 
 	// base labels are those defined in the spec.
-	for k, v := range c.spec().Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, c.spec().Labels)
 
 	// we then apply the overrides from the task, which may be set via the
 	// orchestrator.
-	for k, v := range c.task.Annotations.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, c.task.Annotations.Labels)
 
 	// finally, we apply the system labels, which override all labels.
 	for k, v := range system {
-		labels[strings.Join([]string{systemLabelPrefix, k}, ".")] = v
+		labels[systemLabelPrefix+"."+k] = v
 	}
 
 	return labels
 }
 
-func (c *containerConfig) mounts() []enginemount.Mount {
+func (c *containerConfig) mounts(deps exec.VolumeGetter) []enginemount.Mount {
 	var r []enginemount.Mount
 	for _, mount := range c.spec().Mounts {
-		r = append(r, convertMount(mount))
+		if mount.Type == api.MountTypeCluster {
+			r = append(r, c.convertCSIMount(mount, deps))
+		} else {
+			r = append(r, convertMount(mount))
+		}
 	}
 	return r
+}
+
+// convertCSIMount matches the CSI mount with the path of the CSI volume.
+//
+// technically quadratic with respect to the number of CSI mounts, but that
+// number shouldn't ever be large enough for quadratic to matter.
+//
+// TODO(dperny): figure out a scheme for errors? or maybe add code to
+// checkMounts?
+func (c *containerConfig) convertCSIMount(m api.Mount, deps exec.VolumeGetter) enginemount.Mount {
+	var mount enginemount.Mount
+
+	// these are actually bind mounts
+	mount.Type = enginemount.TypeBind
+
+	for _, attach := range c.task.Volumes {
+		if attach.Source == m.Source && attach.Target == m.Target {
+			// we should not get an error here, because we should have checked
+			// already that the volume is ready
+			path, _ := deps.Get(attach.ID)
+			mount.Source = path
+			mount.Target = m.Target
+		}
+	}
+
+	return mount
 }
 
 func convertMount(m api.Mount) enginemount.Mount {
@@ -279,11 +330,16 @@ func convertMount(m api.Mount) enginemount.Mount {
 		mount.Type = enginemount.TypeTmpfs
 	case api.MountTypeNamedPipe:
 		mount.Type = enginemount.TypeNamedPipe
+	case api.MountTypeCluster:
+		mount.Type = enginemount.TypeCluster
 	}
 
 	if m.BindOptions != nil {
 		mount.BindOptions = &enginemount.BindOptions{
-			NonRecursive: m.BindOptions.NonRecursive,
+			NonRecursive:           m.BindOptions.NonRecursive,
+			CreateMountpoint:       m.BindOptions.CreateMountpoint,
+			ReadOnlyNonRecursive:   m.BindOptions.ReadOnlyNonRecursive,
+			ReadOnlyForceRecursive: m.BindOptions.ReadOnlyForceRecursive,
 		}
 		switch m.BindOptions.Propagation {
 		case api.MountPropagationRPrivate:
@@ -303,13 +359,12 @@ func convertMount(m api.Mount) enginemount.Mount {
 
 	if m.VolumeOptions != nil {
 		mount.VolumeOptions = &enginemount.VolumeOptions{
-			NoCopy: m.VolumeOptions.NoCopy,
+			NoCopy:  m.VolumeOptions.NoCopy,
+			Subpath: m.VolumeOptions.Subpath,
 		}
 		if m.VolumeOptions.Labels != nil {
 			mount.VolumeOptions.Labels = make(map[string]string, len(m.VolumeOptions.Labels))
-			for k, v := range m.VolumeOptions.Labels {
-				mount.VolumeOptions.Labels[k] = v
-			}
+			maps.Copy(mount.VolumeOptions.Labels, m.VolumeOptions.Labels)
 		}
 		if m.VolumeOptions.DriverConfig != nil {
 			mount.VolumeOptions.DriverConfig = &enginemount.Driver{
@@ -317,24 +372,27 @@ func convertMount(m api.Mount) enginemount.Mount {
 			}
 			if m.VolumeOptions.DriverConfig.Options != nil {
 				mount.VolumeOptions.DriverConfig.Options = make(map[string]string, len(m.VolumeOptions.DriverConfig.Options))
-				for k, v := range m.VolumeOptions.DriverConfig.Options {
-					mount.VolumeOptions.DriverConfig.Options[k] = v
-				}
+				maps.Copy(mount.VolumeOptions.DriverConfig.Options, m.VolumeOptions.DriverConfig.Options)
 			}
 		}
 	}
 
 	if m.TmpfsOptions != nil {
+		var options [][]string
+		// see daemon/cluster/convert/container.go, tmpfsOptionsFromGRPC for
+		// details on error handling.
+		_ = json.Unmarshal([]byte(m.TmpfsOptions.Options), &options)
 		mount.TmpfsOptions = &enginemount.TmpfsOptions{
 			SizeBytes: m.TmpfsOptions.SizeBytes,
 			Mode:      m.TmpfsOptions.Mode,
+			Options:   options,
 		}
 	}
 
 	return mount
 }
 
-func (c *containerConfig) healthcheck() *enginecontainer.HealthConfig {
+func (c *containerConfig) healthcheck() *container.HealthConfig {
 	hcSpec := c.spec().Healthcheck
 	if hcSpec == nil {
 		return nil
@@ -342,31 +400,34 @@ func (c *containerConfig) healthcheck() *enginecontainer.HealthConfig {
 	interval, _ := gogotypes.DurationFromProto(hcSpec.Interval)
 	timeout, _ := gogotypes.DurationFromProto(hcSpec.Timeout)
 	startPeriod, _ := gogotypes.DurationFromProto(hcSpec.StartPeriod)
-	return &enginecontainer.HealthConfig{
-		Test:        hcSpec.Test,
-		Interval:    interval,
-		Timeout:     timeout,
-		Retries:     int(hcSpec.Retries),
-		StartPeriod: startPeriod,
+	startInterval, _ := gogotypes.DurationFromProto(hcSpec.StartInterval)
+	return &container.HealthConfig{
+		Test:          hcSpec.Test,
+		Interval:      interval,
+		Timeout:       timeout,
+		Retries:       int(hcSpec.Retries),
+		StartPeriod:   startPeriod,
+		StartInterval: startInterval,
 	}
 }
 
-func (c *containerConfig) hostConfig() *enginecontainer.HostConfig {
-	hc := &enginecontainer.HostConfig{
+func (c *containerConfig) hostConfig(deps exec.VolumeGetter) *container.HostConfig {
+	hc := &container.HostConfig{
 		Resources:      c.resources(),
 		GroupAdd:       c.spec().Groups,
 		PortBindings:   c.portBindings(),
-		Mounts:         c.mounts(),
+		Mounts:         c.mounts(deps),
 		ReadonlyRootfs: c.spec().ReadOnly,
 		Isolation:      c.isolation(),
 		Init:           c.init(),
 		Sysctls:        c.spec().Sysctls,
 		CapAdd:         c.spec().CapabilityAdd,
 		CapDrop:        c.spec().CapabilityDrop,
+		OomScoreAdj:    int(c.spec().OomScoreAdj),
 	}
 
 	if c.spec().DNSConfig != nil {
-		hc.DNS = c.spec().DNSConfig.Nameservers
+		hc.DNS = sliceutil.Map(c.spec().DNSConfig.Nameservers, func(ns string) netip.Addr { a, _ := netip.ParseAddr(ns); return a })
 		hc.DNSSearch = c.spec().DNSConfig.Search
 		hc.DNSOptions = c.spec().DNSConfig.Options
 	}
@@ -388,7 +449,7 @@ func (c *containerConfig) hostConfig() *enginecontainer.HostConfig {
 	}
 
 	if c.task.LogDriver != nil {
-		hc.LogConfig = enginecontainer.LogConfig{
+		hc.LogConfig = container.LogConfig{
 			Type:   c.task.LogDriver.Name,
 			Config: c.task.LogDriver.Options,
 		}
@@ -398,7 +459,7 @@ func (c *containerConfig) hostConfig() *enginecontainer.HostConfig {
 		labels := c.task.Networks[0].Network.Spec.Annotations.Labels
 		name := c.task.Networks[0].Network.Spec.Annotations.Name
 		if v, ok := labels["com.docker.swarm.predefined"]; ok && v == "true" {
-			hc.NetworkMode = enginecontainer.NetworkMode(name)
+			hc.NetworkMode = container.NetworkMode(name)
 		}
 	}
 
@@ -406,7 +467,7 @@ func (c *containerConfig) hostConfig() *enginecontainer.HostConfig {
 }
 
 // This handles the case of volumes that are defined inside a service Mount
-func (c *containerConfig) volumeCreateRequest(mount *api.Mount) *volumetypes.VolumeCreateBody {
+func (c *containerConfig) volumeCreateRequest(mount *api.Mount) *volume.CreateRequest {
 	var (
 		driverName string
 		driverOpts map[string]string
@@ -420,7 +481,7 @@ func (c *containerConfig) volumeCreateRequest(mount *api.Mount) *volumetypes.Vol
 	}
 
 	if mount.VolumeOptions != nil {
-		return &volumetypes.VolumeCreateBody{
+		return &volume.CreateRequest{
 			Name:       mount.Source,
 			Driver:     driverName,
 			DriverOpts: driverOpts,
@@ -430,8 +491,8 @@ func (c *containerConfig) volumeCreateRequest(mount *api.Mount) *volumetypes.Vol
 	return nil
 }
 
-func (c *containerConfig) resources() enginecontainer.Resources {
-	resources := enginecontainer.Resources{}
+func (c *containerConfig) resources() container.Resources {
+	resources := container.Resources{}
 
 	// set pids limit
 	pidsLimit := c.spec().PidsLimit
@@ -439,9 +500,9 @@ func (c *containerConfig) resources() enginecontainer.Resources {
 		resources.PidsLimit = &pidsLimit
 	}
 
-	resources.Ulimits = make([]*units.Ulimit, len(c.spec().Ulimits))
+	resources.Ulimits = make([]*container.Ulimit, len(c.spec().Ulimits))
 	for i, ulimit := range c.spec().Ulimits {
-		resources.Ulimits[i] = &units.Ulimit{
+		resources.Ulimits[i] = &container.Ulimit{
 			Name: ulimit.Name,
 			Soft: ulimit.Soft,
 			Hard: ulimit.Hard,
@@ -459,6 +520,20 @@ func (c *containerConfig) resources() enginecontainer.Resources {
 
 	if r.Limits.MemoryBytes > 0 {
 		resources.Memory = r.Limits.MemoryBytes
+
+		if r.SwapBytes != nil {
+			if swapBytes := r.SwapBytes.Value; swapBytes == -1 {
+				// means unlimited
+				resources.MemorySwap = -1
+			} else if swapBytes >= 0 {
+				// resources.MemorySwap is actually the sum of the memory + the swap
+				resources.MemorySwap = resources.Memory + swapBytes
+			}
+		}
+	}
+
+	if r.MemorySwappiness != nil {
+		resources.MemorySwappiness = &r.MemorySwappiness.Value
 	}
 
 	if r.Limits.NanoCPUs > 0 {
@@ -468,7 +543,6 @@ func (c *containerConfig) resources() enginecontainer.Resources {
 	return resources
 }
 
-// Docker daemon supports just 1 network during container create.
 func (c *containerConfig) createNetworkingConfig(b executorpkg.Backend) *network.NetworkingConfig {
 	var networks []*api.NetworkAttachment
 	if c.task.Spec.GetContainer() != nil || c.task.Spec.GetAttachment() != nil {
@@ -476,46 +550,26 @@ func (c *containerConfig) createNetworkingConfig(b executorpkg.Backend) *network
 	}
 
 	epConfig := make(map[string]*network.EndpointSettings)
-	if len(networks) > 0 {
-		epConfig[networks[0].Network.Spec.Annotations.Name] = getEndpointConfig(networks[0], b)
-	}
-
-	return &network.NetworkingConfig{EndpointsConfig: epConfig}
-}
-
-// TODO: Merge this function with createNetworkingConfig after daemon supports multiple networks in container create
-func (c *containerConfig) connectNetworkingConfig(b executorpkg.Backend) *network.NetworkingConfig {
-	var networks []*api.NetworkAttachment
-	if c.task.Spec.GetContainer() != nil {
-		networks = c.task.Networks
-	}
-	// First network is used during container create. Other networks are used in "docker network connect"
-	if len(networks) < 2 {
-		return nil
-	}
-
-	epConfig := make(map[string]*network.EndpointSettings)
-	for _, na := range networks[1:] {
+	for _, na := range networks {
 		epConfig[na.Network.Spec.Annotations.Name] = getEndpointConfig(na, b)
 	}
+
 	return &network.NetworkingConfig{EndpointsConfig: epConfig}
 }
 
 func getEndpointConfig(na *api.NetworkAttachment, b executorpkg.Backend) *network.EndpointSettings {
-	var ipv4, ipv6 string
+	var ipv4, ipv6 netip.Addr
 	for _, addr := range na.Addresses {
-		ip, _, err := net.ParseCIDR(addr)
+		pfx, err := netiputil.ParseCIDR(addr)
 		if err != nil {
 			continue
 		}
+		ip := pfx.Addr()
 
-		if ip.To4() != nil {
-			ipv4 = ip.String()
-			continue
-		}
-
-		if ip.To16() != nil {
-			ipv6 = ip.String()
+		if ip.Is4() {
+			ipv4 = ip
+		} else {
+			ipv6 = ip
 		}
 	}
 
@@ -560,7 +614,7 @@ func (c *containerConfig) serviceConfig() *clustertypes.ServiceConfig {
 		return nil
 	}
 
-	logrus.Debugf("Creating service config in agent for t = %+v", c.task)
+	log.G(context.TODO()).Debugf("Creating service config in agent for t = %+v", c.task)
 	svcCfg := &clustertypes.ServiceConfig{
 		Name:             c.task.ServiceAnnotations.Name,
 		Aliases:          make(map[string][]string),
@@ -596,58 +650,59 @@ func (c *containerConfig) serviceConfig() *clustertypes.ServiceConfig {
 	return svcCfg
 }
 
-func (c *containerConfig) networkCreateRequest(name string) (clustertypes.NetworkCreateRequest, error) {
-	na, ok := c.networksAttachments[name]
-	if !ok {
-		return clustertypes.NetworkCreateRequest{}, errors.New("container: unknown network referenced")
+func networkCreateRequest(name string, nw *api.Network) clustertypes.NetworkCreateRequest {
+	ipv4Enabled := true
+	ipv6Enabled := nw.Spec.Ipv6Enabled
+	req := network.CreateRequest{
+		Name:       name, // TODO(thaJeztah): this is the same as [nw.Spec.Annotations.Name]; consider using that instead
+		Scope:      scope.Swarm,
+		EnableIPv4: &ipv4Enabled,
+		EnableIPv6: &ipv6Enabled,
+		Internal:   nw.Spec.Internal,
+		Attachable: nw.Spec.Attachable,
+		Ingress:    convert.IsIngressNetwork(nw),
+		Labels:     nw.Spec.Annotations.Labels,
 	}
 
-	options := types.NetworkCreate{
-		// ID:     na.Network.ID,
-		Labels:         na.Network.Spec.Annotations.Labels,
-		Internal:       na.Network.Spec.Internal,
-		Attachable:     na.Network.Spec.Attachable,
-		Ingress:        convert.IsIngressNetwork(na.Network),
-		EnableIPv6:     na.Network.Spec.Ipv6Enabled,
-		CheckDuplicate: true,
-		Scope:          netconst.SwarmScope,
-	}
-
-	if na.Network.Spec.GetNetwork() != "" {
-		options.ConfigFrom = &network.ConfigReference{
-			Network: na.Network.Spec.GetNetwork(),
+	if nw.Spec.GetNetwork() != "" {
+		req.ConfigFrom = &network.ConfigReference{
+			Network: nw.Spec.GetNetwork(),
 		}
 	}
 
-	if na.Network.DriverState != nil {
-		options.Driver = na.Network.DriverState.Name
-		options.Options = na.Network.DriverState.Options
+	if nw.DriverState != nil {
+		req.Driver = nw.DriverState.Name
+		req.Options = nw.DriverState.Options
 	}
-	if na.Network.IPAM != nil {
-		options.IPAM = &network.IPAM{
-			Driver:  na.Network.IPAM.Driver.Name,
-			Options: na.Network.IPAM.Driver.Options,
+
+	if nw.IPAM != nil {
+		req.IPAM = &network.IPAM{
+			Driver:  nw.IPAM.Driver.Name,
+			Options: nw.IPAM.Driver.Options,
 		}
-		for _, ic := range na.Network.IPAM.Configs {
-			c := network.IPAMConfig{
-				Subnet:  ic.Subnet,
-				IPRange: ic.Range,
-				Gateway: ic.Gateway,
+		for _, ic := range nw.IPAM.Configs {
+			// The daemon validates the IPAM configs before creating
+			// the network in Swarm's Raft store, so these values
+			// should always either be empty strings or well-formed
+			// values.
+			cfg, err := ipamConfig(ic)
+			if err != nil {
+				log.G(context.TODO()).WithFields(log.Fields{
+					"network": name,
+					"error":   err,
+				}).Warn("invalid Swarm network IPAM config")
 			}
-			options.IPAM.Config = append(options.IPAM.Config, c)
+			req.IPAM.Config = append(req.IPAM.Config, cfg)
 		}
 	}
 
 	return clustertypes.NetworkCreateRequest{
-		ID: na.Network.ID,
-		NetworkCreateRequest: types.NetworkCreateRequest{
-			Name:          name,
-			NetworkCreate: options,
-		},
-	}, nil
+		ID:            nw.ID,
+		CreateRequest: req,
+	}
 }
 
-func (c *containerConfig) applyPrivileges(hc *enginecontainer.HostConfig) {
+func (c *containerConfig) applyPrivileges(hc *container.HostConfig) {
 	privileges := c.spec().Privileges
 	if privileges == nil {
 		return
@@ -683,12 +738,40 @@ func (c *containerConfig) applyPrivileges(hc *enginecontainer.HostConfig) {
 			hc.SecurityOpt = append(hc.SecurityOpt, "label=type:"+selinux.Type)
 		}
 	}
+
+	// variable to make the lines shorter and easier to read
+	if seccomp := privileges.Seccomp; seccomp != nil {
+		switch seccomp.Mode {
+		// case api.Privileges_SeccompOpts_DEFAULT:
+		//   if the setting is default, nothing needs to be set here. we leave
+		//   the option empty.
+		case api.Privileges_SeccompOpts_UNCONFINED:
+			hc.SecurityOpt = append(hc.SecurityOpt, "seccomp=unconfined")
+		case api.Privileges_SeccompOpts_CUSTOM:
+			// Profile is bytes, but those bytes are actually a string. This is
+			// basically verbatim what happens in the cli after a file is read.
+			hc.SecurityOpt = append(hc.SecurityOpt, fmt.Sprintf("seccomp=%s", seccomp.Profile))
+		default:
+			// TODO(thaJeztah): make switch exhaustive; add api.Privileges_SeccompOpts_DEFAULT
+		}
+	}
+
+	// if the setting is DEFAULT, then nothing to be done. If it's DISABLED,
+	// we set that. Custom not supported yet. When custom *is* supported, make
+	// it look like the above.
+	if apparmor := privileges.Apparmor; apparmor != nil && apparmor.Mode == api.Privileges_AppArmorOpts_DISABLED {
+		hc.SecurityOpt = append(hc.SecurityOpt, "apparmor=unconfined")
+	}
+
+	if privileges.NoNewPrivileges {
+		hc.SecurityOpt = append(hc.SecurityOpt, "no-new-privileges=true")
+	}
 }
 
-func (c containerConfig) eventFilter() filters.Args {
-	filter := filters.NewArgs()
-	filter.Add("type", events.ContainerEventType)
-	filter.Add("name", c.name())
-	filter.Add("label", fmt.Sprintf("%v.task.id=%v", systemLabelPrefix, c.task.ID))
-	return filter
+func (c *containerConfig) eventFilter() filters.Args {
+	return filters.NewArgs(
+		filters.Arg("type", string(events.ContainerEventType)),
+		filters.Arg("name", c.name()),
+		filters.Arg("label", fmt.Sprintf("%v.task.id=%v", systemLabelPrefix, c.task.ID)),
+	)
 }

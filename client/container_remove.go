@@ -1,14 +1,29 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"net/url"
-
-	"github.com/docker/docker/api/types"
 )
 
+// ContainerRemoveOptions holds parameters to remove containers.
+type ContainerRemoveOptions struct {
+	RemoveVolumes bool
+	RemoveLinks   bool
+	Force         bool
+}
+
+// ContainerRemoveResult holds the result of [Client.ContainerRemove],
+type ContainerRemoveResult struct {
+	// Add future fields here.
+}
+
 // ContainerRemove kills and removes a container from the docker host.
-func (cli *Client) ContainerRemove(ctx context.Context, containerID string, options types.ContainerRemoveOptions) error {
+func (cli *Client) ContainerRemove(ctx context.Context, containerID string, options ContainerRemoveOptions) (ContainerRemoveResult, error) {
+	containerID, err := trimID("container", containerID)
+	if err != nil {
+		return ContainerRemoveResult{}, err
+	}
+
 	query := url.Values{}
 	if options.RemoveVolumes {
 		query.Set("v", "1")
@@ -23,5 +38,8 @@ func (cli *Client) ContainerRemove(ctx context.Context, containerID string, opti
 
 	resp, err := cli.delete(ctx, "/containers/"+containerID, query, nil)
 	defer ensureReaderClosed(resp)
-	return wrapResponseError(err, resp, "container", containerID)
+	if err != nil {
+		return ContainerRemoveResult{}, err
+	}
+	return ContainerRemoveResult{}, nil
 }

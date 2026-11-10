@@ -1,24 +1,24 @@
-package container // import "github.com/docker/docker/integration/container"
+package container
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	containerapi "github.com/docker/docker/api/types/container"
-	realcontainer "github.com/docker/docker/container"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/testutil/daemon"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	realcontainer "github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/integration/internal/container"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/assert/opt"
 	"gotest.tools/v3/skip"
 )
 
@@ -38,41 +38,41 @@ func TestContainerStartOnDaemonRestart(t *testing.T) {
 	skip.If(t, testEnv.IsRootless)
 	t.Parallel()
 
+	ctx := testutil.StartSpan(baseContext, t)
+
 	d := daemon.New(t)
-	d.StartWithBusybox(t, "--iptables=false")
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
 
 	c := d.NewClientT(t)
 
-	ctx := context.Background()
-
 	cID := container.Create(ctx, t, c)
-	defer c.ContainerRemove(ctx, cID, types.ContainerRemoveOptions{Force: true})
+	defer c.ContainerRemove(ctx, cID, client.ContainerRemoveOptions{Force: true})
 
-	err := c.ContainerStart(ctx, cID, types.ContainerStartOptions{})
+	_, err := c.ContainerStart(ctx, cID, client.ContainerStartOptions{})
 	assert.Check(t, err, "error starting test container")
 
-	inspect, err := c.ContainerInspect(ctx, cID)
+	inspect, err := c.ContainerInspect(ctx, cID, client.ContainerInspectOptions{})
 	assert.Check(t, err, "error getting inspect data")
 
-	ppid := getContainerdShimPid(t, inspect)
+	ppid := getContainerdShimPid(t, inspect.Container)
 
 	err = d.Kill()
 	assert.Check(t, err, "failed to kill test daemon")
 
-	err = unix.Kill(inspect.State.Pid, unix.SIGKILL)
+	err = unix.Kill(inspect.Container.State.Pid, unix.SIGKILL)
 	assert.Check(t, err, "failed to kill container process")
 
 	err = unix.Kill(ppid, unix.SIGKILL)
 	assert.Check(t, err, "failed to kill containerd-shim")
 
-	d.Start(t, "--iptables=false")
+	d.Start(t, "--iptables=false", "--ip6tables=false")
 
-	err = c.ContainerStart(ctx, cID, types.ContainerStartOptions{})
+	_, err = c.ContainerStart(ctx, cID, client.ContainerStartOptions{})
 	assert.Check(t, err, "failed to start test container")
 }
 
-func getContainerdShimPid(t *testing.T, c types.ContainerJSON) int {
+func getContainerdShimPid(t *testing.T, c containertypes.InspectResponse) int {
 	statB, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", c.State.Pid))
 	assert.Check(t, err, "error looking up containerd-shim pid")
 
@@ -92,39 +92,40 @@ func TestDaemonRestartIpcMode(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	t.Parallel()
 
+	ctx := testutil.StartSpan(baseContext, t)
+
 	d := daemon.New(t)
-	d.StartWithBusybox(t, "--iptables=false", "--default-ipc-mode=private")
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false", "--default-ipc-mode=private")
 	defer d.Stop(t)
 
 	c := d.NewClientT(t)
-	ctx := context.Background()
 
 	// check the container is created with private ipc mode as per daemon default
 	cID := container.Run(ctx, t, c,
 		container.WithCmd("top"),
-		container.WithRestartPolicy("always"),
+		container.WithRestartPolicy(containertypes.RestartPolicyAlways),
 	)
-	defer c.ContainerRemove(ctx, cID, types.ContainerRemoveOptions{Force: true})
+	defer c.ContainerRemove(ctx, cID, client.ContainerRemoveOptions{Force: true})
 
-	inspect, err := c.ContainerInspect(ctx, cID)
+	inspect, err := c.ContainerInspect(ctx, cID, client.ContainerInspectOptions{})
 	assert.NilError(t, err)
-	assert.Check(t, is.Equal(string(inspect.HostConfig.IpcMode), "private"))
+	assert.Check(t, is.Equal(string(inspect.Container.HostConfig.IpcMode), "private"))
 
 	// restart the daemon with shareable default ipc mode
-	d.Restart(t, "--iptables=false", "--default-ipc-mode=shareable")
+	d.Restart(t, "--iptables=false", "--ip6tables=false", "--default-ipc-mode=shareable")
 
 	// check the container is still having private ipc mode
-	inspect, err = c.ContainerInspect(ctx, cID)
+	inspect, err = c.ContainerInspect(ctx, cID, client.ContainerInspectOptions{})
 	assert.NilError(t, err)
-	assert.Check(t, is.Equal(string(inspect.HostConfig.IpcMode), "private"))
+	assert.Check(t, is.Equal(string(inspect.Container.HostConfig.IpcMode), "private"))
 
 	// check a new container is created with shareable ipc mode as per new daemon default
 	cID = container.Run(ctx, t, c)
-	defer c.ContainerRemove(ctx, cID, types.ContainerRemoveOptions{Force: true})
+	defer c.ContainerRemove(ctx, cID, client.ContainerRemoveOptions{Force: true})
 
-	inspect, err = c.ContainerInspect(ctx, cID)
+	inspect, err = c.ContainerInspect(ctx, cID, client.ContainerInspectOptions{})
 	assert.NilError(t, err)
-	assert.Check(t, is.Equal(string(inspect.HostConfig.IpcMode), "shareable"))
+	assert.Check(t, is.Equal(string(inspect.Container.HostConfig.IpcMode), "shareable"))
 }
 
 // TestDaemonHostGatewayIP verifies that when a magic string "host-gateway" is passed
@@ -135,15 +136,15 @@ func TestDaemonRestartIpcMode(t *testing.T) {
 func TestDaemonHostGatewayIP(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	skip.If(t, testEnv.IsRootless, "rootless mode has different view of network")
 	t.Parallel()
+
+	ctx := testutil.StartSpan(baseContext, t)
 
 	// Verify the IP in /etc/hosts is same as host-gateway-ip
 	d := daemon.New(t)
 	// Verify the IP in /etc/hosts is same as the default bridge's IP
-	d.StartWithBusybox(t)
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false")
 	c := d.NewClientT(t)
-	ctx := context.Background()
 	cID := container.Run(ctx, t, c,
 		container.WithExtraHost("host.docker.internal:host-gateway"),
 	)
@@ -151,14 +152,14 @@ func TestDaemonHostGatewayIP(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Assert(t, is.Len(res.Stderr(), 0))
 	assert.Equal(t, 0, res.ExitCode)
-	inspect, err := c.NetworkInspect(ctx, "bridge", types.NetworkInspectOptions{})
+	resp, err := c.NetworkInspect(ctx, "bridge", client.NetworkInspectOptions{})
 	assert.NilError(t, err)
-	assert.Check(t, is.Contains(res.Stdout(), inspect.IPAM.Config[0].Gateway))
-	c.ContainerRemove(ctx, cID, types.ContainerRemoveOptions{Force: true})
+	assert.Check(t, is.Contains(res.Stdout(), resp.Network.IPAM.Config[0].Gateway.String()))
+	c.ContainerRemove(ctx, cID, client.ContainerRemoveOptions{Force: true})
 	d.Stop(t)
 
 	// Verify the IP in /etc/hosts is same as host-gateway-ip
-	d.StartWithBusybox(t, "--host-gateway-ip=6.7.8.9")
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false", "--host-gateway-ip=6.7.8.9")
 	cID = container.Run(ctx, t, c,
 		container.WithExtraHost("host.docker.internal:host-gateway"),
 	)
@@ -167,9 +168,8 @@ func TestDaemonHostGatewayIP(t *testing.T) {
 	assert.Assert(t, is.Len(res.Stderr(), 0))
 	assert.Equal(t, 0, res.ExitCode)
 	assert.Check(t, is.Contains(res.Stdout(), "6.7.8.9"))
-	c.ContainerRemove(ctx, cID, types.ContainerRemoveOptions{Force: true})
+	c.ContainerRemove(ctx, cID, client.ContainerRemoveOptions{Force: true})
 	d.Stop(t)
-
 }
 
 // TestRestartDaemonWithRestartingContainer simulates a case where a container is in "restarting" state when
@@ -180,7 +180,7 @@ func TestDaemonHostGatewayIP(t *testing.T) {
 // In this test we'll change the container state to "restarting".
 // This means that the container will not be 'alive' when we attempt to restore in on daemon startup.
 //
-// We could do the same with `docker run -d --resetart=always busybox:latest exit 1`, and then
+// We could do the same with `docker run -d --restart=always busybox:latest exit 1`, and then
 // `kill -9` dockerd while the container is in "restarting" state. This is difficult to reproduce reliably
 // in an automated test, so we manipulate on disk state instead.
 func TestRestartDaemonWithRestartingContainer(t *testing.T) {
@@ -189,46 +189,110 @@ func TestRestartDaemonWithRestartingContainer(t *testing.T) {
 
 	t.Parallel()
 
+	ctx := testutil.StartSpan(baseContext, t)
+
 	d := daemon.New(t)
 	defer d.Cleanup(t)
 
-	d.StartWithBusybox(t, "--iptables=false")
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
 
-	ctx := context.Background()
-	client := d.NewClientT(t)
+	apiClient := d.NewClientT(t)
 
 	// Just create the container, no need to start it to be started.
 	// We really want to make sure there is no process running when docker starts back up.
 	// We will manipulate the on disk state later
-	id := container.Create(ctx, t, client, container.WithRestartPolicy("always"), container.WithCmd("/bin/sh", "-c", "exit 1"))
+	id := container.Create(ctx, t, apiClient, container.WithRestartPolicy(containertypes.RestartPolicyAlways), container.WithCmd("/bin/sh", "-c", "exit 1"))
 
 	d.Stop(t)
 
-	configPath := filepath.Join(d.Root, "containers", id, "config.v2.json")
-	configBytes, err := os.ReadFile(configPath)
-	assert.NilError(t, err)
+	d.TamperWithContainerConfig(t, id, func(c *realcontainer.Container) {
+		c.State.SetRestarting(&realcontainer.ExitStatus{ExitCode: 1})
+		c.HasBeenStartedBefore = true
+	})
 
-	var c realcontainer.Container
-
-	assert.NilError(t, json.Unmarshal(configBytes, &c))
-
-	c.State = realcontainer.NewState()
-	c.SetRestarting(&realcontainer.ExitStatus{ExitCode: 1})
-	c.HasBeenStartedBefore = true
-
-	configBytes, err = json.Marshal(&c)
-	assert.NilError(t, err)
-	assert.NilError(t, os.WriteFile(configPath, configBytes, 0600))
-
-	d.Start(t)
+	d.Start(t, "--iptables=false", "--ip6tables=false")
 
 	ctxTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	chOk, chErr := client.ContainerWait(ctxTimeout, id, containerapi.WaitConditionNextExit)
+	wait := apiClient.ContainerWait(ctxTimeout, id, client.ContainerWaitOptions{Condition: containertypes.WaitConditionNextExit})
 	select {
-	case <-chOk:
-	case err := <-chErr:
+	case <-wait.Result:
+	case err := <-wait.Error:
 		assert.NilError(t, err)
 	}
+}
+
+// TestHardRestartWhenContainerIsRunning simulates a case where dockerd is
+// killed while a container is running, and the container's task no longer
+// exists when dockerd starts back up. This can happen if the system is
+// hard-rebooted, for example.
+//
+// Regression test for moby/moby#45788
+func TestHardRestartWhenContainerIsRunning(t *testing.T) {
+	skip.If(t, testEnv.IsRemoteDaemon, "cannot start daemon on remote test run")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
+
+	t.Parallel()
+
+	ctx := testutil.StartSpan(baseContext, t)
+
+	d := daemon.New(t)
+	defer d.Cleanup(t)
+
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false")
+	defer d.Stop(t)
+
+	apiClient := d.NewClientT(t)
+
+	// Just create the containers, no need to start them.
+	// We really want to make sure there is no process running when docker starts back up.
+	// We will manipulate the on disk state later.
+	noPolicy := container.Create(ctx, t, apiClient, container.WithCmd("/bin/sh", "-c", "exit 1"))
+	onFailure := container.Create(ctx, t, apiClient, container.WithRestartPolicy("on-failure"), container.WithCmd("/bin/sh", "-c", "sleep 60"))
+
+	d.Stop(t)
+
+	for _, id := range []string{noPolicy, onFailure} {
+		d.TamperWithContainerConfig(t, id, func(c *realcontainer.Container) {
+			c.State.SetRunning(nil, nil, time.Now())
+			c.HasBeenStartedBefore = true
+		})
+	}
+
+	d.Start(t, "--iptables=false", "--ip6tables=false")
+
+	t.Run("RestartPolicy=none", func(t *testing.T) {
+		ctx := testutil.StartSpan(ctx, t)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		inspect, err := apiClient.ContainerInspect(ctx, noPolicy, client.ContainerInspectOptions{})
+		assert.NilError(t, err)
+		assert.Check(t, is.Equal(inspect.Container.State.Status, containertypes.StateExited))
+		assert.Check(t, is.Equal(inspect.Container.State.ExitCode, 255))
+		finishedAt, err := time.Parse(time.RFC3339Nano, inspect.Container.State.FinishedAt)
+		if assert.Check(t, err) {
+			assert.Check(t, is.DeepEqual(finishedAt, time.Now(), opt.TimeWithThreshold(time.Minute)))
+		}
+	})
+
+	t.Run("RestartPolicy=on-failure", func(t *testing.T) {
+		ctx := testutil.StartSpan(ctx, t)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		inspect, err := apiClient.ContainerInspect(ctx, onFailure, client.ContainerInspectOptions{})
+		assert.NilError(t, err)
+		assert.Check(t, is.Equal(inspect.Container.State.Status, containertypes.StateRunning))
+		assert.Check(t, is.Equal(inspect.Container.State.ExitCode, 0))
+		finishedAt, err := time.Parse(time.RFC3339Nano, inspect.Container.State.FinishedAt)
+		if assert.Check(t, err) {
+			assert.Check(t, is.DeepEqual(finishedAt, time.Now(), opt.TimeWithThreshold(time.Minute)))
+		}
+
+		stopTimeout := 0
+		_, err = apiClient.ContainerStop(ctx, onFailure, client.ContainerStopOptions{
+			Timeout: &stopTimeout,
+		})
+		assert.NilError(t, err)
+	})
 }

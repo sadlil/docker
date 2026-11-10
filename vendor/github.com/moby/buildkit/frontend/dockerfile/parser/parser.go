@@ -1,4 +1,5 @@
-// Package parser implements a parser and parse tree dumper for Dockerfiles.
+// The parser package implements a parser that transforms a raw byte-stream
+// into a low-level Abstract Syntax Tree.
 package parser
 
 import (
@@ -27,7 +28,6 @@ import (
 // This data structure is frankly pretty lousy for handling complex languages,
 // but lucky for us the Dockerfile isn't very complicated. This structure
 // works a little more effectively than a "proper" parse tree for our needs.
-//
 type Node struct {
 	Value       string          // actual content
 	Next        *Node           // the next item in the current sexp
@@ -49,26 +49,29 @@ func (node *Node) Location() []Range {
 // Dump dumps the AST defined by `node` as a list of sexps.
 // Returns a string suitable for printing.
 func (node *Node) Dump() string {
-	str := ""
-	str += node.Value
+	var str strings.Builder
+	str.WriteString(strings.ToLower(node.Value))
 
 	if len(node.Flags) > 0 {
-		str += fmt.Sprintf(" %q", node.Flags)
+		fmt.Fprintf(&str, " %q", node.Flags)
 	}
 
 	for _, n := range node.Children {
-		str += "(" + n.Dump() + ")\n"
+		str.WriteByte('(')
+		str.WriteString(n.Dump())
+		str.WriteString(")\n")
 	}
 
 	for n := node.Next; n != nil; n = n.Next {
+		str.WriteByte(' ')
 		if len(n.Children) > 0 {
-			str += " " + n.Dump()
+			str.WriteString(n.Dump())
 		} else {
-			str += " " + strconv.Quote(n.Value)
+			str.WriteString(strconv.Quote(n.Value))
 		}
 	}
 
-	return strings.TrimSpace(str)
+	return strings.TrimSpace(str.String())
 }
 
 func (node *Node) lines(start, end int) {
@@ -77,10 +80,17 @@ func (node *Node) lines(start, end int) {
 }
 
 func (node *Node) canContainHeredoc() bool {
-	if _, allowedDirective := heredocDirectives[node.Value]; !allowedDirective {
+	// check for compound commands, like ONBUILD
+	if ok := heredocCompoundDirectives[strings.ToLower(node.Value)]; ok {
+		if node.Next != nil && len(node.Next.Children) > 0 {
+			node = node.Next.Children[0]
+		}
+	}
+
+	if ok := heredocDirectives[strings.ToLower(node.Value)]; !ok {
 		return false
 	}
-	if _, isJSON := node.Attributes["json"]; isJSON {
+	if isJSON := node.Attributes["json"]; isJSON {
 		return false
 	}
 
@@ -106,30 +116,42 @@ type Heredoc struct {
 }
 
 var (
-	dispatch          map[string]func(string, *directives) (*Node, map[string]bool, error)
-	heredocDirectives map[string]bool
-	reWhitespace      = regexp.MustCompile(`[\t\v\f\r ]+`)
-	reDirectives      = regexp.MustCompile(`^#\s*([a-zA-Z][a-zA-Z0-9]*)\s*=\s*(.+?)\s*$`)
-	reComment         = regexp.MustCompile(`^#.*$`)
-	reHeredoc         = regexp.MustCompile(`^(\d*)<<(-?)(['"]?)([a-zA-Z][a-zA-Z0-9]*)(['"]?)$`)
-	reLeadingTabs     = regexp.MustCompile(`(?m)^\t+`)
+	dispatch      map[string]func(string, *directives) (*Node, map[string]bool, error)
+	reWhitespace  = regexp.MustCompile(`[\t\v\f\r ]+`)
+	reHeredoc     = regexp.MustCompile(`^(\d*)<<(-?)\s*([^<]*)$`)
+	reLeadingTabs = regexp.MustCompile(`(?m)^\t+`)
 )
 
 // DefaultEscapeToken is the default escape token
 const DefaultEscapeToken = '\\'
 
-var validDirectives = map[string]struct{}{
-	"escape": {},
-	"syntax": {},
-}
+var (
+	// Directives allowed to contain heredocs
+	heredocDirectives = map[string]bool{
+		command.Add:  true,
+		command.Copy: true,
+		command.Run:  true,
+	}
 
-// directive is the structure used during a build run to hold the state of
+	// Directives allowed to contain directives containing heredocs
+	heredocCompoundDirectives = map[string]bool{
+		command.Onbuild: true,
+	}
+
+	// Directives that parse key-value pairs but take a list of names
+	// when --unset flag is set
+	unsetCommands = map[string]bool{
+		command.Env:   true,
+		command.Label: true,
+	}
+)
+
+// directives is the structure used during a build run to hold the state of
 // parsing directives.
 type directives struct {
-	escapeToken           rune                // Current escape token
-	lineContinuationRegex *regexp.Regexp      // Current line continuation regex
-	done                  bool                // Whether we are done looking for directives
-	seen                  map[string]struct{} // Whether the escape directive has been seen
+	parser                DirectiveParser
+	escapeToken           rune           // Current escape token
+	lineContinuationRegex *regexp.Regexp // Current line continuation regex
 }
 
 // setEscapeToken sets the default token for escaping characters and as line-
@@ -156,42 +178,22 @@ func (d *directives) setEscapeToken(s string) error {
 
 // possibleParserDirective looks for parser directives, eg '# escapeToken=<char>'.
 // Parser directives must precede any builder instruction or other comments,
-// and cannot be repeated.
-func (d *directives) possibleParserDirective(line string) error {
-	if d.done {
-		return nil
+// and cannot be repeated. Returns true if a parser directive was found.
+func (d *directives) possibleParserDirective(line []byte) (bool, error) {
+	directive, err := d.parser.ParseLine(line)
+	if err != nil {
+		return false, err
 	}
-
-	match := reDirectives.FindStringSubmatch(line)
-	if len(match) == 0 {
-		d.done = true
-		return nil
+	if directive != nil && directive.Name == keyEscape {
+		err := d.setEscapeToken(directive.Value)
+		return err == nil, err
 	}
-
-	k := strings.ToLower(match[1])
-	_, ok := validDirectives[k]
-	if !ok {
-		d.done = true
-		return nil
-	}
-
-	if _, ok := d.seen[k]; ok {
-		return errors.Errorf("only one %s parser directive can be used", k)
-	}
-	d.seen[k] = struct{}{}
-
-	if k == "escape" {
-		return d.setEscapeToken(match[2])
-	}
-
-	return nil
+	return directive != nil, nil
 }
 
 // newDefaultDirectives returns a new directives structure with the default escapeToken token
 func newDefaultDirectives() *directives {
-	d := &directives{
-		seen: map[string]struct{}{},
-	}
+	d := &directives{}
 	d.setEscapeToken(string(DefaultEscapeToken))
 	return d
 }
@@ -229,15 +231,19 @@ func init() {
 // based on the command and command arguments. A Node is created from the
 // result of the dispatch.
 func newNodeFromLine(line string, d *directives, comments []string) (*Node, error) {
-	cmd, flags, args, err := splitCommand(line)
+	cmd, flags, args, err := splitCommand(line, d)
 	if err != nil {
 		return nil, err
 	}
 
-	fn := dispatch[cmd]
+	fn := dispatch[strings.ToLower(cmd)]
 	// Ignore invalid Dockerfile instructions
 	if fn == nil {
 		fn = parseIgnore
+	}
+	// --unset form takes a list of names instead of key-value pairs
+	if unsetCommands[strings.ToLower(cmd)] && hasUnsetFlag(flags) {
+		fn = parseNameOrNameVal
 	}
 	next, attrs, err := fn(args, d)
 	if err != nil {
@@ -254,11 +260,31 @@ func newNodeFromLine(line string, d *directives, comments []string) (*Node, erro
 	}, nil
 }
 
-// Result is the result of parsing a Dockerfile
+func hasUnsetFlag(flags []string) bool {
+	for _, f := range flags {
+		name, value, _ := strings.Cut(f, "=")
+		if name == "--unset" {
+			// invalid values are reported by the flag parser
+			return !strings.EqualFold(value, "false")
+		}
+	}
+	return false
+}
+
+// Result contains the bundled outputs from parsing a Dockerfile.
 type Result struct {
 	AST         *Node
 	EscapeToken rune
-	Warnings    []string
+	Warnings    []Warning
+}
+
+// Warning contains information to identify and locate a warning generated
+// during parsing.
+type Warning struct {
+	Short    string
+	Detail   [][]byte
+	URL      string
+	Location *Range
 }
 
 // PrintWarnings to the writer
@@ -266,26 +292,32 @@ func (r *Result) PrintWarnings(out io.Writer) {
 	if len(r.Warnings) == 0 {
 		return
 	}
-	fmt.Fprintf(out, strings.Join(r.Warnings, "\n")+"\n")
+	for _, w := range r.Warnings {
+		fmt.Fprintf(out, "[WARNING]: %s\n", w.Short)
+	}
+	if len(r.Warnings) > 0 {
+		fmt.Fprint(out, "[WARNING]: Empty continuation lines will become errors in a future release.\n")
+	}
 }
 
-// Parse reads lines from a Reader, parses the lines into an AST and returns
-// the AST and escape token
+// Parse consumes lines from a provided Reader, parses each line into an AST
+// and returns the results of doing so.
 func Parse(rwc io.Reader) (*Result, error) {
 	d := newDefaultDirectives()
 	currentLine := 0
 	root := &Node{StartLine: -1}
 	scanner := bufio.NewScanner(rwc)
 	scanner.Split(scanLines)
-	warnings := []string{}
+	warnings := []Warning{}
 	var comments []string
+	buf := &bytes.Buffer{}
 
 	var err error
 	for scanner.Scan() {
 		bytesRead := scanner.Bytes()
 		if currentLine == 0 {
 			// First line, strip the byte-order-marker if present
-			bytesRead = bytes.TrimPrefix(bytesRead, utf8bom)
+			bytesRead = discardBOM(bytesRead)
 		}
 		if isComment(bytesRead) {
 			comment := strings.TrimSpace(string(bytesRead[1:]))
@@ -295,21 +327,29 @@ func Parse(rwc io.Reader) (*Result, error) {
 				comments = append(comments, comment)
 			}
 		}
-		bytesRead, err = processLine(d, bytesRead, true)
+		var directiveOk bool
+		bytesRead, directiveOk, err = processLine(d, bytesRead, true)
+		// If the line is a directive, strip it from the comments
+		// so it doesn't get added to the AST.
+		if directiveOk {
+			comments = comments[:len(comments)-1]
+		}
 		if err != nil {
 			return nil, withLocation(err, currentLine, 0)
 		}
 		currentLine++
 
 		startLine := currentLine
-		line, isEndOfLine := trimContinuationCharacter(string(bytesRead), d)
-		if isEndOfLine && line == "" {
+		bytesRead, isEndOfLine := trimContinuationCharacter(bytesRead, d)
+		if isEndOfLine && len(bytesRead) == 0 {
 			continue
 		}
+		buf.Reset()
+		buf.Write(bytesRead)
 
 		var hasEmptyContinuationLine bool
 		for !isEndOfLine && scanner.Scan() {
-			bytesRead, err := processLine(d, scanner.Bytes(), false)
+			bytesRead, _, err := processLine(d, scanner.Bytes(), false)
 			if err != nil {
 				return nil, withLocation(err, currentLine, 0)
 			}
@@ -324,13 +364,19 @@ func Parse(rwc io.Reader) (*Result, error) {
 				continue
 			}
 
-			continuationLine := string(bytesRead)
-			continuationLine, isEndOfLine = trimContinuationCharacter(continuationLine, d)
-			line += continuationLine
+			bytesRead, isEndOfLine = trimContinuationCharacter(bytesRead, d)
+			buf.Write(bytesRead)
 		}
 
+		line := buf.String()
+
 		if hasEmptyContinuationLine {
-			warnings = append(warnings, "[WARNING]: Empty continuation line found in:\n    "+line)
+			warnings = append(warnings, Warning{
+				Short:    "Empty continuation line found in: " + line,
+				Detail:   [][]byte{[]byte("Empty continuation lines will become errors in a future release")},
+				URL:      "https://docs.docker.com/go/dockerfile/rule/no-empty-continuation/",
+				Location: &Range{Start: Position{Line: currentLine}, End: Position{Line: currentLine}},
+			})
 		}
 
 		child, err := newNodeFromLine(line, d, comments)
@@ -338,7 +384,7 @@ func Parse(rwc io.Reader) (*Result, error) {
 			return nil, withLocation(err, startLine, currentLine)
 		}
 
-		if child.canContainHeredoc() {
+		if child.canContainHeredoc() && strings.Contains(line, "<<") {
 			heredocs, err := heredocsFromLine(line)
 			if err != nil {
 				return nil, withLocation(err, startLine, currentLine)
@@ -347,6 +393,8 @@ func Parse(rwc io.Reader) (*Result, error) {
 			for _, heredoc := range heredocs {
 				terminator := []byte(heredoc.Name)
 				terminated := false
+				var content strings.Builder
+				content.WriteString(heredoc.Content)
 				for scanner.Scan() {
 					bytesRead := scanner.Bytes()
 					currentLine++
@@ -359,22 +407,19 @@ func Parse(rwc io.Reader) (*Result, error) {
 						terminated = true
 						break
 					}
-					heredoc.Content += string(bytesRead)
+					content.Write(bytesRead)
 				}
 				if !terminated {
 					return nil, withLocation(errors.New("unterminated heredoc"), startLine, currentLine)
 				}
 
+				heredoc.Content = content.String()
 				child.Heredocs = append(child.Heredocs, heredoc)
 			}
 		}
 
 		root.AddChild(child, startLine, currentLine)
 		comments = nil
-	}
-
-	if len(warnings) > 0 {
-		warnings = append(warnings, "[WARNING]: Empty continuation lines will become errors in a future release.")
 	}
 
 	if root.StartLine < 0 {
@@ -388,36 +433,68 @@ func Parse(rwc io.Reader) (*Result, error) {
 	}, withLocation(handleScannerError(scanner.Err()), currentLine, 0)
 }
 
+// heredocFromMatch extracts a heredoc from a possible heredoc regex match.
 func heredocFromMatch(match []string) (*Heredoc, error) {
 	if len(match) == 0 {
 		return nil, nil
 	}
 
-	fileDescriptor, _ := strconv.ParseUint(match[1], 10, 0)
+	fd, _ := strconv.ParseUint(match[1], 10, 0)
 	chomp := match[2] == "-"
-	quoteOpen := match[3]
-	name := match[4]
-	quoteClose := match[5]
+	rest := match[3]
 
-	expand := true
-	if quoteOpen != "" || quoteClose != "" {
-		if quoteOpen != quoteClose {
-			return nil, errors.New("quoted heredoc quotes do not match")
-		}
-		expand = false
+	if len(rest) == 0 {
+		return nil, nil
 	}
 
+	shlex := shell.NewLex('\\')
+	shlex.SkipUnsetEnv = true
+
+	// Attempt to parse both the heredoc both with *and* without quotes.
+	// If there are quotes in one but not the other, then we know that some
+	// part of the heredoc word is quoted, so we shouldn't expand the content.
+	shlex.RawQuotes = false
+	words, err := shlex.ProcessWords(rest, emptyEnvs{})
+	if err != nil {
+		return nil, err
+	}
+	// quick sanity check that rest is a single word
+	if len(words) != 1 {
+		return nil, nil
+	}
+
+	shlex.RawQuotes = true
+	wordsRaw, err := shlex.ProcessWords(rest, emptyEnvs{})
+	if err != nil {
+		return nil, err
+	}
+	if len(wordsRaw) != len(words) {
+		return nil, errors.Errorf("internal lexing of heredoc produced inconsistent results: %s", rest)
+	}
+
+	word := words[0]
+	wordQuoteCount := strings.Count(word, `'`) + strings.Count(word, `"`)
+	wordRaw := wordsRaw[0]
+	wordRawQuoteCount := strings.Count(wordRaw, `'`) + strings.Count(wordRaw, `"`)
+
+	expand := wordQuoteCount == wordRawQuoteCount
+
 	return &Heredoc{
-		Name:           name,
+		Name:           word,
 		Expand:         expand,
 		Chomp:          chomp,
-		FileDescriptor: uint(fileDescriptor),
+		FileDescriptor: uint(fd),
 	}, nil
 }
 
+// ParseHeredoc parses a heredoc word from a target string, returning the
+// components from the doc.
 func ParseHeredoc(src string) (*Heredoc, error) {
 	return heredocFromMatch(reHeredoc.FindStringSubmatch(src))
 }
+
+// MustParseHeredoc is a variant of ParseHeredoc that discards the error, if
+// there was one present.
 func MustParseHeredoc(src string) *Heredoc {
 	heredoc, _ := ParseHeredoc(src)
 	return heredoc
@@ -426,7 +503,9 @@ func MustParseHeredoc(src string) *Heredoc {
 func heredocsFromLine(line string) ([]Heredoc, error) {
 	shlex := shell.NewLex('\\')
 	shlex.RawQuotes = true
-	words, _ := shlex.ProcessWords(line, []string{})
+	shlex.RawEscapes = true
+	shlex.SkipUnsetEnv = true
+	words, _ := shlex.ProcessWords(line, emptyEnvs{})
 
 	var docs []Heredoc
 	for _, word := range words {
@@ -441,12 +520,16 @@ func heredocsFromLine(line string) ([]Heredoc, error) {
 	return docs, nil
 }
 
+// ChompHeredocContent chomps leading tabs from the heredoc.
 func ChompHeredocContent(src string) string {
 	return reLeadingTabs.ReplaceAllString(src, "")
 }
 
 func trimComments(src []byte) []byte {
-	return reComment.ReplaceAll(src, []byte{})
+	if !isComment(src) {
+		return src
+	}
+	return nil
 }
 
 func trimLeadingWhitespace(src []byte) []byte {
@@ -460,18 +543,17 @@ func trimNewline(src []byte) []byte {
 }
 
 func isComment(line []byte) bool {
-	return reComment.Match(trimLeadingWhitespace(trimNewline(line)))
+	line = trimLeadingWhitespace(line)
+	return len(line) > 0 && line[0] == '#'
 }
 
 func isEmptyContinuationLine(line []byte) bool {
 	return len(trimLeadingWhitespace(trimNewline(line))) == 0
 }
 
-var utf8bom = []byte{0xEF, 0xBB, 0xBF}
-
-func trimContinuationCharacter(line string, d *directives) (string, bool) {
-	if d.lineContinuationRegex.MatchString(line) {
-		line = d.lineContinuationRegex.ReplaceAllString(line, "$1")
+func trimContinuationCharacter(line []byte, d *directives) ([]byte, bool) {
+	if d.lineContinuationRegex.Match(line) {
+		line = d.lineContinuationRegex.ReplaceAll(line, []byte("$1"))
 		return line, false
 	}
 	return line, true
@@ -479,12 +561,13 @@ func trimContinuationCharacter(line string, d *directives) (string, bool) {
 
 // TODO: remove stripLeftWhitespace after deprecation period. It seems silly
 // to preserve whitespace on continuation lines. Why is that done?
-func processLine(d *directives, token []byte, stripLeftWhitespace bool) ([]byte, error) {
+func processLine(d *directives, token []byte, stripLeftWhitespace bool) ([]byte, bool, error) {
 	token = trimNewline(token)
 	if stripLeftWhitespace {
 		token = trimLeadingWhitespace(token)
 	}
-	return trimComments(token), d.possibleParserDirective(string(token))
+	directiveOk, err := d.possibleParserDirective(token)
+	return trimComments(token), directiveOk, err
 }
 
 // Variation of bufio.ScanLines that preserves the line endings
@@ -502,10 +585,20 @@ func scanLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
 }
 
 func handleScannerError(err error) error {
-	switch err {
-	case bufio.ErrTooLong:
+	switch {
+	case errors.Is(err, bufio.ErrTooLong):
 		return errors.Errorf("dockerfile line greater than max allowed size of %d", bufio.MaxScanTokenSize-1)
 	default:
 		return err
 	}
+}
+
+type emptyEnvs struct{}
+
+func (emptyEnvs) Get(string) (string, bool) {
+	return "", false
+}
+
+func (emptyEnvs) Keys() []string {
+	return nil
 }

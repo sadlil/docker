@@ -2,12 +2,18 @@ package metadata
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/db"
+	"github.com/moby/buildkit/util/db/boltutil"
+	"github.com/moby/buildkit/util/db/compaction"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -17,21 +23,36 @@ const (
 	externalBucket = "_external"
 )
 
-var errNotFound = errors.Errorf("not found")
+var errNotFound = errors.New("not found")
 
 type Store struct {
-	db *bolt.DB
+	db db.DB
 }
 
-func NewStore(dbPath string) (*Store, error) {
-	db, err := bolt.Open(dbPath, 0600, nil)
+func NewStore(dbPath string, policies ...compaction.Config) (*Store, error) {
+	// Check for legacy (v1) cache state.
+	//
+	// Automatic migration was removed in https://github.com/moby/buildkit/pull/6509
+	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+		legacyMetadata := filepath.Join(filepath.Dir(dbPath), "metadata.db")
+		if _, err := os.Stat(legacyMetadata); err == nil {
+			return nil, errors.Errorf(
+				"legacy (v1) cache metadata found at %q and needs to be removed or migrated; downgrade BuildKit to v0.27.1 to perform automatic migration or remove the existing cache",
+				legacyMetadata,
+			)
+		}
+	}
+	db, err := boltutil.Open(dbPath, 0600, &bolt.Options{
+		FreelistType:   bolt.FreelistMapType,
+		NoFreelistSync: true,
+	}, policies...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to open database file %s", dbPath)
 	}
 	return &Store{db: db}, nil
 }
 
-func (s *Store) DB() *bolt.DB {
+func (s *Store) DB() db.Transactor {
 	return s.db
 }
 
@@ -80,7 +101,7 @@ func (s *Store) Probe(index string) (bool, error) {
 	return exists, errors.WithStack(err)
 }
 
-func (s *Store) Search(index string) ([]*StorageItem, error) {
+func (s *Store) Search(ctx context.Context, index string, prefix bool) ([]*StorageItem, error) {
 	var out []*StorageItem
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(indexBucket))
@@ -91,16 +112,22 @@ func (s *Store) Search(index string) ([]*StorageItem, error) {
 		if main == nil {
 			return nil
 		}
-		index = indexKey(index, "")
+		if !prefix {
+			index = indexKey(index, "")
+		}
 		c := b.Cursor()
 		k, _ := c.Seek([]byte(index))
 		for {
 			if k != nil && strings.HasPrefix(string(k), index) {
-				itemID := strings.TrimPrefix(string(k), index)
+				idx := strings.LastIndex(string(k), "::")
+				if idx == -1 {
+					continue
+				}
+				itemID := string(k[idx+2:])
 				k, _ = c.Next()
 				b := main.Bucket([]byte(itemID))
 				if b == nil {
-					logrus.Errorf("index pointing to missing record %s", itemID)
+					bklog.G(ctx).Errorf("index pointing to missing record %s", itemID)
 					continue
 				}
 				si, err := newStorageItem(itemID, b, s)
@@ -163,6 +190,40 @@ func (s *Store) Clear(id string) error {
 	}))
 }
 
+func (s *Store) ClearOrphans() (int, error) {
+	var n int
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		external := tx.Bucket([]byte(externalBucket))
+		if external == nil {
+			return nil
+		}
+		var records *bolt.Cursor
+		if main := tx.Bucket([]byte(mainBucket)); main != nil {
+			records = main.Cursor()
+		}
+		var orphans [][]byte
+		if err := external.ForEach(func(k, _ []byte) error {
+			if records != nil {
+				if id, v := records.Seek(k); bytes.Equal(id, k) && v == nil {
+					return nil
+				}
+			}
+			orphans = append(orphans, append([]byte(nil), k...))
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, id := range orphans {
+			if err := external.DeleteBucket(id); err != nil {
+				return err
+			}
+		}
+		n = len(orphans)
+		return nil
+	})
+	return n, errors.WithStack(err)
+}
+
 func (s *Store) Update(id string, fn func(b *bolt.Bucket) error) error {
 	return errors.WithStack(s.db.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(mainBucket))
@@ -182,21 +243,28 @@ func (s *Store) Get(id string) (*StorageItem, bool) {
 		si, _ := newStorageItem(id, nil, s)
 		return si
 	}
-	tx, err := s.db.Begin(false)
-	if err != nil {
+
+	var si *StorageItem
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(mainBucket))
+		if b == nil {
+			return nil
+		}
+		b = b.Bucket([]byte(id))
+		if b == nil {
+			return nil
+		}
+		si, _ = newStorageItem(id, b, s)
+		return nil
+	}); err != nil {
 		return empty(), false
 	}
-	defer tx.Rollback()
-	b := tx.Bucket([]byte(mainBucket))
-	if b == nil {
-		return empty(), false
+
+	if si != nil {
+		return si, true
 	}
-	b = b.Bucket([]byte(id))
-	if b == nil {
-		return empty(), false
-	}
-	si, _ := newStorageItem(id, b, s)
-	return si, true
+
+	return empty(), false
 }
 
 func (s *Store) Close() error {
@@ -235,7 +303,7 @@ func newStorageItem(id string, b *bolt.Bucket, s *Store) (*StorageItem, error) {
 	return si, nil
 }
 
-func (s *StorageItem) Storage() *Store { // TODO: used in local source. how to remove this?
+func (s *StorageItem) Storage() *Store {
 	return s.storage
 }
 
@@ -296,6 +364,10 @@ func (s *StorageItem) GetExternal(k string) ([]byte, error) {
 
 func (s *StorageItem) SetExternal(k string, dt []byte) error {
 	return errors.WithStack(s.storage.db.Update(func(tx *bolt.Tx) error {
+		main := tx.Bucket([]byte(mainBucket))
+		if main == nil || main.Bucket([]byte(s.id)) == nil {
+			return errors.Wrapf(errNotFound, "record %s", s.id)
+		}
 		b, err := tx.CreateBucketIfNotExists([]byte(externalBucket))
 		if err != nil {
 			return errors.WithStack(err)
@@ -317,6 +389,9 @@ func (s *StorageItem) Queue(fn func(b *bolt.Bucket) error) {
 func (s *StorageItem) Commit() error {
 	s.qmu.Lock()
 	defer s.qmu.Unlock()
+	if len(s.queue) == 0 {
+		return nil
+	}
 	return errors.WithStack(s.Update(func(b *bolt.Bucket) error {
 		for _, fn := range s.queue {
 			if err := fn(b); err != nil {
@@ -345,40 +420,79 @@ func (s *StorageItem) SetValue(b *bolt.Bucket, key string, v *Value) error {
 	return s.setValue(b, key, v)
 }
 
-func (s *StorageItem) setValue(b *bolt.Bucket, key string, v *Value) error {
-	if v == nil {
-		if old, ok := s.values[key]; ok {
-			if old.Index != "" {
-				b, err := b.Tx().CreateBucketIfNotExists([]byte(indexBucket))
-				if err != nil {
-					return errors.WithStack(err)
-				}
-				b.Delete([]byte(indexKey(old.Index, s.ID()))) // ignore error
-			}
-		}
-		if err := b.Put([]byte(key), nil); err != nil {
-			return err
-		}
-		delete(s.values, key)
-		return nil
-	}
-	dt, err := json.Marshal(v)
+func (s *StorageItem) ClearIndex(tx *bolt.Tx, index string) error {
+	s.vmu.Lock()
+	defer s.vmu.Unlock()
+	return s.clearIndex(tx, index)
+}
+
+func (s *StorageItem) clearIndex(tx *bolt.Tx, index string) error {
+	b, err := tx.CreateBucketIfNotExists([]byte(indexBucket))
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	return b.Delete([]byte(indexKey(index, s.ID())))
+}
+
+func (s *StorageItem) setValue(b *bolt.Bucket, key string, v *Value) error {
+	// Read the previous index from the transaction: another StorageItem handle
+	// or a caller modifying a Value returned by Get may have changed the cache.
+	var old Value
+	if dt := b.Get([]byte(key)); len(dt) > 0 {
+		if err := json.Unmarshal(dt, &old); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	var dt []byte
+	var index string
+	if v != nil {
+		var err error
+		dt, err = json.Marshal(v)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		index = v.Index
 	}
 	if err := b.Put([]byte(key), dt); err != nil {
 		return errors.WithStack(err)
 	}
-	if v.Index != "" {
+	if old.Index != "" && old.Index != index {
+		// Index entries are shared by all values on this record. Remove an old
+		// entry only after its last value stops referencing it.
+		inUse := false
+		if err := b.ForEach(func(_, dt []byte) error {
+			if len(dt) == 0 {
+				return nil
+			}
+			var current Value
+			if err := json.Unmarshal(dt, &current); err != nil {
+				return errors.WithStack(err)
+			}
+			inUse = inUse || current.Index == old.Index
+			return nil
+		}); err != nil {
+			return err
+		}
+		if !inUse {
+			if err := s.clearIndex(b.Tx(), old.Index); err != nil {
+				return err
+			}
+		}
+	}
+	if index != "" {
 		b, err := b.Tx().CreateBucketIfNotExists([]byte(indexBucket))
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		if err := b.Put([]byte(indexKey(v.Index, s.ID())), []byte{}); err != nil {
+		if err := b.Put([]byte(indexKey(index, s.ID())), []byte{}); err != nil {
 			return errors.WithStack(err)
 		}
 	}
-	s.values[key] = v
+	if v == nil {
+		delete(s.values, key)
+	} else {
+		s.values[key] = v
+	}
 	return nil
 }
 
@@ -403,7 +517,7 @@ type Value struct {
 	Index string          `json:"index,omitempty"`
 }
 
-func NewValue(v interface{}) (*Value, error) {
+func NewValue(v any) (*Value, error) {
 	dt, err := json.Marshal(v)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -411,7 +525,7 @@ func NewValue(v interface{}) (*Value, error) {
 	return &Value{Value: json.RawMessage(dt)}, nil
 }
 
-func (v *Value) Unmarshal(target interface{}) error {
+func (v *Value) Unmarshal(target any) error {
 	return errors.WithStack(json.Unmarshal(v.Value, target))
 }
 

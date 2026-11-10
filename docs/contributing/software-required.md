@@ -23,7 +23,7 @@ on the command line.
 
 ## Task 2. Install git
 
-Install `git` on your local system. You can check if `git` is on already on your
+Install `git` on your local system. You can check if `git` is already on your
 system and properly installed with the following command:
 
 ```bash
@@ -90,5 +90,7 @@ You must log out and log back in for this modification to take effect.
 
 ## Where to go next
 
-In the next section, you'll [learn how to set up and configure Git for
-contributing to Moby](set-up-git.md).
+In the next section, you'll [configure the project to be properly recognized by the IDE](set-up-ide.md).
+
+If you don't want to use IDE, you can proceed to the next step
+and [learn how to set up and configure Git for contributing to Moby](set-up-git.md).

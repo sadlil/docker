@@ -1,38 +1,45 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/url"
 
-	registrytypes "github.com/docker/docker/api/types/registry"
+	"github.com/moby/moby/api/types/registry"
 )
 
+// DistributionInspectResult holds the result of the DistributionInspect operation.
+type DistributionInspectResult struct {
+	registry.DistributionInspect
+}
+
+// DistributionInspectOptions holds options for the DistributionInspect operation.
+type DistributionInspectOptions struct {
+	EncodedRegistryAuth string
+}
+
 // DistributionInspect returns the image digest with the full manifest.
-func (cli *Client) DistributionInspect(ctx context.Context, image, encodedRegistryAuth string) (registrytypes.DistributionInspect, error) {
-	// Contact the registry to retrieve digest and platform information
-	var distributionInspect registrytypes.DistributionInspect
-	if image == "" {
-		return distributionInspect, objectNotFoundError{object: "distribution", id: image}
+func (cli *Client) DistributionInspect(ctx context.Context, imageRef string, options DistributionInspectOptions) (DistributionInspectResult, error) {
+	if imageRef == "" {
+		return DistributionInspectResult{}, objectNotFoundError{object: "distribution", id: imageRef}
 	}
 
-	if err := cli.NewVersionError("1.30", "distribution inspect"); err != nil {
-		return distributionInspect, err
-	}
-	var headers map[string][]string
-
-	if encodedRegistryAuth != "" {
-		headers = map[string][]string{
-			"X-Registry-Auth": {encodedRegistryAuth},
+	var headers http.Header
+	if options.EncodedRegistryAuth != "" {
+		headers = http.Header{
+			registry.AuthHeader: {options.EncodedRegistryAuth},
 		}
 	}
 
-	resp, err := cli.get(ctx, "/distribution/"+image+"/json", url.Values{}, headers)
+	// Contact the registry to retrieve digest and platform information
+	resp, err := cli.get(ctx, "/distribution/"+imageRef+"/json", url.Values{}, headers)
 	defer ensureReaderClosed(resp)
 	if err != nil {
-		return distributionInspect, err
+		return DistributionInspectResult{}, err
 	}
 
-	err = json.NewDecoder(resp.body).Decode(&distributionInspect)
-	return distributionInspect, err
+	var distributionInspect registry.DistributionInspect
+	err = json.NewDecoder(resp.Body).Decode(&distributionInspect)
+	return DistributionInspectResult{DistributionInspect: distributionInspect}, err
 }

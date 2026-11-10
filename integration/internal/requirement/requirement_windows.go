@@ -1,7 +1,6 @@
 //go:build windows
-// +build windows
 
-package requirement // import "github.com/docker/docker/integration/internal/requirement"
+package requirement
 
 func overlayFSSupported() bool {
 	return false

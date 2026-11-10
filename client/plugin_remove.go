@@ -1,14 +1,27 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"net/url"
-
-	"github.com/docker/docker/api/types"
 )
 
+// PluginRemoveOptions holds parameters to remove plugins.
+type PluginRemoveOptions struct {
+	Force bool
+}
+
+// PluginRemoveResult represents the result of a plugin removal.
+type PluginRemoveResult struct {
+	// Currently empty; can be extended in the future if needed.
+}
+
 // PluginRemove removes a plugin
-func (cli *Client) PluginRemove(ctx context.Context, name string, options types.PluginRemoveOptions) error {
+func (cli *Client) PluginRemove(ctx context.Context, name string, options PluginRemoveOptions) (PluginRemoveResult, error) {
+	name, err := trimID("plugin", name)
+	if err != nil {
+		return PluginRemoveResult{}, err
+	}
+
 	query := url.Values{}
 	if options.Force {
 		query.Set("force", "1")
@@ -16,5 +29,5 @@ func (cli *Client) PluginRemove(ctx context.Context, name string, options types.
 
 	resp, err := cli.delete(ctx, "/plugins/"+name, query, nil)
 	defer ensureReaderClosed(resp)
-	return wrapResponseError(err, resp, "plugin", name)
+	return PluginRemoveResult{}, err
 }

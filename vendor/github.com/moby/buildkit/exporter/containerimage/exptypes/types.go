@@ -1,15 +1,29 @@
 package exptypes
 
 import (
-	"github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"context"
+
+	"github.com/moby/buildkit/solver/result"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-const ExporterImageConfigKey = "containerimage.config"
-const ExporterInlineCache = "containerimage.inlinecache"
-const ExporterPlatformsKey = "refs.platforms"
+const (
+	ExporterConfigDigestKey      = "config.digest"
+	ExporterImageNameKey         = "image.name"
+	ExporterImageDigestKey       = "containerimage.digest"
+	ExporterImageConfigKey       = "containerimage.config"
+	ExporterImageConfigDigestKey = "containerimage.config.digest"
+	ExporterImageDescriptorKey   = "containerimage.descriptor"
+	ExporterImageBaseConfigKey   = "containerimage.base.config"
+	ExporterPlatformsKey         = "refs.platforms"
+)
 
-const EmptyGZLayer = digest.Digest("sha256:4f4fb700ef54461cfa02571ae0db9a0dc1e0cdb5577484a6d75e68dc38e8acc1")
+// KnownRefMetadataKeys are the subset of exporter keys that can be suffixed by
+// a platform to become platform specific
+var KnownRefMetadataKeys = []string{
+	ExporterImageConfigKey,
+	ExporterImageBaseConfigKey,
+}
 
 type Platforms struct {
 	Platforms []Platform
@@ -17,5 +31,10 @@ type Platforms struct {
 
 type Platform struct {
 	ID       string
-	Platform specs.Platform
+	Platform ocispecs.Platform
 }
+
+type InlineCacheEntry struct {
+	Data []byte
+}
+type InlineCache func(ctx context.Context) (*result.Result[*InlineCacheEntry], error)

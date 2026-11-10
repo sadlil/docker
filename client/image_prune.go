@@ -1,36 +1,39 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
+	"github.com/moby/moby/api/types/image"
 )
 
-// ImagesPrune requests the daemon to delete unused data
-func (cli *Client) ImagesPrune(ctx context.Context, pruneFilters filters.Args) (types.ImagesPruneReport, error) {
-	var report types.ImagesPruneReport
+// ImagePruneOptions holds parameters to prune images.
+type ImagePruneOptions struct {
+	Filters Filters
+}
 
-	if err := cli.NewVersionError("1.25", "image prune"); err != nil {
-		return report, err
-	}
+// ImagePruneResult holds the result from the [Client.ImagePrune] method.
+type ImagePruneResult struct {
+	Report image.PruneReport
+}
 
-	query, err := getFiltersQuery(pruneFilters)
+// ImagePrune requests the daemon to delete unused data
+func (cli *Client) ImagePrune(ctx context.Context, opts ImagePruneOptions) (ImagePruneResult, error) {
+	query := url.Values{}
+	opts.Filters.updateURLValues(query)
+
+	resp, err := cli.post(ctx, "/images/prune", query, nil, nil)
+	defer ensureReaderClosed(resp)
 	if err != nil {
-		return report, err
+		return ImagePruneResult{}, err
 	}
 
-	serverResp, err := cli.post(ctx, "/images/prune", query, nil, nil)
-	defer ensureReaderClosed(serverResp)
-	if err != nil {
-		return report, err
+	var report image.PruneReport
+	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		return ImagePruneResult{}, fmt.Errorf("Error retrieving disk usage: %v", err)
 	}
 
-	if err := json.NewDecoder(serverResp.body).Decode(&report); err != nil {
-		return report, fmt.Errorf("Error retrieving disk usage: %v", err)
-	}
-
-	return report, nil
+	return ImagePruneResult{Report: report}, nil
 }

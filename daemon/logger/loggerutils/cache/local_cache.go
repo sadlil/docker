@@ -1,14 +1,15 @@
-package cache // import "github.com/docker/docker/daemon/logger/loggerutils/cache"
+package cache
 
 import (
+	"context"
 	"strconv"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/local"
-	units "github.com/docker/go-units"
+	"github.com/containerd/log"
+	"github.com/docker/go-units"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/local"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -22,6 +23,8 @@ const (
 var builtInCacheLogOpts = map[string]bool{
 	cacheDisabledKey: true,
 }
+
+var _ logger.LogReader = (*loggerWithCache)(nil)
 
 // WithLocalCache wraps the passed in logger with a logger caches all writes locally
 // in addition to writing to the passed in logger.
@@ -74,24 +77,27 @@ func (l *loggerWithCache) Log(msg *logger.Message) error {
 	dup := logger.NewMessage()
 	dumbCopyMessage(dup, msg)
 
-	if err := l.l.Log(msg); err != nil {
+	// Log the duplicate first so the caller retains ownership of the
+	// original message if either logger returns an error.
+	if err := l.l.Log(dup); err != nil {
+		logger.PutMessage(dup)
 		return err
 	}
-	return l.cache.Log(dup)
+	return l.cache.Log(msg)
 }
 
 func (l *loggerWithCache) Name() string {
 	return l.l.Name()
 }
 
-func (l *loggerWithCache) ReadLogs(config logger.ReadConfig) *logger.LogWatcher {
-	return l.cache.(logger.LogReader).ReadLogs(config)
+func (l *loggerWithCache) ReadLogs(ctx context.Context, config logger.ReadConfig) *logger.LogWatcher {
+	return l.cache.(logger.LogReader).ReadLogs(ctx, config)
 }
 
 func (l *loggerWithCache) Close() error {
 	err := l.l.Close()
 	if err := l.cache.Close(); err != nil {
-		logrus.WithError(err).Warn("error while shutting cache logger")
+		log.G(context.TODO()).WithError(err).Warn("error while shutting cache logger")
 	}
 	return err
 }

@@ -10,39 +10,36 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/testutil/request"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/request"
 	"github.com/pkg/errors"
 	"gotest.tools/v3/assert"
 )
 
-func (s *DockerSuite) TestExecResizeAPIHeightWidthNoInt(c *testing.T) {
+func (s *DockerAPISuite) TestExecResizeAPIHeightWidthNoInt(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
-	out, _ := dockerCmd(c, "run", "-d", "busybox", "top")
+	out := cli.DockerCmd(c, "run", "-d", "busybox", "top").Stdout()
 	cleanedContainerID := strings.TrimSpace(out)
 
 	endpoint := "/exec/" + cleanedContainerID + "/resize?h=foo&w=bar"
-	res, _, err := request.Post(endpoint)
+	res, _, err := request.Post(testutil.GetContext(c), endpoint)
 	assert.NilError(c, err)
-	if versions.LessThan(testEnv.DaemonAPIVersion(), "1.32") {
-		assert.Equal(c, res.StatusCode, http.StatusInternalServerError)
-	} else {
-		assert.Equal(c, res.StatusCode, http.StatusBadRequest)
-	}
+	assert.Equal(c, res.StatusCode, http.StatusBadRequest)
 }
 
 // Part of #14845
-func (s *DockerSuite) TestExecResizeImmediatelyAfterExecStart(c *testing.T) {
+func (s *DockerAPISuite) TestExecResizeImmediatelyAfterExecStart(c *testing.T) {
 	name := "exec_resize_test"
-	dockerCmd(c, "run", "-d", "-i", "-t", "--name", name, "--restart", "always", "busybox", "/bin/sh")
+	cli.DockerCmd(c, "run", "-d", "-i", "-t", "--name", name, "--restart", "always", "busybox", "/bin/sh")
 
 	testExecResize := func() error {
-		data := map[string]interface{}{
+		data := map[string]any{
 			"AttachStdin": true,
 			"Cmd":         []string{"/bin/sh"},
 		}
 		uri := fmt.Sprintf("/containers/%s/exec", name)
-		res, body, err := request.Post(uri, request.JSONBody(data))
+		res, body, err := request.Post(testutil.GetContext(c), uri, request.JSONBody(data))
 		if err != nil {
 			return err
 		}
@@ -71,10 +68,10 @@ func (s *DockerSuite) TestExecResizeImmediatelyAfterExecStart(c *testing.T) {
 		}
 		defer wc.Close()
 
-		_, rc, err := request.Post(fmt.Sprintf("/exec/%s/resize?h=24&w=80", execID), request.ContentType("text/plain"))
+		_, rc, err := request.Post(testutil.GetContext(c), fmt.Sprintf("/exec/%s/resize?h=24&w=80", execID), request.ContentType("text/plain"))
 		if err != nil {
 			// It's probably a panic of the daemon if io.ErrUnexpectedEOF is returned.
-			if err == io.ErrUnexpectedEOF {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
 				return errors.New("the daemon might have crashed")
 			}
 			// Other error happened, should be reported.
@@ -95,14 +92,12 @@ func (s *DockerSuite) TestExecResizeImmediatelyAfterExecStart(c *testing.T) {
 		ch = make(chan error, n)
 		wg sync.WaitGroup
 	)
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			if err := testExecResize(); err != nil {
 				ch <- err
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

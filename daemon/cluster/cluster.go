@@ -1,4 +1,4 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 //
 // ## Swarmkit integration
@@ -45,20 +45,19 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/network"
-	types "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/daemon/cluster/controllers/plugin"
-	executorpkg "github.com/docker/docker/daemon/cluster/executor"
-	lncluster "github.com/docker/docker/libnetwork/cluster"
-	"github.com/docker/docker/pkg/stack"
-	swarmapi "github.com/docker/swarmkit/api"
-	swarmnode "github.com/docker/swarmkit/node"
+	"github.com/containerd/log"
+	"github.com/moby/moby/api/types/network"
+	types "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/daemon/cluster/controllers/plugin"
+	executorpkg "github.com/moby/moby/v2/daemon/cluster/executor"
+	"github.com/moby/moby/v2/daemon/internal/stack"
+	lncluster "github.com/moby/moby/v2/daemon/libnetwork/cluster"
+	swarmapi "github.com/moby/swarmkit/v2/api"
+	swarmnode "github.com/moby/swarmkit/v2/node"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
@@ -68,8 +67,7 @@ const (
 	swarmConnectTimeout            = 20 * time.Second
 	swarmRequestTimeout            = 20 * time.Second
 	stateFile                      = "docker-state.json"
-	defaultAddr                    = "0.0.0.0:2377"
-	isWindows                      = runtime.GOOS == "windows"
+	defaultAddr                    = "tcp://0.0.0.0:2377"
 	initialReconnectDelay          = 100 * time.Millisecond
 	maxReconnectDelay              = 30 * time.Second
 	contextPrefix                  = "com.docker.swarm"
@@ -91,6 +89,7 @@ type Config struct {
 	PluginBackend          plugin.Backend
 	VolumeBackend          executorpkg.VolumeBackend
 	NetworkSubnetsProvider NetworkSubnetsProvider
+	GenerateServiceName    func(context.Context, int, string) (string, error)
 
 	// DefaultAdvertiseAddr is the default host/IP or network interface to use
 	// if no AdvertiseAddr value is specified.
@@ -98,9 +97,6 @@ type Config struct {
 
 	// path to store runtime state, such as the swarm control socket
 	RuntimeRoot string
-
-	// WatchStream is a channel to pass watch API notifications to daemon
-	WatchStream chan *swarmapi.WatchMessage
 
 	// RaftHeartbeatTick is the number of ticks for heartbeat of quorum members
 	RaftHeartbeatTick uint32
@@ -116,12 +112,12 @@ type Cluster struct {
 	mu           sync.RWMutex
 	controlMutex sync.RWMutex // protect init/join/leave user operations
 	nr           *nodeRunner
-	root         string
+	stateDir     string
 	runtimeRoot  string
 	config       Config
 	configEvent  chan lncluster.ConfigEventType // todo: make this array and goroutine safe
 	attachers    map[string]*attacher
-	watchStream  chan *swarmapi.WatchMessage
+	watchStream  chan *swarmapi.WatchMessage // watchStream is a channel to pass watch API notifications to daemon.
 }
 
 // attacher manages the in-memory attachment state of a container
@@ -139,12 +135,9 @@ type attacher struct {
 
 // New creates a new Cluster instance using provided config.
 func New(config Config) (*Cluster, error) {
-	root := filepath.Join(config.Root, swarmDirName)
-	if err := os.MkdirAll(root, 0700); err != nil {
-		return nil, err
-	}
+	stateDir := filepath.Join(config.Root, swarmDirName)
 	if config.RuntimeRoot == "" {
-		config.RuntimeRoot = root
+		config.RuntimeRoot = stateDir
 	}
 	if config.RaftHeartbeatTick == 0 {
 		config.RaftHeartbeatTick = 1
@@ -154,16 +147,16 @@ func New(config Config) (*Cluster, error) {
 		config.RaftElectionTick = 10 * config.RaftHeartbeatTick
 	}
 
-	if err := os.MkdirAll(config.RuntimeRoot, 0700); err != nil {
-		return nil, err
-	}
 	c := &Cluster{
-		root:        root,
+		stateDir:    stateDir,
 		config:      config,
 		configEvent: make(chan lncluster.ConfigEventType, 10),
 		runtimeRoot: config.RuntimeRoot,
 		attachers:   make(map[string]*attacher),
-		watchStream: config.WatchStream,
+
+		// watchStream uses a buffered channel to pass changes from store watch API to daemon.
+		// A buffer allows store watch API and daemon processing to not wait for each other
+		watchStream: make(chan *swarmapi.WatchMessage, 32),
 	}
 	return c, nil
 }
@@ -172,9 +165,11 @@ func New(config Config) (*Cluster, error) {
 // TODO The split between New and Start can be join again when the SendClusterEvent
 // method is no longer required
 func (c *Cluster) Start() error {
-	root := filepath.Join(c.config.Root, swarmDirName)
-
-	nodeConfig, err := loadPersistentState(root)
+	// Create state-dir and runtime root if missing.
+	if err := os.MkdirAll(c.stateDir, 0o700); err != nil {
+		return err
+	}
+	nodeConfig, err := loadPersistentState(c.stateDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -182,6 +177,12 @@ func (c *Cluster) Start() error {
 		return err
 	}
 
+	// Create runtime root if missing. It is used for the control-socket on Linux.
+	//
+	// TODO(thaJeztah): this should probably be done as part of "nodeRunner.start()", which constructs the socket.
+	if err := os.MkdirAll(c.config.RuntimeRoot, 0o700); err != nil {
+		return err
+	}
 	nr, err := c.newNodeRunner(*nodeConfig)
 	if err != nil {
 		return err
@@ -193,10 +194,10 @@ func (c *Cluster) Start() error {
 
 	select {
 	case <-timer.C:
-		logrus.Error("swarm component could not be started before timeout was reached")
+		log.G(context.TODO()).Error("swarm component could not be started before timeout was reached")
 	case err := <-nr.Ready():
 		if err != nil {
-			logrus.WithError(err).Error("swarm component could not be started")
+			log.G(context.TODO()).WithError(err).Error("swarm component could not be started")
 			return nil
 		}
 	}
@@ -233,7 +234,7 @@ func (c *Cluster) newNodeRunner(conf nodeStartConfig) (*nodeRunner, error) {
 			}
 			localHostPort := conn.LocalAddr().String()
 			actualLocalAddr, _, _ = net.SplitHostPort(localHostPort)
-			conn.Close()
+			_ = conn.Close()
 		}
 	}
 
@@ -247,10 +248,6 @@ func (c *Cluster) newNodeRunner(conf nodeStartConfig) (*nodeRunner, error) {
 	c.config.Backend.DaemonJoinsCluster(c)
 
 	return nr, nil
-}
-
-func (c *Cluster) getRequestContext() (context.Context, func()) { // TODO: not needed when requests don't block on qourum lost
-	return context.WithTimeout(context.Background(), swarmRequestTimeout)
 }
 
 // IsManager returns true if Cluster is participating as a manager.
@@ -356,10 +353,10 @@ func (c *Cluster) errNoManager(st nodeState) error {
 		if errors.Is(st.err, errSwarmLocked) {
 			return errSwarmLocked
 		}
-		if st.err == errSwarmCertificatesExpired {
+		if errors.Is(st.err, errSwarmCertificatesExpired) {
 			return errSwarmCertificatesExpired
 		}
-		return errors.WithStack(notAvailableError("This node is not a swarm manager. Use \"docker swarm init\" or \"docker swarm join\" to connect this node to swarm and try again."))
+		return errors.WithStack(notAvailableError(`This node is not a swarm manager. Use "docker swarm init" or "docker swarm join" to connect this node to swarm and try again.`))
 	}
 	if st.swarmNode.Manager() != nil {
 		return errors.WithStack(notAvailableError("This node is not a swarm manager. Manager is being prepared or has trouble connecting to the cluster."))
@@ -386,13 +383,13 @@ func (c *Cluster) Cleanup() {
 		if err == nil {
 			singlenode := active && isLastManager(reachable, unreachable)
 			if active && !singlenode && removingManagerCausesLossOfQuorum(reachable, unreachable) {
-				logrus.Errorf("Leaving cluster with %v managers left out of %v. Raft quorum will be lost.", reachable-1, reachable+unreachable)
+				log.G(context.TODO()).Errorf("Leaving cluster with %v managers left out of %v. Raft quorum will be lost.", reachable-1, reachable+unreachable)
 			}
 		}
 	}
 
 	if err := node.Stop(); err != nil {
-		logrus.Errorf("failed to shut down cluster node: %v", err)
+		log.G(context.TODO()).Errorf("failed to shut down cluster node: %v", err)
 		stack.Dump()
 	}
 
@@ -401,7 +398,7 @@ func (c *Cluster) Cleanup() {
 	c.mu.Unlock()
 }
 
-func managerStats(client swarmapi.ControlClient, currentNodeID string) (current bool, reachable int, unreachable int, err error) {
+func managerStats(client swarmapi.ControlClient, currentNodeID string) (current bool, reachable int, unreachable int, _ error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	nodes, err := client.ListNodes(
@@ -424,17 +421,17 @@ func managerStats(client swarmapi.ControlClient, currentNodeID string) (current 
 			}
 		}
 	}
-	return
+	return current, reachable, unreachable, nil
 }
 
 func detectLockedError(err error) error {
-	if err == swarmnode.ErrInvalidUnlockKey {
+	if errors.Is(err, swarmnode.ErrInvalidUnlockKey) {
 		return errors.WithStack(errSwarmLocked)
 	}
 	return err
 }
 
-func (c *Cluster) lockedManagerAction(fn func(ctx context.Context, state nodeState) error) error {
+func (c *Cluster) lockedManagerAction(ctx context.Context, fn func(ctx context.Context, state nodeState) error) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -443,7 +440,7 @@ func (c *Cluster) lockedManagerAction(fn func(ctx context.Context, state nodeSta
 		return c.errNoManager(state)
 	}
 
-	ctx, cancel := c.getRequestContext()
+	ctx, cancel := context.WithTimeout(ctx, swarmRequestTimeout)
 	defer cancel()
 
 	return fn(ctx, state)

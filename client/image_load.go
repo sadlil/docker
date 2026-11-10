@@ -1,29 +1,63 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"io"
+	"net/http"
 	"net/url"
-
-	"github.com/docker/docker/api/types"
 )
 
-// ImageLoad loads an image in the docker host from the client host.
-// It's up to the caller to close the io.ReadCloser in the
-// ImageLoadResponse returned by this function.
-func (cli *Client) ImageLoad(ctx context.Context, input io.Reader, quiet bool) (types.ImageLoadResponse, error) {
-	v := url.Values{}
-	v.Set("quiet", "0")
-	if quiet {
-		v.Set("quiet", "1")
+// ImageLoadResult returns information to the client about a load process.
+// It implements [io.ReadCloser] and must be closed to avoid a resource leak.
+type ImageLoadResult interface {
+	io.ReadCloser
+}
+
+// ImageLoad loads an image in the docker host from the client host. It's up
+// to the caller to close the [ImageLoadResult] returned by this function.
+//
+// The underlying [io.ReadCloser] is automatically closed if the context is canceled,
+func (cli *Client) ImageLoad(ctx context.Context, input io.Reader, loadOpts ...ImageLoadOption) (ImageLoadResult, error) {
+	var opts imageLoadOpts
+	for _, opt := range loadOpts {
+		if err := opt.Apply(&opts); err != nil {
+			return nil, err
+		}
 	}
-	headers := map[string][]string{"Content-Type": {"application/x-tar"}}
-	resp, err := cli.postRaw(ctx, "/images/load", v, input, headers)
+
+	query := url.Values{}
+	query.Set("quiet", "0")
+	if opts.apiOptions.Quiet {
+		query.Set("quiet", "1")
+	}
+	if len(opts.apiOptions.Platforms) > 0 {
+		if err := cli.requiresVersion(ctx, "1.48", "platform"); err != nil {
+			return nil, err
+		}
+
+		p, err := encodePlatforms(opts.apiOptions.Platforms...)
+		if err != nil {
+			return nil, err
+		}
+		query["platform"] = p
+	}
+
+	headers := http.Header{"Content-Type": {"application/x-tar"}}
+	resp, err := cli.postRaw(ctx, "/images/load", query, headers, input)
 	if err != nil {
-		return types.ImageLoadResponse{}, err
+		return nil, err
 	}
-	return types.ImageLoadResponse{
-		Body: resp.body,
-		JSON: resp.header.Get("Content-Type") == "application/json",
+	return &imageLoadResult{
+		ReadCloser: newCancelReadCloser(ctx, resp.Body),
 	}, nil
 }
+
+// imageLoadResult returns information to the client about a load process.
+type imageLoadResult struct {
+	io.ReadCloser
+}
+
+var (
+	_ io.ReadCloser   = (*imageLoadResult)(nil)
+	_ ImageLoadResult = (*imageLoadResult)(nil)
+)

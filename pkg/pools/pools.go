@@ -7,14 +7,14 @@
 //
 // Utility functions which operate on pools should be added to this
 // package to allow them to be reused.
-package pools // import "github.com/docker/docker/pkg/pools"
+package pools
 
 import (
 	"bufio"
 	"io"
 	"sync"
 
-	"github.com/docker/docker/pkg/ioutils"
+	"github.com/moby/moby/v2/pkg/ioutils"
 )
 
 const buffer32K = 32 * 1024
@@ -37,7 +37,7 @@ type BufioReaderPool struct {
 func newBufioReaderPoolWithSize(size int) *BufioReaderPool {
 	return &BufioReaderPool{
 		pool: sync.Pool{
-			New: func() interface{} { return bufio.NewReaderSize(nil, size) },
+			New: func() any { return bufio.NewReaderSize(nil, size) },
 		},
 	}
 }
@@ -62,7 +62,7 @@ type bufferPool struct {
 func newBufferPoolWithSize(size int) *bufferPool {
 	return &bufferPool{
 		pool: sync.Pool{
-			New: func() interface{} { s := make([]byte, size); return &s },
+			New: func() any { s := make([]byte, size); return &s },
 		},
 	}
 }
@@ -76,11 +76,11 @@ func (bp *bufferPool) Put(b *[]byte) {
 }
 
 // Copy is a convenience wrapper which uses a buffer to avoid allocation in io.Copy.
-func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
+func Copy(dst io.Writer, src io.Reader) (written int64, _ error) {
 	buf := buffer32KPool.Get()
-	written, err = io.CopyBuffer(dst, src, *buf)
+	written, err := io.CopyBuffer(dst, src, *buf)
 	buffer32KPool.Put(buf)
-	return
+	return written, err
 }
 
 // NewReadCloserWrapper returns a wrapper which puts the bufio.Reader back
@@ -88,7 +88,7 @@ func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
 func (bufPool *BufioReaderPool) NewReadCloserWrapper(buf *bufio.Reader, r io.Reader) io.ReadCloser {
 	return ioutils.NewReadCloserWrapper(r, func() error {
 		if readCloser, ok := r.(io.ReadCloser); ok {
-			readCloser.Close()
+			_ = readCloser.Close()
 		}
 		bufPool.Put(buf)
 		return nil
@@ -105,7 +105,7 @@ type BufioWriterPool struct {
 func newBufioWriterPoolWithSize(size int) *BufioWriterPool {
 	return &BufioWriterPool{
 		pool: sync.Pool{
-			New: func() interface{} { return bufio.NewWriterSize(nil, size) },
+			New: func() any { return bufio.NewWriterSize(nil, size) },
 		},
 	}
 }
@@ -124,12 +124,12 @@ func (bufPool *BufioWriterPool) Put(b *bufio.Writer) {
 }
 
 // NewWriteCloserWrapper returns a wrapper which puts the bufio.Writer back
-// into the pool and closes the writer if it's an io.Writecloser.
+// into the pool and closes the writer if it's an io.WriteCloser.
 func (bufPool *BufioWriterPool) NewWriteCloserWrapper(buf *bufio.Writer, w io.Writer) io.WriteCloser {
 	return ioutils.NewWriteCloserWrapper(w, func() error {
-		buf.Flush()
+		_ = buf.Flush()
 		if writeCloser, ok := w.(io.WriteCloser); ok {
-			writeCloser.Close()
+			_ = writeCloser.Close()
 		}
 		bufPool.Put(buf)
 		return nil

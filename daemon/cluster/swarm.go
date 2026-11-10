@@ -1,4 +1,4 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 import (
 	"context"
@@ -7,18 +7,19 @@ import (
 	"strings"
 	"time"
 
-	apitypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	types "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/daemon/cluster/convert"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/opts"
-	"github.com/docker/docker/pkg/stack"
-	swarmapi "github.com/docker/swarmkit/api"
-	"github.com/docker/swarmkit/manager/encryption"
-	swarmnode "github.com/docker/swarmkit/node"
+	"github.com/containerd/log"
+	types "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/daemon/cluster/convert"
+	"github.com/moby/moby/v2/daemon/internal/filters"
+	"github.com/moby/moby/v2/daemon/internal/stack"
+	"github.com/moby/moby/v2/daemon/pkg/opts"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/daemon/server/swarmbackend"
+	"github.com/moby/moby/v2/errdefs"
+	swarmapi "github.com/moby/swarmkit/v2/api"
+	"github.com/moby/swarmkit/v2/manager/encryption"
+	swarmnode "github.com/moby/swarmkit/v2/node"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 )
 
@@ -52,7 +53,7 @@ func (c *Cluster) Init(req types.InitRequest) (string, error) {
 
 	listenHost, listenPort, err := resolveListenAddr(req.ListenAddr)
 	if err != nil {
-		return "", err
+		return "", errdefs.InvalidParameter(err)
 	}
 
 	advertiseHost, advertisePort, err := c.resolveAdvertiseAddr(req.AdvertiseAddr, listenPort)
@@ -87,7 +88,7 @@ func (c *Cluster) Init(req types.InitRequest) (string, error) {
 		if !found {
 			ip, err := c.resolveSystemAddr()
 			if err != nil {
-				logrus.Warnf("Could not find a local address: %v", err)
+				log.G(context.TODO()).Warnf("Could not find a local address: %v", err)
 				return "", errMustSpecifyListenAddr
 			}
 			localAddr = ip.String()
@@ -127,7 +128,7 @@ func (c *Cluster) Init(req types.InitRequest) (string, error) {
 		c.nr = nil
 		c.mu.Unlock()
 		if !req.ForceNewCluster { // if failure on first attempt don't keep state
-			if err := clearPersistentState(c.root); err != nil {
+			if err := clearPersistentState(c.stateDir); err != nil {
 				return "", err
 			}
 		}
@@ -206,7 +207,7 @@ func (c *Cluster) Join(req types.JoinRequest) error {
 			c.mu.Lock()
 			c.nr = nil
 			c.mu.Unlock()
-			if err := clearPersistentState(c.root); err != nil {
+			if err := clearPersistentState(c.stateDir); err != nil {
 				return err
 			}
 		}
@@ -217,7 +218,7 @@ func (c *Cluster) Join(req types.JoinRequest) error {
 // Inspect retrieves the configuration properties of a managed swarm cluster.
 func (c *Cluster) Inspect() (types.Swarm, error) {
 	var swarm types.Swarm
-	if err := c.lockedManagerAction(func(ctx context.Context, state nodeState) error {
+	if err := c.lockedManagerAction(context.TODO(), func(ctx context.Context, state nodeState) error {
 		s, err := c.inspect(ctx, state)
 		if err != nil {
 			return err
@@ -239,8 +240,8 @@ func (c *Cluster) inspect(ctx context.Context, state nodeState) (types.Swarm, er
 }
 
 // Update updates configuration of a managed swarm cluster.
-func (c *Cluster) Update(version uint64, spec types.Spec, flags types.UpdateFlags) error {
-	return c.lockedManagerAction(func(ctx context.Context, state nodeState) error {
+func (c *Cluster) Update(version uint64, spec types.Spec, flags swarmbackend.UpdateFlags) error {
+	return c.lockedManagerAction(context.TODO(), func(ctx context.Context, state nodeState) error {
 		swarm, err := getSwarm(ctx, state.controlClient)
 		if err != nil {
 			return err
@@ -283,7 +284,7 @@ func (c *Cluster) Update(version uint64, spec types.Spec, flags types.UpdateFlag
 // GetUnlockKey returns the unlock key for the swarm.
 func (c *Cluster) GetUnlockKey() (string, error) {
 	var resp *swarmapi.GetUnlockKeyResponse
-	if err := c.lockedManagerAction(func(ctx context.Context, state nodeState) error {
+	if err := c.lockedManagerAction(context.TODO(), func(ctx context.Context, state nodeState) error {
 		client := swarmapi.NewCAClient(state.grpcConn)
 
 		r, err := client.GetUnlockKey(ctx, &swarmapi.GetUnlockKeyRequest{})
@@ -313,7 +314,7 @@ func (c *Cluster) UnlockSwarm(req types.UnlockRequest) error {
 	if !state.IsActiveManager() {
 		// when manager is not active,
 		// unless it is locked, otherwise return error.
-		if err := c.errNoManager(state); err != errSwarmLocked {
+		if err := c.errNoManager(state); !errors.Is(err, errSwarmLocked) {
 			c.mu.RUnlock()
 			return err
 		}
@@ -356,7 +357,7 @@ func (c *Cluster) UnlockSwarm(req types.UnlockRequest) error {
 }
 
 // Leave shuts down Cluster and removes current state.
-func (c *Cluster) Leave(force bool) error {
+func (c *Cluster) Leave(ctx context.Context, force bool) error {
 	c.controlMutex.Lock()
 	defer c.controlMutex.Unlock()
 
@@ -398,7 +399,7 @@ func (c *Cluster) Leave(force bool) error {
 	}
 	// release readers in here
 	if err := nr.Stop(); err != nil {
-		logrus.Errorf("failed to shut down cluster node: %v", err)
+		log.G(ctx).Errorf("failed to shut down cluster node: %v", err)
 		stack.Dump()
 		return err
 	}
@@ -408,19 +409,19 @@ func (c *Cluster) Leave(force bool) error {
 	c.mu.Unlock()
 
 	if nodeID := state.NodeID(); nodeID != "" {
-		nodeContainers, err := c.listContainerForNode(nodeID)
+		nodeContainers, err := c.listContainerForNode(ctx, nodeID)
 		if err != nil {
 			return err
 		}
 		for _, id := range nodeContainers {
-			if err := c.config.Backend.ContainerRm(id, &apitypes.ContainerRmConfig{ForceRemove: true}); err != nil {
-				logrus.Errorf("error removing %v: %v", id, err)
+			if err := c.config.Backend.ContainerRm(id, &backend.ContainerRmConfig{ForceRemove: true}); err != nil {
+				log.G(ctx).Errorf("error removing %v: %v", id, err)
 			}
 		}
 	}
 
 	// todo: cleanup optional?
-	if err := clearPersistentState(c.root); err != nil {
+	if err := clearPersistentState(c.stateDir); err != nil {
 		return err
 	}
 	c.config.Backend.DaemonLeavesCluster()
@@ -428,7 +429,7 @@ func (c *Cluster) Leave(force bool) error {
 }
 
 // Info returns information about the current cluster state.
-func (c *Cluster) Info() types.Info {
+func (c *Cluster) Info(ctx context.Context) types.Info {
 	info := types.Info{
 		NodeAddr: c.GetAdvertiseAddress(),
 	}
@@ -441,7 +442,7 @@ func (c *Cluster) Info() types.Info {
 		info.Error = state.err.Error()
 	}
 
-	ctx, cancel := c.getRequestContext()
+	ctx, cancel := context.WithTimeout(ctx, swarmRequestTimeout)
 	defer cancel()
 
 	if state.IsActiveManager() {
@@ -492,6 +493,23 @@ func (c *Cluster) Info() types.Info {
 	return info
 }
 
+// Status returns a textual representation of the node's swarm status and role (manager/worker)
+func (c *Cluster) Status() string {
+	c.mu.RLock()
+	s := c.currentNodeState()
+	c.mu.RUnlock()
+
+	state := string(s.status)
+	if s.status == types.LocalNodeStateActive {
+		if s.IsActiveManager() || s.IsManager() {
+			state += "/manager"
+		} else {
+			state += "/worker"
+		}
+	}
+	return state
+}
+
 func validateAndSanitizeInitRequest(req *types.InitRequest) error {
 	var err error
 	req.ListenAddr, err = validateAddr(req.ListenAddr)
@@ -532,6 +550,7 @@ func validateAddr(addr string) (string, error) {
 	}
 	newaddr, err := opts.ParseTCPAddr(addr, defaultAddr)
 	if err != nil {
+		// TODO(thaJeztah) why are we ignoring the error here? Is this to allow "non-tcp" addresses?
 		return addr, nil
 	}
 	return strings.TrimPrefix(newaddr, "tcp://"), nil
@@ -586,12 +605,10 @@ func initClusterSpec(node *swarmnode.Node, spec types.Spec) error {
 	return ctx.Err()
 }
 
-func (c *Cluster) listContainerForNode(nodeID string) ([]string, error) {
+func (c *Cluster) listContainerForNode(ctx context.Context, nodeID string) ([]string, error) {
 	var ids []string
-	filters := filters.NewArgs()
-	filters.Add("label", fmt.Sprintf("com.docker.swarm.node.id=%s", nodeID))
-	containers, err := c.config.Backend.Containers(&apitypes.ContainerListOptions{
-		Filters: filters,
+	containers, err := c.config.Backend.Containers(ctx, &backend.ContainerListOptions{
+		Filters: filters.NewArgs(filters.Arg("label", "com.docker.swarm.node.id="+nodeID)),
 	})
 	if err != nil {
 		return []string{}, err

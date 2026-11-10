@@ -1,23 +1,21 @@
-package service // import "github.com/docker/docker/integration/service"
+package service
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/strslice"
-	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/integration/internal/network"
-	"github.com/docker/docker/integration/internal/swarm"
-	"github.com/docker/docker/testutil/daemon"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/go-units"
+	"github.com/moby/moby/api/types/container"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/network"
+	"github.com/moby/moby/v2/integration/internal/swarm"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
@@ -25,69 +23,72 @@ import (
 )
 
 func TestServiceCreateInit(t *testing.T) {
-	defer setupTest(t)()
-	t.Run("daemonInitDisabled", testServiceCreateInit(false))
-	t.Run("daemonInitEnabled", testServiceCreateInit(true))
+	ctx := setupTest(t)
+	t.Run("daemonInitDisabled", testServiceCreateInit(ctx, false))
+	t.Run("daemonInitEnabled", testServiceCreateInit(ctx, true))
 }
 
-func testServiceCreateInit(daemonEnabled bool) func(t *testing.T) {
+func testServiceCreateInit(ctx context.Context, daemonEnabled bool) func(t *testing.T) {
 	return func(t *testing.T) {
-		var ops = []daemon.Option{}
+		_ = testutil.StartSpan(ctx, t)
+		ops := []daemon.Option{}
 
 		if daemonEnabled {
 			ops = append(ops, daemon.WithInit())
 		}
-		d := swarm.NewSwarm(t, testEnv, ops...)
+		d := swarm.NewSwarm(ctx, t, testEnv, ops...)
 		defer d.Stop(t)
-		client := d.NewClientT(t)
-		defer client.Close()
+		apiClient := d.NewClientT(t)
+		defer apiClient.Close()
 
 		booleanTrue := true
 		booleanFalse := false
 
-		serviceID := swarm.CreateService(t, d)
-		poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, 1), swarm.ServicePoll)
-		i := inspectServiceContainer(t, client, serviceID)
+		// An unset Init delegates to the daemon configuration, which is what this
+		// case is about - so ask for it explicitly, rather than relying on the
+		// spec helper leaving it unset.
+		serviceID := swarm.CreateService(ctx, t, d, swarm.ServiceWithInit(nil))
+		poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, 1), swarm.ServicePoll)
+		i := inspectServiceContainer(ctx, t, apiClient, serviceID)
 		// HostConfig.Init == nil means that it delegates to daemon configuration
-		assert.Check(t, i.HostConfig.Init == nil)
+		assert.Check(t, is.Nil(i.HostConfig.Init))
 
-		serviceID = swarm.CreateService(t, d, swarm.ServiceWithInit(&booleanTrue))
-		poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, 1), swarm.ServicePoll)
-		i = inspectServiceContainer(t, client, serviceID)
+		serviceID = swarm.CreateService(ctx, t, d, swarm.ServiceWithInit(&booleanTrue))
+		poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, 1), swarm.ServicePoll)
+		i = inspectServiceContainer(ctx, t, apiClient, serviceID)
 		assert.Check(t, is.Equal(true, *i.HostConfig.Init))
 
-		serviceID = swarm.CreateService(t, d, swarm.ServiceWithInit(&booleanFalse))
-		poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, 1), swarm.ServicePoll)
-		i = inspectServiceContainer(t, client, serviceID)
+		serviceID = swarm.CreateService(ctx, t, d, swarm.ServiceWithInit(&booleanFalse))
+		poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, 1), swarm.ServicePoll)
+		i = inspectServiceContainer(ctx, t, apiClient, serviceID)
 		assert.Check(t, is.Equal(false, *i.HostConfig.Init))
 	}
 }
 
-func inspectServiceContainer(t *testing.T, client client.APIClient, serviceID string) types.ContainerJSON {
+func inspectServiceContainer(ctx context.Context, t *testing.T, apiClient client.APIClient, serviceID string) container.InspectResponse {
 	t.Helper()
-	filter := filters.NewArgs()
-	filter.Add("label", fmt.Sprintf("com.docker.swarm.service.id=%s", serviceID))
-	containers, err := client.ContainerList(context.Background(), types.ContainerListOptions{Filters: filter})
+	list, err := apiClient.ContainerList(ctx, client.ContainerListOptions{
+		Filters: make(client.Filters).Add("label", "com.docker.swarm.service.id="+serviceID),
+	})
 	assert.NilError(t, err)
-	assert.Check(t, is.Len(containers, 1))
+	assert.Check(t, is.Len(list.Items, 1))
 
-	i, err := client.ContainerInspect(context.Background(), containers[0].ID)
+	inspect, err := apiClient.ContainerInspect(ctx, list.Items[0].ID, client.ContainerInspectOptions{})
 	assert.NilError(t, err)
-	return i
+	return inspect.Container
 }
 
 func TestCreateServiceMultipleTimes(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	defer setupTest(t)()
-	d := swarm.NewSwarm(t, testEnv)
+	ctx := setupTest(t)
+
+	d := swarm.NewSwarm(ctx, t, testEnv)
 	defer d.Stop(t)
-	client := d.NewClientT(t)
-	defer client.Close()
-	ctx := context.Background()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
 	overlayName := "overlay1_" + t.Name()
-	overlayID := network.CreateNoError(ctx, t, client, overlayName,
-		network.WithCheckDuplicate(),
+	overlayID := network.CreateNoError(ctx, t, apiClient, overlayName,
 		network.WithDriver("overlay"),
 	)
 
@@ -100,31 +101,31 @@ func TestCreateServiceMultipleTimes(t *testing.T) {
 		swarm.ServiceWithNetwork(overlayName),
 	}
 
-	serviceID := swarm.CreateService(t, d, serviceSpec...)
-	poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, instances), swarm.ServicePoll)
+	serviceID := swarm.CreateService(ctx, t, d, serviceSpec...)
+	poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, instances), swarm.ServicePoll)
 
-	_, _, err := client.ServiceInspectWithRaw(context.Background(), serviceID, types.ServiceInspectOptions{})
+	_, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
 	assert.NilError(t, err)
 
-	err = client.ServiceRemove(context.Background(), serviceID)
+	_, err = apiClient.ServiceRemove(ctx, serviceID, client.ServiceRemoveOptions{})
 	assert.NilError(t, err)
 
-	poll.WaitOn(t, swarm.NoTasksForService(ctx, client, serviceID), swarm.ServicePoll)
+	poll.WaitOn(t, swarm.NoTasksForService(ctx, apiClient, serviceID), swarm.ServicePoll)
 
-	serviceID2 := swarm.CreateService(t, d, serviceSpec...)
-	poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID2, instances), swarm.ServicePoll)
+	serviceID2 := swarm.CreateService(ctx, t, d, serviceSpec...)
+	poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID2, instances), swarm.ServicePoll)
 
-	err = client.ServiceRemove(context.Background(), serviceID2)
+	_, err = apiClient.ServiceRemove(ctx, serviceID2, client.ServiceRemoveOptions{})
 	assert.NilError(t, err)
 
 	// we can't just wait on no tasks for the service, counter-intuitively.
-	// Tasks may briefly exist but not show up, if they are are in the process
+	// Tasks may briefly exist but not show up, if they are in the process
 	// of being deallocated. To avoid this case, we should retry network remove
-	// a few times, to give tasks time to be deallcoated
-	poll.WaitOn(t, swarm.NoTasksForService(ctx, client, serviceID2), swarm.ServicePoll)
+	// a few times, to give tasks time to be deallocated
+	poll.WaitOn(t, swarm.NoTasksForService(ctx, apiClient, serviceID2), swarm.ServicePoll)
 
-	for retry := 0; retry < 5; retry++ {
-		err = client.NetworkRemove(context.Background(), overlayID)
+	for range 5 {
+		_, err = apiClient.NetworkRemove(ctx, overlayID, client.NetworkRemoveOptions{})
 		// TODO(dperny): using strings.Contains for error checking is awful,
 		// but so is the fact that swarm functions don't return errdefs errors.
 		// I don't have time at this moment to fix the latter, so I guess I'll
@@ -146,37 +147,40 @@ func TestCreateServiceMultipleTimes(t *testing.T) {
 	}
 	assert.NilError(t, err)
 
-	poll.WaitOn(t, network.IsRemoved(context.Background(), client, overlayID), poll.WithTimeout(1*time.Minute), poll.WithDelay(10*time.Second))
+	poll.WaitOn(t, network.IsRemoved(ctx, apiClient, overlayID), poll.WithTimeout(1*time.Minute), poll.WithDelay(10*time.Second))
 }
 
 func TestCreateServiceConflict(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	defer setupTest(t)()
-	d := swarm.NewSwarm(t, testEnv)
+	ctx := setupTest(t)
+
+	d := swarm.NewSwarm(ctx, t, testEnv)
 	defer d.Stop(t)
 	c := d.NewClientT(t)
 	defer c.Close()
-	ctx := context.Background()
 
 	serviceName := "TestService_" + t.Name()
 	serviceSpec := []swarm.ServiceSpecOpt{
 		swarm.ServiceWithName(serviceName),
 	}
 
-	swarm.CreateService(t, d, serviceSpec...)
+	swarm.CreateService(ctx, t, d, serviceSpec...)
 
 	spec := swarm.CreateServiceSpec(t, serviceSpec...)
-	_, err := c.ServiceCreate(ctx, spec, types.ServiceCreateOptions{})
-	assert.Check(t, errdefs.IsConflict(err))
+	_, err := c.ServiceCreate(ctx, client.ServiceCreateOptions{
+		Spec: spec,
+	})
+	assert.Check(t, cerrdefs.IsConflict(err))
 	assert.ErrorContains(t, err, "service "+serviceName+" already exists")
 }
 
 func TestCreateServiceMaxReplicas(t *testing.T) {
-	defer setupTest(t)()
-	d := swarm.NewSwarm(t, testEnv)
+	ctx := setupTest(t)
+
+	d := swarm.NewSwarm(ctx, t, testEnv)
 	defer d.Stop(t)
-	client := d.NewClientT(t)
-	defer client.Close()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
 	var maxReplicas uint64 = 2
 	serviceSpec := []swarm.ServiceSpecOpt{
@@ -184,87 +188,36 @@ func TestCreateServiceMaxReplicas(t *testing.T) {
 		swarm.ServiceWithMaxReplicas(maxReplicas),
 	}
 
-	serviceID := swarm.CreateService(t, d, serviceSpec...)
-	poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, maxReplicas), swarm.ServicePoll)
+	serviceID := swarm.CreateService(ctx, t, d, serviceSpec...)
+	poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, maxReplicas), swarm.ServicePoll)
 
-	_, _, err := client.ServiceInspectWithRaw(context.Background(), serviceID, types.ServiceInspectOptions{})
+	_, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
 	assert.NilError(t, err)
-}
-
-func TestCreateWithDuplicateNetworkNames(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	defer setupTest(t)()
-	d := swarm.NewSwarm(t, testEnv)
-	defer d.Stop(t)
-	client := d.NewClientT(t)
-	defer client.Close()
-	ctx := context.Background()
-
-	name := "foo_" + t.Name()
-	n1 := network.CreateNoError(ctx, t, client, name, network.WithDriver("bridge"))
-	n2 := network.CreateNoError(ctx, t, client, name, network.WithDriver("bridge"))
-
-	// Duplicates with name but with different driver
-	n3 := network.CreateNoError(ctx, t, client, name, network.WithDriver("overlay"))
-
-	// Create Service with the same name
-	var instances uint64 = 1
-
-	serviceName := "top_" + t.Name()
-	serviceID := swarm.CreateService(t, d,
-		swarm.ServiceWithReplicas(instances),
-		swarm.ServiceWithName(serviceName),
-		swarm.ServiceWithNetwork(name),
-	)
-
-	poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, instances), swarm.ServicePoll)
-
-	resp, _, err := client.ServiceInspectWithRaw(ctx, serviceID, types.ServiceInspectOptions{})
-	assert.NilError(t, err)
-	assert.Check(t, is.Equal(n3, resp.Spec.TaskTemplate.Networks[0].Target))
-
-	// Remove Service, and wait for its tasks to be removed
-	err = client.ServiceRemove(ctx, serviceID)
-	assert.NilError(t, err)
-	poll.WaitOn(t, swarm.NoTasksForService(ctx, client, serviceID), swarm.ServicePoll)
-
-	// Remove networks
-	err = client.NetworkRemove(context.Background(), n3)
-	assert.NilError(t, err)
-
-	err = client.NetworkRemove(context.Background(), n2)
-	assert.NilError(t, err)
-
-	err = client.NetworkRemove(context.Background(), n1)
-	assert.NilError(t, err)
-
-	// Make sure networks have been destroyed.
-	poll.WaitOn(t, network.IsRemoved(context.Background(), client, n3), poll.WithTimeout(1*time.Minute), poll.WithDelay(10*time.Second))
-	poll.WaitOn(t, network.IsRemoved(context.Background(), client, n2), poll.WithTimeout(1*time.Minute), poll.WithDelay(10*time.Second))
-	poll.WaitOn(t, network.IsRemoved(context.Background(), client, n1), poll.WithTimeout(1*time.Minute), poll.WithDelay(10*time.Second))
 }
 
 func TestCreateServiceSecretFileMode(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	defer setupTest(t)()
-	d := swarm.NewSwarm(t, testEnv)
-	defer d.Stop(t)
-	client := d.NewClientT(t)
-	defer client.Close()
+	ctx := setupTest(t)
 
-	ctx := context.Background()
+	d := swarm.NewSwarm(ctx, t, testEnv)
+	defer d.Stop(t)
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
+
 	secretName := "TestSecret_" + t.Name()
-	secretResp, err := client.SecretCreate(ctx, swarmtypes.SecretSpec{
-		Annotations: swarmtypes.Annotations{
-			Name: secretName,
+	secretResp, err := apiClient.SecretCreate(ctx, client.SecretCreateOptions{
+		Spec: swarmtypes.SecretSpec{
+			Annotations: swarmtypes.Annotations{
+				Name: secretName,
+			},
+			Data: []byte("TESTSECRET"),
 		},
-		Data: []byte("TESTSECRET"),
 	})
 	assert.NilError(t, err)
 
 	var instances uint64 = 1
 	serviceName := "TestService_" + t.Name()
-	serviceID := swarm.CreateService(t, d,
+	serviceID := swarm.CreateService(ctx, t, d,
 		swarm.ServiceWithReplicas(instances),
 		swarm.ServiceWithName(serviceName),
 		swarm.ServiceWithCommand([]string{"/bin/sh", "-c", "ls -l /etc/secret && sleep inf"}),
@@ -273,55 +226,57 @@ func TestCreateServiceSecretFileMode(t *testing.T) {
 				Name: "/etc/secret",
 				UID:  "0",
 				GID:  "0",
-				Mode: 0777,
+				Mode: 0o777,
 			},
 			SecretID:   secretResp.ID,
 			SecretName: secretName,
 		}),
 	)
 
-	poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, instances), swarm.ServicePoll)
+	poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, instances), swarm.ServicePoll)
 
-	body, err := client.ServiceLogs(ctx, serviceID, types.ContainerLogsOptions{
+	res, err := apiClient.ServiceLogs(ctx, serviceID, client.ServiceLogsOptions{
 		Tail:       "1",
 		ShowStdout: true,
 	})
 	assert.NilError(t, err)
-	defer body.Close()
+	defer func() { _ = res.Close() }()
 
-	content, err := io.ReadAll(body)
+	content, err := io.ReadAll(res)
 	assert.NilError(t, err)
 	assert.Check(t, is.Contains(string(content), "-rwxrwxrwx"))
 
-	err = client.ServiceRemove(ctx, serviceID)
+	_, err = apiClient.ServiceRemove(ctx, serviceID, client.ServiceRemoveOptions{})
 	assert.NilError(t, err)
-	poll.WaitOn(t, swarm.NoTasksForService(ctx, client, serviceID), swarm.ServicePoll)
+	poll.WaitOn(t, swarm.NoTasksForService(ctx, apiClient, serviceID), swarm.ServicePoll)
 
-	err = client.SecretRemove(ctx, secretName)
+	_, err = apiClient.SecretRemove(ctx, secretName, client.SecretRemoveOptions{})
 	assert.NilError(t, err)
 }
 
 func TestCreateServiceConfigFileMode(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
-	defer setupTest(t)()
-	d := swarm.NewSwarm(t, testEnv)
-	defer d.Stop(t)
-	client := d.NewClientT(t)
-	defer client.Close()
+	ctx := setupTest(t)
 
-	ctx := context.Background()
+	d := swarm.NewSwarm(ctx, t, testEnv)
+	defer d.Stop(t)
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
+
 	configName := "TestConfig_" + t.Name()
-	configResp, err := client.ConfigCreate(ctx, swarmtypes.ConfigSpec{
-		Annotations: swarmtypes.Annotations{
-			Name: configName,
+	resp, err := apiClient.ConfigCreate(ctx, client.ConfigCreateOptions{
+		Spec: swarmtypes.ConfigSpec{
+			Annotations: swarmtypes.Annotations{
+				Name: configName,
+			},
+			Data: []byte("TESTCONFIG"),
 		},
-		Data: []byte("TESTCONFIG"),
 	})
 	assert.NilError(t, err)
 
 	var instances uint64 = 1
 	serviceName := "TestService_" + t.Name()
-	serviceID := swarm.CreateService(t, d,
+	serviceID := swarm.CreateService(ctx, t, d,
 		swarm.ServiceWithName(serviceName),
 		swarm.ServiceWithCommand([]string{"/bin/sh", "-c", "ls -l /etc/config && sleep inf"}),
 		swarm.ServiceWithReplicas(instances),
@@ -330,40 +285,40 @@ func TestCreateServiceConfigFileMode(t *testing.T) {
 				Name: "/etc/config",
 				UID:  "0",
 				GID:  "0",
-				Mode: 0777,
+				Mode: 0o777,
 			},
-			ConfigID:   configResp.ID,
+			ConfigID:   resp.ID,
 			ConfigName: configName,
 		}),
 	)
 
-	poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, instances))
+	poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, instances), swarm.ServicePoll)
 
-	body, err := client.ServiceLogs(ctx, serviceID, types.ContainerLogsOptions{
+	res, err := apiClient.ServiceLogs(ctx, serviceID, client.ServiceLogsOptions{
 		Tail:       "1",
 		ShowStdout: true,
 	})
 	assert.NilError(t, err)
-	defer body.Close()
+	defer func() { _ = res.Close() }()
 
-	content, err := io.ReadAll(body)
+	content, err := io.ReadAll(res)
 	assert.NilError(t, err)
 	assert.Check(t, is.Contains(string(content), "-rwxrwxrwx"))
 
-	err = client.ServiceRemove(ctx, serviceID)
+	_, err = apiClient.ServiceRemove(ctx, serviceID, client.ServiceRemoveOptions{})
 	assert.NilError(t, err)
-	poll.WaitOn(t, swarm.NoTasksForService(ctx, client, serviceID))
+	poll.WaitOn(t, swarm.NoTasksForService(ctx, apiClient, serviceID), swarm.ServicePoll)
 
-	err = client.ConfigRemove(ctx, configName)
+	_, err = apiClient.ConfigRemove(ctx, configName, client.ConfigRemoveOptions{})
 	assert.NilError(t, err)
 }
 
-// TestServiceCreateSysctls tests that a service created with sysctl options in
+// TestCreateServiceSysctls tests that a service created with sysctl options in
 // the ContainerSpec correctly applies those options.
 //
 // To test this, we're going to create a service with the sysctl option
 //
-//   {"net.ipv4.ip_nonlocal_bind": "0"}
+//	{"net.ipv4.ip_nonlocal_bind": "0"}
 //
 // We'll get the service's tasks to get the container ID, and then we'll
 // inspect the container. If the output of the container inspect contains the
@@ -381,35 +336,28 @@ func TestCreateServiceConfigFileMode(t *testing.T) {
 // confident won't be modified by the container runtime, and won't blow
 // anything up in the test environment
 func TestCreateServiceSysctls(t *testing.T) {
-	skip.If(
-		t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"),
-		"setting service sysctls is unsupported before api v1.40",
-	)
+	ctx := setupTest(t)
 
-	defer setupTest(t)()
-	d := swarm.NewSwarm(t, testEnv)
+	d := swarm.NewSwarm(ctx, t, testEnv)
 	defer d.Stop(t)
-	client := d.NewClientT(t)
-	defer client.Close()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
-	ctx := context.Background()
-
-	// run thie block twice, so that no matter what the default value of
+	// run this block twice, so that no matter what the default value of
 	// net.ipv4.ip_nonlocal_bind is, we can verify that setting the sysctl
 	// options works
 	for _, expected := range []string{"0", "1"} {
-
 		// store the map we're going to be using everywhere.
 		expectedSysctls := map[string]string{"net.ipv4.ip_nonlocal_bind": expected}
 
 		// Create the service with the sysctl options
 		var instances uint64 = 1
-		serviceID := swarm.CreateService(t, d,
+		serviceID := swarm.CreateService(ctx, t, d,
 			swarm.ServiceWithSysctls(expectedSysctls),
 		)
 
 		// wait for the service to converge to 1 running task as expected
-		poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, instances))
+		poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, instances), swarm.ServicePoll)
 
 		// we're going to check 3 things:
 		//
@@ -427,56 +375,48 @@ func TestCreateServiceSysctls(t *testing.T) {
 		// earlier version of this test had to get container logs and was much
 		// more complex)
 
-		// get all of the tasks of the service, so we can get the container
-		filter := filters.NewArgs()
-		filter.Add("service", serviceID)
-		tasks, err := client.TaskList(ctx, types.TaskListOptions{
-			Filters: filter,
+		// get all tasks of the service, so we can get the container
+		taskList, err := apiClient.TaskList(ctx, client.TaskListOptions{
+			Filters: make(client.Filters).Add("service", serviceID),
 		})
 		assert.NilError(t, err)
-		assert.Check(t, is.Equal(len(tasks), 1))
+		assert.Check(t, is.Equal(len(taskList.Items), 1))
 
 		// verify that the container has the sysctl option set
-		ctnr, err := client.ContainerInspect(ctx, tasks[0].Status.ContainerStatus.ContainerID)
+		inspect, err := apiClient.ContainerInspect(ctx, taskList.Items[0].Status.ContainerStatus.ContainerID, client.ContainerInspectOptions{})
 		assert.NilError(t, err)
-		assert.DeepEqual(t, ctnr.HostConfig.Sysctls, expectedSysctls)
+		assert.DeepEqual(t, inspect.Container.HostConfig.Sysctls, expectedSysctls)
 
 		// verify that the task has the sysctl option set in the task object
-		assert.DeepEqual(t, tasks[0].Spec.ContainerSpec.Sysctls, expectedSysctls)
+		assert.DeepEqual(t, taskList.Items[0].Spec.ContainerSpec.Sysctls, expectedSysctls)
 
 		// verify that the service also has the sysctl set in the spec.
-		service, _, err := client.ServiceInspectWithRaw(ctx, serviceID, types.ServiceInspectOptions{})
+		result, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
 		assert.NilError(t, err)
 		assert.DeepEqual(t,
-			service.Spec.TaskTemplate.ContainerSpec.Sysctls, expectedSysctls,
+			result.Service.Spec.TaskTemplate.ContainerSpec.Sysctls, expectedSysctls,
 		)
 	}
 }
 
-// TestServiceCreateCapabilities tests that a service created with capabilities options in
+// TestCreateServiceCapabilities tests that a service created with capabilities options in
 // the ContainerSpec correctly applies those options.
 //
 // To test this, we're going to create a service with the capabilities option
 //
-//   []string{"CAP_NET_RAW", "CAP_SYS_CHROOT"}
+//	[]string{"CAP_NET_RAW", "CAP_SYS_CHROOT"}
 //
 // We'll get the service's tasks to get the container ID, and then we'll
 // inspect the container. If the output of the container inspect contains the
 // capabilities option with the correct value, we can assume that the capabilities has been
 // plumbed correctly.
 func TestCreateServiceCapabilities(t *testing.T) {
-	skip.If(
-		t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.41"),
-		"setting service capabilities is unsupported before api v1.41",
-	)
+	ctx := setupTest(t)
 
-	defer setupTest(t)()
-	d := swarm.NewSwarm(t, testEnv)
+	d := swarm.NewSwarm(ctx, t, testEnv)
 	defer d.Stop(t)
-	client := d.NewClientT(t)
-	defer client.Close()
-
-	ctx := context.Background()
+	apiClient := d.NewClientT(t)
+	defer apiClient.Close()
 
 	// store the map we're going to be using everywhere.
 	capAdd := []string{"CAP_SYS_CHROOT"}
@@ -484,12 +424,12 @@ func TestCreateServiceCapabilities(t *testing.T) {
 
 	// Create the service with the capabilities options
 	var instances uint64 = 1
-	serviceID := swarm.CreateService(t, d,
+	serviceID := swarm.CreateService(ctx, t, d,
 		swarm.ServiceWithCapabilities(capAdd, capDrop),
 	)
 
 	// wait for the service to converge to 1 running task as expected
-	poll.WaitOn(t, swarm.RunningTasksCount(client, serviceID, instances))
+	poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, instances), swarm.ServicePoll)
 
 	// we're going to check 3 things:
 	//
@@ -505,28 +445,185 @@ func TestCreateServiceCapabilities(t *testing.T) {
 	// we know that the capabilities is plumbed correctly. everything below that
 	// level has been tested elsewhere.
 
-	// get all of the tasks of the service, so we can get the container
-	filter := filters.NewArgs()
-	filter.Add("service", serviceID)
-	tasks, err := client.TaskList(ctx, types.TaskListOptions{
-		Filters: filter,
+	// get all tasks of the service, so we can get the container
+	taskList, err := apiClient.TaskList(ctx, client.TaskListOptions{
+		Filters: make(client.Filters).Add("service", serviceID),
 	})
 	assert.NilError(t, err)
-	assert.Check(t, is.Equal(len(tasks), 1))
+	assert.Check(t, is.Equal(len(taskList.Items), 1))
 
 	// verify that the container has the capabilities option set
-	ctnr, err := client.ContainerInspect(ctx, tasks[0].Status.ContainerStatus.ContainerID)
+	inspect, err := apiClient.ContainerInspect(ctx, taskList.Items[0].Status.ContainerStatus.ContainerID, client.ContainerInspectOptions{})
 	assert.NilError(t, err)
-	assert.DeepEqual(t, ctnr.HostConfig.CapAdd, strslice.StrSlice(capAdd))
-	assert.DeepEqual(t, ctnr.HostConfig.CapDrop, strslice.StrSlice(capDrop))
+	assert.DeepEqual(t, inspect.Container.HostConfig.CapAdd, capAdd)
+	assert.DeepEqual(t, inspect.Container.HostConfig.CapDrop, capDrop)
 
 	// verify that the task has the capabilities option set in the task object
-	assert.DeepEqual(t, tasks[0].Spec.ContainerSpec.CapabilityAdd, capAdd)
-	assert.DeepEqual(t, tasks[0].Spec.ContainerSpec.CapabilityDrop, capDrop)
+	assert.DeepEqual(t, taskList.Items[0].Spec.ContainerSpec.CapabilityAdd, capAdd)
+	assert.DeepEqual(t, taskList.Items[0].Spec.ContainerSpec.CapabilityDrop, capDrop)
 
 	// verify that the service also has the capabilities set in the spec.
-	service, _, err := client.ServiceInspectWithRaw(ctx, serviceID, types.ServiceInspectOptions{})
+	result, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
 	assert.NilError(t, err)
-	assert.DeepEqual(t, service.Spec.TaskTemplate.ContainerSpec.CapabilityAdd, capAdd)
-	assert.DeepEqual(t, service.Spec.TaskTemplate.ContainerSpec.CapabilityDrop, capDrop)
+	assert.DeepEqual(t, result.Service.Spec.TaskTemplate.ContainerSpec.CapabilityAdd, capAdd)
+	assert.DeepEqual(t, result.Service.Spec.TaskTemplate.ContainerSpec.CapabilityDrop, capDrop)
+}
+
+func TestCreateServiceMemorySwap(t *testing.T) {
+	ctx := setupTest(t)
+	d := swarm.NewSwarm(ctx, t, testEnv)
+	defer d.Stop(t)
+	apiClient := d.NewClientT(t)
+
+	toPtr := func(v int64) *int64 { return &v }
+	tests := []struct {
+		testName string
+
+		swapSpec  *int64
+		limitSpec int64
+
+		// as reported by Docker
+		expectedDockerSwap int64
+	}{
+		{
+			testName: "default",
+		},
+		{
+			testName:           "memory-limit and memory-swap",
+			swapSpec:           toPtr(1 * units.MiB),
+			limitSpec:          20 * units.MiB,
+			expectedDockerSwap: 21 * units.MiB,
+		},
+		{
+			testName:           "memory-limit alone - should default to twice as much swap",
+			limitSpec:          20 * units.MiB,
+			expectedDockerSwap: 40 * units.MiB,
+		},
+		{
+			testName:           "memory-limit and zero memory-swap",
+			swapSpec:           toPtr(0),
+			limitSpec:          20 * units.MiB,
+			expectedDockerSwap: 20 * units.MiB,
+		},
+		{
+			testName:           "memory-limit and unlimited memory-swap",
+			swapSpec:           toPtr(-1),
+			limitSpec:          20 * units.MiB,
+			expectedDockerSwap: -1,
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run("service create with "+testCase.testName, func(t *testing.T) {
+			serviceID := swarm.CreateService(
+				ctx, t, d,
+				swarm.ServiceWithMemorySwap(testCase.swapSpec, testCase.limitSpec),
+			)
+			poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, 1), swarm.ServicePoll)
+
+			inspect, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
+			assert.NilError(t, err)
+
+			filter := make(client.Filters)
+			filter.Add("service", serviceID)
+			tasks, err := apiClient.TaskList(ctx, client.TaskListOptions{
+				Filters: filter,
+			})
+			assert.NilError(t, err)
+			assert.Check(t, is.Equal(len(tasks.Items), 1))
+			task := tasks.Items[0]
+
+			if testCase.swapSpec == nil {
+				assert.Check(t, is.Nil(task.Spec.Resources.SwapBytes))
+				assert.Check(t, is.Nil(inspect.Service.Spec.TaskTemplate.Resources.SwapBytes))
+			} else {
+				assert.Equal(t, *testCase.swapSpec, *task.Spec.Resources.SwapBytes)
+				assert.Equal(t, *testCase.swapSpec, *inspect.Service.Spec.TaskTemplate.Resources.SwapBytes)
+			}
+
+			// if the host supports it (see https://github.com/moby/moby/blob/v17.03.2-ce/daemon/daemon_unix.go#L290-L294)
+			// then check that the swap option is set on the container, and properly reported by the group FS as well
+			if testEnv.DaemonInfo.SwapLimit {
+				ctr, err := apiClient.ContainerInspect(ctx, task.Status.ContainerStatus.ContainerID, client.ContainerInspectOptions{})
+				assert.NilError(t, err)
+				assert.Equal(t, testCase.expectedDockerSwap, ctr.Container.HostConfig.Resources.MemorySwap)
+			}
+		})
+	}
+
+	t.Run("cannot create a service with a memory swap option without setting a memory limit", func(t *testing.T) {
+		serviceOpts := func(spec *swarmtypes.ServiceSpec) {
+			if spec.TaskTemplate.Resources == nil {
+				spec.TaskTemplate.Resources = &swarmtypes.ResourceRequirements{}
+			}
+			spec.TaskTemplate.Resources.SwapBytes = toPtr(10 * units.MiB)
+		}
+
+		spec := swarm.CreateServiceSpec(t, serviceOpts)
+		_, err := apiClient.ServiceCreate(t.Context(), client.ServiceCreateOptions{
+			Spec: spec,
+		})
+
+		assert.ErrorContains(t, err, "memory swap provided, but no memory-limit was set")
+	})
+}
+
+func TestCreateServiceMemorySwappiness(t *testing.T) {
+	ctx := setupTest(t)
+	d := swarm.NewSwarm(ctx, t, testEnv)
+	defer d.Stop(t)
+	apiClient := d.NewClientT(t)
+
+	toPtr := func(v int64) *int64 { return &v }
+
+	tests := []struct {
+		testName       string
+		swappinessSpec *int64
+	}{
+		{testName: "default"},
+		{testName: "zero memory-swappiness", swappinessSpec: toPtr(0)},
+		{testName: "memory-swappiness", swappinessSpec: toPtr(28)},
+	}
+
+	for _, testCase := range tests {
+		t.Run("service create with "+testCase.testName, func(t *testing.T) {
+			serviceID := swarm.CreateService(
+				ctx, t, d,
+				swarm.ServiceWithMemorySwappiness(testCase.swappinessSpec),
+			)
+			poll.WaitOn(t, swarm.RunningTasksCount(ctx, apiClient, serviceID, 1), swarm.ServicePoll)
+
+			filter := make(client.Filters)
+			filter.Add("service", serviceID)
+			tasks, err := apiClient.TaskList(ctx, client.TaskListOptions{
+				Filters: filter,
+			})
+			assert.NilError(t, err)
+			assert.Check(t, is.Equal(len(tasks.Items), 1))
+			task := tasks.Items[0]
+
+			inspect, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
+			assert.NilError(t, err)
+
+			// An earlier version of this test also inspected the container
+			// created by Swarm to ensure that MemorySwappiness was set on its
+			// HostConfig. However, on systems that do not support
+			// MemorySwappiness (the Github Actions platform is one, in late
+			// 2025), that field in the HostConfig is nilled out, and a warning
+			// is returned. Swarm doesn't do anything with the warning, so the
+			// setting is silently ignored. Getting the raw SysInfo can show if
+			// MemorySwappiness is supported, but that field is not present in
+			// a regular Info API call, and so is not part of
+			// testEnv.DaemonInfo and cannot be checked (easily) here. So,
+			// ultimately, we'll skip that check in the integration test.
+
+			if testCase.swappinessSpec == nil {
+				assert.Check(t, is.Nil(task.Spec.Resources.MemorySwappiness))
+				assert.Check(t, is.Nil(inspect.Service.Spec.TaskTemplate.Resources.MemorySwappiness))
+			} else {
+				assert.Equal(t, *testCase.swappinessSpec, *task.Spec.Resources.MemorySwappiness)
+				assert.Equal(t, *testCase.swappinessSpec, *inspect.Service.Spec.TaskTemplate.Resources.MemorySwappiness)
+			}
+		})
+	}
 }

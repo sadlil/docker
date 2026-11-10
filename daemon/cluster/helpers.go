@@ -1,11 +1,12 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/docker/docker/errdefs"
-	swarmapi "github.com/docker/swarmkit/api"
+	"github.com/gogo/protobuf/types"
+	"github.com/moby/moby/v2/errdefs"
+	swarmapi "github.com/moby/swarmkit/v2/api"
 	"github.com/pkg/errors"
 )
 
@@ -211,9 +212,9 @@ func getConfig(ctx context.Context, c swarmapi.ControlClient, input string) (*sw
 	return rl.Configs[0], nil
 }
 
-func getNetwork(ctx context.Context, c swarmapi.ControlClient, input string) (*swarmapi.Network, error) {
+func getNetwork(ctx context.Context, c swarmapi.ControlClient, input string, appdata *types.Any) (*swarmapi.Network, error) {
 	// GetNetwork to match via full ID.
-	if rg, err := c.GetNetwork(ctx, &swarmapi.GetNetworkRequest{NetworkID: input}); err == nil {
+	if rg, err := c.GetNetwork(ctx, &swarmapi.GetNetworkRequest{NetworkID: input, Appdata: appdata}); err == nil {
 		return rg.Network, nil
 	}
 
@@ -222,12 +223,14 @@ func getNetwork(ctx context.Context, c swarmapi.ControlClient, input string) (*s
 		Filters: &swarmapi.ListNetworksRequest_Filters{
 			Names: []string{input},
 		},
+		Appdata: appdata,
 	})
 	if err != nil || len(rl.Networks) == 0 {
 		rl, err = c.ListNetworks(ctx, &swarmapi.ListNetworksRequest{
 			Filters: &swarmapi.ListNetworksRequest_Filters{
 				IDPrefixes: []string{input},
 			},
+			Appdata: appdata,
 		})
 	}
 	if err != nil {
@@ -243,4 +246,40 @@ func getNetwork(ctx context.Context, c swarmapi.ControlClient, input string) (*s
 	}
 
 	return rl.Networks[0], nil
+}
+
+func getVolume(ctx context.Context, c swarmapi.ControlClient, input string) (*swarmapi.Volume, error) {
+	// GetVolume to match via full ID
+	if v, err := c.GetVolume(ctx, &swarmapi.GetVolumeRequest{VolumeID: input}); err == nil {
+		return v.Volume, nil
+	}
+
+	// If any error (including NotFound), list volumes to match via ID prefix
+	// and full name
+	resp, err := c.ListVolumes(ctx, &swarmapi.ListVolumesRequest{
+		Filters: &swarmapi.ListVolumesRequest_Filters{
+			Names: []string{input},
+		},
+	})
+
+	if err != nil || len(resp.Volumes) == 0 {
+		resp, err = c.ListVolumes(ctx, &swarmapi.ListVolumesRequest{
+			Filters: &swarmapi.ListVolumesRequest_Filters{
+				IDPrefixes: []string{input},
+			},
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if len(resp.Volumes) == 0 {
+		return nil, errdefs.NotFound(fmt.Errorf("volume %s not found", input))
+	}
+
+	if l := len(resp.Volumes); l > 1 {
+		return nil, errdefs.InvalidParameter(fmt.Errorf("volume %s is ambiguous (%d matches found)", input, l))
+	}
+
+	return resp.Volumes[0], nil
 }

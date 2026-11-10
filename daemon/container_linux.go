@@ -1,28 +1,33 @@
 //go:build !windows
-// +build !windows
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/errdefs"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/errdefs"
 )
 
 func (daemon *Daemon) saveAppArmorConfig(container *container.Container) error {
-	container.AppArmorProfile = "" // we don't care about the previous value.
+	container.AppArmorProfile = "" // reset; parseSecurityOpt re-derives it from HostConfig.SecurityOpt.
 
-	if !daemon.RawSysInfo().AppArmor {
+	sysInfo, err := daemon.RawSysInfo()
+	if err != nil {
+		return errdefs.System(err)
+	}
+	if !sysInfo.AppArmor {
 		return nil // if apparmor is disabled there is nothing to do here.
 	}
 
-	if err := parseSecurityOpt(container, container.HostConfig); err != nil {
+	if err := parseSecurityOpt(&container.SecurityOptions, container.HostConfig); err != nil {
 		return errdefs.InvalidParameter(err)
 	}
 
-	if container.HostConfig.Privileged {
-		container.AppArmorProfile = unconfinedAppArmorProfile
-	} else if container.AppArmorProfile == "" {
-		container.AppArmorProfile = defaultAppArmorProfile
+	if container.AppArmorProfile == "" {
+		if container.HostConfig.Privileged {
+			container.AppArmorProfile = unconfinedAppArmorProfile
+		} else {
+			container.AppArmorProfile = defaultAppArmorProfile
+		}
 	}
 	return nil
 }

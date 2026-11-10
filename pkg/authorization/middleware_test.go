@@ -1,4 +1,4 @@
-package authorization // import "github.com/docker/docker/pkg/authorization"
+package authorization
 
 import (
 	"net/http"
@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/moby/moby/v2/pkg/plugingetter"
 	"gotest.tools/v3/assert"
 )
 
@@ -43,7 +43,6 @@ func TestNewResponseModifier(t *testing.T) {
 	if recorder.Header().Get("H1") != "V1" {
 		t.Fatalf("Header value must exists %s", recorder.Header().Get("H1"))
 	}
-
 }
 
 func setAuthzPlugins(m *Middleware, plugins []Plugin) {

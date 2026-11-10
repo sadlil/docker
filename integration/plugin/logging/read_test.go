@@ -2,17 +2,19 @@ package logging
 
 import (
 	"bytes"
-	"context"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	testContainer "github.com/moby/moby/v2/integration/internal/container"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
 	"gotest.tools/v3/assert"
+	"gotest.tools/v3/poll"
 )
 
 // TestReadPluginNoRead tests that reads are supported even if the plugin isn't capable.
@@ -21,17 +23,18 @@ func TestReadPluginNoRead(t *testing.T) {
 		t.Skip("no unix domain sockets on Windows")
 	}
 	t.Parallel()
+
+	ctx := testutil.StartSpan(baseContext, t)
+
 	d := daemon.New(t)
-	d.StartWithBusybox(t, "--iptables=false")
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
 
-	client, err := d.NewClient()
+	apiclient, err := d.NewClient()
 	assert.Assert(t, err)
-	createPlugin(t, client, "test", "discard", asLogDriver)
+	createPlugin(ctx, t, apiclient, "test", "discard", asLogDriver)
 
-	ctx := context.Background()
-
-	err = client.PluginEnable(ctx, "test", types.PluginEnableOptions{Timeout: 30})
+	_, err = apiclient.PluginEnable(ctx, "test", client.PluginEnableOptions{Timeout: 30})
 	assert.Check(t, err)
 	d.Stop(t)
 
@@ -48,22 +51,23 @@ func TestReadPluginNoRead(t *testing.T) {
 		"explicitly enabled caching": {[]string{"--log-opt=cache-disabled=false"}, true},
 	} {
 		t.Run(desc, func(t *testing.T) {
-			d.Start(t, append([]string{"--iptables=false"}, test.dOpts...)...)
+			ctx := testutil.StartSpan(ctx, t)
+			d.Start(t, append([]string{"--iptables=false", "--ip6tables=false"}, test.dOpts...)...)
 			defer d.Stop(t)
-			c, err := client.ContainerCreate(ctx,
-				cfg,
-				&container.HostConfig{LogConfig: container.LogConfig{Type: "test"}},
-				nil,
-				nil,
-				"",
-			)
+			c, err := apiclient.ContainerCreate(ctx, client.ContainerCreateOptions{
+				Config: cfg,
+				HostConfig: &container.HostConfig{
+					LogConfig: container.LogConfig{Type: "test"},
+				},
+			})
 			assert.Assert(t, err)
-			defer client.ContainerRemove(ctx, c.ID, types.ContainerRemoveOptions{Force: true})
+			defer apiclient.ContainerRemove(ctx, c.ID, client.ContainerRemoveOptions{Force: true})
 
-			err = client.ContainerStart(ctx, c.ID, types.ContainerStartOptions{})
+			_, err = apiclient.ContainerStart(ctx, c.ID, client.ContainerStartOptions{})
 			assert.Assert(t, err)
 
-			logs, err := client.ContainerLogs(ctx, c.ID, types.ContainerLogsOptions{ShowStdout: true})
+			poll.WaitOn(t, testContainer.IsStopped(ctx, apiclient, c.ID))
+			logs, err := apiclient.ContainerLogs(ctx, c.ID, client.ContainerLogsOptions{ShowStdout: true})
 			if !test.logsSupported {
 				assert.Assert(t, err != nil)
 				return
@@ -88,5 +92,4 @@ func TestReadPluginNoRead(t *testing.T) {
 			assert.Assert(t, strings.TrimSpace(buf.String()) == "hello world", buf.Bytes())
 		})
 	}
-
 }

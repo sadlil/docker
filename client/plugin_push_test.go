@@ -1,52 +1,47 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/registry"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestPluginPushError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	_, err := client.PluginPush(context.Background(), "plugin_name", "")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.PluginPush(t.Context(), "plugin_name", PluginPushOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.PluginPush(t.Context(), "", PluginPushOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.PluginPush(t.Context(), "    ", PluginPushOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestPluginPush(t *testing.T) {
-	expectedURL := "/plugins/plugin_name"
+	const expectedURL = "/plugins/plugin_name"
 
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
-			if req.Method != http.MethodPost {
-				return nil, fmt.Errorf("expected POST method, got %s", req.Method)
-			}
-			auth := req.Header.Get("X-Registry-Auth")
-			if auth != "authtoken" {
-				return nil, fmt.Errorf("Invalid auth header : expected 'authtoken', got %s", auth)
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader([]byte(""))),
-			}, nil
-		}),
-	}
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+			return nil, err
+		}
+		auth := req.Header.Get(registry.AuthHeader)
+		if auth != "authtoken" {
+			return nil, fmt.Errorf("invalid auth header: expected 'authtoken', got %s", auth)
+		}
+		return mockResponse(http.StatusOK, nil, "")(req)
+	}))
+	assert.NilError(t, err)
 
-	_, err := client.PluginPush(context.Background(), "plugin_name", "authtoken")
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, err = client.PluginPush(t.Context(), "plugin_name", PluginPushOptions{RegistryAuth: "authtoken"})
+	assert.NilError(t, err)
 }

@@ -1,14 +1,15 @@
 //go:build linux
-// +build linux
 
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
 )
 
@@ -37,8 +38,8 @@ func (s *DockerDaemonSuite) TestDaemonRestartWithPluginEnabled(c *testing.T) {
 	if err != nil {
 		c.Fatalf("Could not list plugins: %v %s", err, out)
 	}
-	assert.Assert(c, strings.Contains(out, pName))
-	assert.Assert(c, strings.Contains(out, "true"))
+	assert.Assert(c, is.Contains(out, pName))
+	assert.Assert(c, is.Contains(out, "true"))
 }
 
 // TestDaemonRestartWithPluginDisabled tests state restore for a disabled plugin
@@ -63,8 +64,8 @@ func (s *DockerDaemonSuite) TestDaemonRestartWithPluginDisabled(c *testing.T) {
 	if err != nil {
 		c.Fatalf("Could not list plugins: %v %s", err, out)
 	}
-	assert.Assert(c, strings.Contains(out, pName))
-	assert.Assert(c, strings.Contains(out, "false"))
+	assert.Assert(c, is.Contains(out, pName))
+	assert.Assert(c, is.Contains(out, "false"))
 }
 
 // TestDaemonKillLiveRestoreWithPlugins SIGKILLs daemon started with --live-restore.
@@ -143,7 +144,7 @@ func (s *DockerDaemonSuite) TestDaemonShutdownWithPlugins(c *testing.T) {
 	}
 
 	for {
-		if err := unix.Kill(s.d.Pid(), 0); err == unix.ESRCH {
+		if err := unix.Kill(s.d.Pid(), 0); errors.Is(err, unix.ESRCH) {
 			break
 		}
 	}
@@ -221,8 +222,8 @@ func (s *DockerDaemonSuite) TestVolumePlugin(c *testing.T) {
 	if err != nil {
 		c.Fatalf("Could not list volume: %v %s", err, out)
 	}
-	assert.Assert(c, strings.Contains(out, volName))
-	assert.Assert(c, strings.Contains(out, pName))
+	assert.Assert(c, is.Contains(out, volName))
+	assert.Assert(c, is.Contains(out, pName))
 
 	out, err = s.d.Cmd("run", "--rm", "-v", volName+":"+destDir, "busybox", "touch", destDir+destFile)
 	assert.NilError(c, err, out)
@@ -238,7 +239,7 @@ func (s *DockerDaemonSuite) TestPluginVolumeRemoveOnRestart(c *testing.T) {
 
 	out, err := s.d.Cmd("plugin", "install", "--grant-all-permissions", pName)
 	assert.NilError(c, err, out)
-	assert.Assert(c, strings.Contains(out, pName))
+	assert.Assert(c, is.Contains(out, pName))
 
 	out, err = s.d.Cmd("volume", "create", "--driver", pName, "test")
 	assert.NilError(c, err, out)
@@ -247,7 +248,7 @@ func (s *DockerDaemonSuite) TestPluginVolumeRemoveOnRestart(c *testing.T) {
 
 	out, err = s.d.Cmd("plugin", "disable", pName)
 	assert.ErrorContains(c, err, "", out)
-	assert.Assert(c, strings.Contains(out, "in use"))
+	assert.Assert(c, is.Contains(out, "in use"))
 
 	out, err = s.d.Cmd("volume", "rm", "test")
 	assert.NilError(c, err, out)
@@ -279,12 +280,12 @@ func (s *DockerDaemonSuite) TestPluginListFilterEnabled(c *testing.T) {
 
 	out, err = s.d.Cmd("plugin", "ls", "--filter", "enabled=false")
 	assert.NilError(c, err, out)
-	assert.Assert(c, strings.Contains(out, pName))
-	assert.Assert(c, strings.Contains(out, "false"))
+	assert.Assert(c, is.Contains(out, pName))
+	assert.Assert(c, is.Contains(out, "false"))
 
 	out, err = s.d.Cmd("plugin", "ls")
 	assert.NilError(c, err, out)
-	assert.Assert(c, strings.Contains(out, pName))
+	assert.Assert(c, is.Contains(out, pName))
 }
 
 func (s *DockerDaemonSuite) TestPluginListFilterCapability(c *testing.T) {
@@ -303,7 +304,7 @@ func (s *DockerDaemonSuite) TestPluginListFilterCapability(c *testing.T) {
 
 	out, err = s.d.Cmd("plugin", "ls", "--filter", "capability=volumedriver")
 	assert.NilError(c, err, out)
-	assert.Assert(c, strings.Contains(out, pName))
+	assert.Assert(c, is.Contains(out, pName))
 
 	out, err = s.d.Cmd("plugin", "ls", "--filter", "capability=authz")
 	assert.NilError(c, err, out)
@@ -311,5 +312,5 @@ func (s *DockerDaemonSuite) TestPluginListFilterCapability(c *testing.T) {
 
 	out, err = s.d.Cmd("plugin", "ls")
 	assert.NilError(c, err, out)
-	assert.Assert(c, strings.Contains(out, pName))
+	assert.Assert(c, is.Contains(out, pName))
 }

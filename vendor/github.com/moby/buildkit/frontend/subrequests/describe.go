@@ -3,6 +3,10 @@ package subrequests
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"text/tabwriter"
 
 	"github.com/moby/buildkit/frontend/gateway/client"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
@@ -18,9 +22,8 @@ var SubrequestsDescribeDefinition = Request{
 	Type:        TypeRPC,
 	Description: "List available subrequest types",
 	Metadata: []Named{
-		{
-			Name: "result.json",
-		},
+		{Name: "result.json"},
+		{Name: "result.txt"},
 	},
 }
 
@@ -52,7 +55,7 @@ func Describe(ctx context.Context, c client.Client) ([]Request, error) {
 
 	dt, ok := res.Metadata["result.json"]
 	if !ok {
-		return nil, errors.Errorf("no result.json metadata in response")
+		return nil, errors.New("no result.json metadata in response")
 	}
 
 	var reqs []Request
@@ -60,4 +63,19 @@ func Describe(ctx context.Context, c client.Client) ([]Request, error) {
 		return nil, errors.Wrap(err, "failed to parse describe result")
 	}
 	return reqs, nil
+}
+
+func PrintDescribe(dt []byte, w io.Writer) error {
+	var d []Request
+	if err := json.Unmarshal(dt, &d); err != nil {
+		return err
+	}
+
+	tw := tabwriter.NewWriter(w, 0, 0, 1, ' ', 0)
+	fmt.Fprint(tw, "NAME\tVERSION\tDESCRIPTION\n")
+
+	for _, r := range d {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", strings.TrimPrefix(r.Name, "frontend."), r.Version, r.Description)
+	}
+	return tw.Flush()
 }

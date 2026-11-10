@@ -1,82 +1,63 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
+	"errors"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
-	"github.com/pkg/errors"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/volume"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestVolumeInspectError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	_, err := client.VolumeInspect(context.Background(), "nothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.VolumeInspect(t.Context(), "nothing", VolumeInspectOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestVolumeInspectNotFound(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusNotFound, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusNotFound, "Server error")))
+	assert.NilError(t, err)
 
-	_, err := client.VolumeInspect(context.Background(), "unknown")
-	assert.Check(t, IsErrNotFound(err))
+	_, err = client.VolumeInspect(t.Context(), "unknown", VolumeInspectOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsNotFound))
 }
 
 func TestVolumeInspectWithEmptyID(t *testing.T) {
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			return nil, errors.New("should not make request")
-		}),
-	}
-	_, _, err := client.VolumeInspectWithRaw(context.Background(), "")
-	if !IsErrNotFound(err) {
-		t.Fatalf("Expected NotFoundError, got %v", err)
-	}
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("should not make request")
+	}))
+	assert.NilError(t, err)
+	_, err = client.VolumeInspect(t.Context(), "", VolumeInspectOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.VolumeInspect(t.Context(), "    ", VolumeInspectOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestVolumeInspect(t *testing.T) {
-	expectedURL := "/volumes/volume_id"
-	expected := types.Volume{
+	const expectedURL = "/volumes/volume_id"
+	expected := volume.Volume{
 		Name:       "name",
 		Driver:     "driver",
 		Mountpoint: "mountpoint",
 	}
 
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
-			if req.Method != http.MethodGet {
-				return nil, fmt.Errorf("expected GET method, got %s", req.Method)
-			}
-			content, err := json.Marshal(expected)
-			if err != nil {
-				return nil, err
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(content)),
-			}, nil
-		}),
-	}
-
-	volume, err := client.VolumeInspect(context.Background(), "volume_id")
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+			return nil, err
+		}
+		return mockJSONResponse(http.StatusOK, nil, expected)(req)
+	}))
 	assert.NilError(t, err)
-	assert.Check(t, is.DeepEqual(expected, volume))
+
+	result, err := client.VolumeInspect(t.Context(), "volume_id", VolumeInspectOptions{})
+	assert.NilError(t, err)
+	assert.Check(t, is.DeepEqual(expected, result.Volume))
 }

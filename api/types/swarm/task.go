@@ -1,9 +1,7 @@
-package swarm // import "github.com/docker/docker/api/types/swarm"
+package swarm
 
 import (
 	"time"
-
-	"github.com/docker/docker/api/types/swarm/runtime"
 )
 
 // TaskState represents the state of a task.
@@ -62,6 +60,11 @@ type Task struct {
 	// used to determine which Tasks belong to which run of the job. This field
 	// is absent if the Service mode is Replicated or Global.
 	JobIteration *Version `json:",omitempty"`
+
+	// Volumes is the list of VolumeAttachments for this task. It specifies
+	// which particular volumes are to be used by this particular task, and
+	// fulfilling what mounts in the spec.
+	Volumes []VolumeAttachment
 }
 
 // TaskSpec represents the spec of a task.
@@ -71,7 +74,7 @@ type TaskSpec struct {
 	// NetworkAttachmentSpec is used if the `Runtime` field is set to
 	// `attachment`.
 	ContainerSpec         *ContainerSpec         `json:",omitempty"`
-	PluginSpec            *runtime.PluginSpec    `json:",omitempty"`
+	PluginSpec            *RuntimeSpec           `json:",omitempty"`
 	NetworkAttachmentSpec *NetworkAttachmentSpec `json:",omitempty"`
 
 	Resources     *ResourceRequirements     `json:",omitempty"`
@@ -106,14 +109,14 @@ type Limit struct {
 	Pids        int64 `json:",omitempty"`
 }
 
-// GenericResource represents a "user defined" resource which can
+// GenericResource represents a "user-defined" resource which can
 // be either an integer (e.g: SSD=3) or a string (e.g: SSD=sda1)
 type GenericResource struct {
 	NamedResourceSpec    *NamedGenericResource    `json:",omitempty"`
 	DiscreteResourceSpec *DiscreteGenericResource `json:",omitempty"`
 }
 
-// NamedGenericResource represents a "user defined" resource which is defined
+// NamedGenericResource represents a "user-defined" resource which is defined
 // as a string.
 // "Kind" is used to describe the Kind of a resource (e.g: "GPU", "FPGA", "SSD", ...)
 // Value is used to identify the resource (GPU="UUID-1", FPGA="/dev/sdb5", ...)
@@ -122,7 +125,7 @@ type NamedGenericResource struct {
 	Value string `json:",omitempty"`
 }
 
-// DiscreteGenericResource represents a "user defined" resource which is defined
+// DiscreteGenericResource represents a "user-defined" resource which is defined
 // as an integer
 // "Kind" is used to describe the Kind of a resource (e.g: "GPU", "FPGA", "SSD", ...)
 // Value is used to count the resource (SSD=5, HDD=3, ...)
@@ -135,6 +138,17 @@ type DiscreteGenericResource struct {
 type ResourceRequirements struct {
 	Limits       *Limit     `json:",omitempty"`
 	Reservations *Resources `json:",omitempty"`
+
+	// Amount of swap in bytes - can only be used together with a memory limit
+	// -1 means unlimited
+	// a null pointer keeps the default behaviour of granting twice the memory
+	// amount in swap
+	SwapBytes *int64 `json:"SwapBytes,omitzero"`
+
+	// Tune container memory swappiness (0 to 100) - if not specified, defaults
+	// to the container OS's default - generally 60, or the value predefined in
+	// the image; set to -1 to unset a previously set value
+	MemorySwappiness *int64 `json:"MemorySwappiness,omitzero"`
 }
 
 // Placement represents orchestration parameters.
@@ -203,4 +217,18 @@ type ContainerStatus struct {
 // service has published host ports
 type PortStatus struct {
 	Ports []PortConfig `json:",omitempty"`
+}
+
+// VolumeAttachment contains the associating a Volume to a Task.
+type VolumeAttachment struct {
+	// ID is the Swarmkit ID of the Volume. This is not the CSI VolumeId.
+	ID string `json:",omitempty"`
+
+	// Source, together with Target, indicates the Mount, as specified in the
+	// ContainerSpec, that this volume fulfills.
+	Source string `json:",omitempty"`
+
+	// Target, together with Source, indicates the Mount, as specified
+	// in the ContainerSpec, that this volume fulfills.
+	Target string `json:",omitempty"`
 }

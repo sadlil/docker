@@ -1,105 +1,133 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/swarm"
+	"github.com/distribution/reference"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/api/types/swarm"
 	"github.com/opencontainers/go-digest"
-	"github.com/pkg/errors"
 )
 
+// ServiceCreateOptions contains the options to use when creating a service.
+type ServiceCreateOptions struct {
+	Spec swarm.ServiceSpec
+
+	// EncodedRegistryAuth is the encoded registry authorization credentials to
+	// use when updating the service.
+	//
+	// This field follows the format of the X-Registry-Auth header.
+	EncodedRegistryAuth string
+
+	// QueryRegistry indicates whether the service update requires
+	// contacting a registry. A registry may be contacted to retrieve
+	// the image digest and manifest, which in turn can be used to update
+	// platform or other information about the service.
+	QueryRegistry bool
+}
+
+// ServiceCreateResult represents the result of creating a service.
+type ServiceCreateResult struct {
+	// ID is the ID of the created service.
+	ID string
+
+	// Warnings is a list of warnings that occurred during service creation.
+	Warnings []string
+}
+
 // ServiceCreate creates a new service.
-func (cli *Client) ServiceCreate(ctx context.Context, service swarm.ServiceSpec, options types.ServiceCreateOptions) (types.ServiceCreateResponse, error) {
-	var response types.ServiceCreateResponse
-	headers := map[string][]string{
-		"version": {cli.version},
-	}
-
-	if options.EncodedRegistryAuth != "" {
-		headers["X-Registry-Auth"] = []string{options.EncodedRegistryAuth}
-	}
-
+func (cli *Client) ServiceCreate(ctx context.Context, options ServiceCreateOptions) (ServiceCreateResult, error) {
 	// Make sure containerSpec is not nil when no runtime is set or the runtime is set to container
-	if service.TaskTemplate.ContainerSpec == nil && (service.TaskTemplate.Runtime == "" || service.TaskTemplate.Runtime == swarm.RuntimeContainer) {
-		service.TaskTemplate.ContainerSpec = &swarm.ContainerSpec{}
+	if options.Spec.TaskTemplate.ContainerSpec == nil && (options.Spec.TaskTemplate.Runtime == "" || options.Spec.TaskTemplate.Runtime == swarm.RuntimeContainer) {
+		options.Spec.TaskTemplate.ContainerSpec = &swarm.ContainerSpec{}
 	}
 
-	if err := validateServiceSpec(service); err != nil {
-		return response, err
+	if err := validateServiceSpec(options.Spec); err != nil {
+		return ServiceCreateResult{}, err
 	}
 
 	// ensure that the image is tagged
-	var resolveWarning string
+	var warnings []string
 	switch {
-	case service.TaskTemplate.ContainerSpec != nil:
-		if taggedImg := imageWithTagString(service.TaskTemplate.ContainerSpec.Image); taggedImg != "" {
-			service.TaskTemplate.ContainerSpec.Image = taggedImg
+	case options.Spec.TaskTemplate.ContainerSpec != nil:
+		if taggedImg := imageWithTagString(options.Spec.TaskTemplate.ContainerSpec.Image); taggedImg != "" {
+			options.Spec.TaskTemplate.ContainerSpec.Image = taggedImg
 		}
 		if options.QueryRegistry {
-			resolveWarning = resolveContainerSpecImage(ctx, cli, &service.TaskTemplate, options.EncodedRegistryAuth)
+			if warning := resolveContainerSpecImage(ctx, cli, &options.Spec.TaskTemplate, options.EncodedRegistryAuth); warning != "" {
+				warnings = append(warnings, warning)
+			}
 		}
-	case service.TaskTemplate.PluginSpec != nil:
-		if taggedImg := imageWithTagString(service.TaskTemplate.PluginSpec.Remote); taggedImg != "" {
-			service.TaskTemplate.PluginSpec.Remote = taggedImg
+	case options.Spec.TaskTemplate.PluginSpec != nil:
+		if taggedImg := imageWithTagString(options.Spec.TaskTemplate.PluginSpec.Remote); taggedImg != "" {
+			options.Spec.TaskTemplate.PluginSpec.Remote = taggedImg
 		}
 		if options.QueryRegistry {
-			resolveWarning = resolvePluginSpecRemote(ctx, cli, &service.TaskTemplate, options.EncodedRegistryAuth)
+			if warning := resolvePluginSpecRemote(ctx, cli, &options.Spec.TaskTemplate, options.EncodedRegistryAuth); warning != "" {
+				warnings = append(warnings, warning)
+			}
 		}
 	}
 
-	resp, err := cli.post(ctx, "/services/create", nil, service, headers)
+	headers := http.Header{}
+	if options.EncodedRegistryAuth != "" {
+		headers[registry.AuthHeader] = []string{options.EncodedRegistryAuth}
+	}
+	resp, err := cli.post(ctx, "/services/create", nil, headers, options.Spec)
 	defer ensureReaderClosed(resp)
 	if err != nil {
-		return response, err
+		return ServiceCreateResult{}, err
 	}
 
-	err = json.NewDecoder(resp.body).Decode(&response)
-	if resolveWarning != "" {
-		response.Warnings = append(response.Warnings, resolveWarning)
-	}
+	var response swarm.ServiceCreateResponse
+	err = json.NewDecoder(resp.Body).Decode(&response)
+	warnings = append(warnings, response.Warnings...)
 
-	return response, err
+	return ServiceCreateResult{
+		ID:       response.ID,
+		Warnings: warnings,
+	}, err
 }
 
 func resolveContainerSpecImage(ctx context.Context, cli DistributionAPIClient, taskSpec *swarm.TaskSpec, encodedAuth string) string {
-	var warning string
-	if img, imgPlatforms, err := imageDigestAndPlatforms(ctx, cli, taskSpec.ContainerSpec.Image, encodedAuth); err != nil {
-		warning = digestWarning(taskSpec.ContainerSpec.Image)
-	} else {
-		taskSpec.ContainerSpec.Image = img
-		if len(imgPlatforms) > 0 {
-			if taskSpec.Placement == nil {
-				taskSpec.Placement = &swarm.Placement{}
-			}
-			taskSpec.Placement.Platforms = imgPlatforms
-		}
+	img, imgPlatforms, err := imageDigestAndPlatforms(ctx, cli, taskSpec.ContainerSpec.Image, encodedAuth)
+	if err != nil {
+		return digestWarning(taskSpec.ContainerSpec.Image)
 	}
-	return warning
+	taskSpec.ContainerSpec.Image = img
+	if len(imgPlatforms) > 0 {
+		if taskSpec.Placement == nil {
+			taskSpec.Placement = &swarm.Placement{}
+		}
+		taskSpec.Placement.Platforms = imgPlatforms
+	}
+	return ""
 }
 
 func resolvePluginSpecRemote(ctx context.Context, cli DistributionAPIClient, taskSpec *swarm.TaskSpec, encodedAuth string) string {
-	var warning string
-	if img, imgPlatforms, err := imageDigestAndPlatforms(ctx, cli, taskSpec.PluginSpec.Remote, encodedAuth); err != nil {
-		warning = digestWarning(taskSpec.PluginSpec.Remote)
-	} else {
-		taskSpec.PluginSpec.Remote = img
-		if len(imgPlatforms) > 0 {
-			if taskSpec.Placement == nil {
-				taskSpec.Placement = &swarm.Placement{}
-			}
-			taskSpec.Placement.Platforms = imgPlatforms
-		}
+	img, imgPlatforms, err := imageDigestAndPlatforms(ctx, cli, taskSpec.PluginSpec.Remote, encodedAuth)
+	if err != nil {
+		return digestWarning(taskSpec.PluginSpec.Remote)
 	}
-	return warning
+	taskSpec.PluginSpec.Remote = img
+	if len(imgPlatforms) > 0 {
+		if taskSpec.Placement == nil {
+			taskSpec.Placement = &swarm.Placement{}
+		}
+		taskSpec.Placement.Platforms = imgPlatforms
+	}
+	return ""
 }
 
 func imageDigestAndPlatforms(ctx context.Context, cli DistributionAPIClient, image, encodedAuth string) (string, []swarm.Platform, error) {
-	distributionInspect, err := cli.DistributionInspect(ctx, image, encodedAuth)
+	distributionInspect, err := cli.DistributionInspect(ctx, image, DistributionInspectOptions{
+		EncodedRegistryAuth: encodedAuth,
+	})
 	var platforms []swarm.Platform
 	if err != nil {
 		return "", nil, err
@@ -109,21 +137,37 @@ func imageDigestAndPlatforms(ctx context.Context, cli DistributionAPIClient, ima
 
 	if len(distributionInspect.Platforms) > 0 {
 		platforms = make([]swarm.Platform, 0, len(distributionInspect.Platforms))
+		seen := make(map[swarm.Platform]struct{}, len(distributionInspect.Platforms))
 		for _, p := range distributionInspect.Platforms {
+			// skip attestations and other data included in the manifest index.
+			if p.OS == "unknown" || p.Architecture == "unknown" {
+				continue
+			}
 			// clear architecture field for arm. This is a temporary patch to address
-			// https://github.com/docker/swarmkit/issues/2294. The issue is that while
+			// https://github.com/moby/swarmkit/issues/2294. The issue is that while
 			// image manifests report "arm" as the architecture, the node reports
 			// something like "armv7l" (includes the variant), which causes arm images
 			// to stop working with swarm mode. This patch removes the architecture
 			// constraint for arm images to ensure tasks get scheduled.
 			arch := p.Architecture
-			if strings.ToLower(arch) == "arm" {
+			if strings.EqualFold(arch, "arm") {
 				arch = ""
 			}
-			platforms = append(platforms, swarm.Platform{
+			platform := swarm.Platform{
 				Architecture: arch,
 				OS:           p.OS,
-			})
+			}
+
+			// Skip duplicates. Swarm currently only uses os/arch, and doesn't
+			// support other fields (Variant, OSVersion, OSFeatures), which
+			// usually results in duplicate "os/arch" combinations coming from
+			// the image.
+			if _, ok := seen[platform]; ok {
+				continue
+			}
+			seen[platform] = struct{}{}
+
+			platforms = append(platforms, platform)
 		}
 	}
 	return imageWithDigest, platforms, err
@@ -135,7 +179,7 @@ func imageDigestAndPlatforms(ctx context.Context, cli DistributionAPIClient, ima
 func imageWithDigestString(image string, dgst digest.Digest) string {
 	namedRef, err := reference.ParseNormalizedNamed(image)
 	if err == nil {
-		if _, isCanonical := namedRef.(reference.Canonical); !isCanonical {
+		if _, hasDigest := namedRef.(reference.Digested); !hasDigest {
 			// ensure that image gets a default tag if none is provided
 			img, err := reference.WithDigest(namedRef, dgst)
 			if err == nil {

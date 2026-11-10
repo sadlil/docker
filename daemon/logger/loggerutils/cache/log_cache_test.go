@@ -1,16 +1,14 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"testing"
-
 	"time"
 
-	"bytes"
-
-	"github.com/docker/docker/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger"
 	"gotest.tools/v3/assert"
-	"gotest.tools/v3/assert/cmp"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 type fakeLogger struct {
@@ -45,14 +43,14 @@ func TestLog(t *testing.T) {
 	defer l.Close()
 
 	var messages []logger.Message
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		messages = append(messages, logger.Message{
 			Timestamp: time.Now(),
 			Line:      append(bytes.Repeat([]byte("a"), 100), '\n'),
 		})
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
 	go func() {
@@ -75,7 +73,7 @@ func TestLog(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatal("timed out waiting for messages... this is probably a test implementation error")
 		case msg = <-cacher.messages:
-			assert.Assert(t, cmp.DeepEqual(msg, m))
+			assert.Assert(t, is.DeepEqual(msg, m))
 		}
 	}
 }

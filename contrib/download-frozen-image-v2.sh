@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
+# This script was developed for use in Moby's CI, and as such the use cases and
+# usability are (intentionally) limited. You may find this script useful for
+# educational purposes, for example, to learn how pulling images works "under
+# the hood", and you may be able to use it for other purposes, but it should not
+# be considered a "general purpose" tool for pulling images.
+#
+# The project maintainers accept contributions to this script within its intended
+# scope, but may not accept contributions beyond that.
+#
+# For users who have a similar need but require more flexibility/functionality,
+# refer to the discussion on GitHub, which mentions various alternatives that
+# are more suitable for other uses: https://github.com/moby/moby/issues/40857
+
 # hello-world                      latest              ef872312fe1b        3 months ago        910 B
 # hello-world                      latest              ef872312fe1bbc5e05aae626791a47ee9b032efa8f3bda39cc0be7b56bfe59b9   3 months ago        910 B
 
@@ -59,30 +72,11 @@ fetch_blob() {
 	shift
 	local curlArgs=("$@")
 
-	local curlHeaders
-	curlHeaders="$(
-		curl -S "${curlArgs[@]}" \
-			-H "Authorization: Bearer $token" \
-			"$registryBase/v2/$image/blobs/$digest" \
-			-o "$targetFile" \
-			-D-
-	)"
-	curlHeaders="$(echo "$curlHeaders" | tr -d '\r')"
-	if grep -qE "^HTTP/[0-9].[0-9] 3" <<< "$curlHeaders"; then
-		rm -f "$targetFile"
-
-		local blobRedirect
-		blobRedirect="$(echo "$curlHeaders" | awk -F ': ' 'tolower($1) == "location" { print $2; exit }')"
-		if [ -z "$blobRedirect" ]; then
-			echo >&2 "error: failed fetching '$image' blob '$digest'"
-			echo "$curlHeaders" | head -1 >&2
-			return 1
-		fi
-
-		curl -fSL "${curlArgs[@]}" \
-			"$blobRedirect" \
-			-o "$targetFile"
-	fi
+	curl -L -S "${curlArgs[@]}" \
+		-H "Authorization: Bearer $token" \
+		"$registryBase/v2/$image/blobs/$digest" \
+		-o "$targetFile" \
+		-D-
 }
 
 # handle 'application/vnd.docker.distribution.manifest.v2+json' manifest
@@ -157,7 +151,7 @@ handle_single_manifest_v2() {
 		fi
 
 		case "$layerMediaType" in
-			application/vnd.docker.image.rootfs.diff.tar.gzip)
+			application/vnd.oci.image.layer.v1.tar+gzip | application/vnd.docker.image.rootfs.diff.tar.gzip)
 				local layerTar="$layerId/layer.tar"
 				layerFiles=("${layerFiles[@]}" "$layerTar")
 				# TODO figure out why "-C -" doesn't work here
@@ -190,10 +184,10 @@ handle_single_manifest_v2() {
 
 	local manifestJsonEntry
 	manifestJsonEntry="$(
-		echo '{}' | jq --raw-output '. + {
+		echo '{}' | jq --raw-output --compact-output '. + {
 			Config: "'"$configFile"'",
 			RepoTags: ["'"${image#library\/}:$tag"'"],
-			Layers: '"$(echo '[]' | jq --raw-output ".$(for layerFile in "${layerFiles[@]}"; do echo " + [ \"$layerFile\" ]"; done)")"'
+			Layers: '"$(echo '[]' | jq --raw-output --compact-output ".$(for layerFile in "${layerFiles[@]}"; do echo " + [ \"$layerFile\" ]"; done)")"'
 		}'
 	)"
 	manifestJsonEntries=("${manifestJsonEntries[@]}" "$manifestJsonEntry")
@@ -261,6 +255,10 @@ get_target_arch() {
 	echo amd64
 }
 
+get_target_variant() {
+	echo "${TARGETVARIANT:-}"
+}
+
 while [ $# -gt 0 ]; do
 	imageTag="$1"
 	shift
@@ -281,6 +279,8 @@ while [ $# -gt 0 ]; do
 	manifestJson="$(
 		curl -fsSL \
 			-H "Authorization: Bearer $token" \
+			-H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+			-H 'Accept: application/vnd.oci.image.index.v1+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
@@ -300,10 +300,10 @@ while [ $# -gt 0 ]; do
 			mediaType="$(echo "$manifestJson" | jq --raw-output '.mediaType')"
 
 			case "$mediaType" in
-				application/vnd.docker.distribution.manifest.v2+json)
+				application/vnd.oci.image.manifest.v1+json | application/vnd.docker.distribution.manifest.v2+json)
 					handle_single_manifest_v2 "$manifestJson"
 					;;
-				application/vnd.docker.distribution.manifest.list.v2+json)
+				application/vnd.oci.image.index.v1+json | application/vnd.docker.distribution.manifest.list.v2+json)
 					layersFs="$(echo "$manifestJson" | jq --raw-output --compact-output '.manifests[]')"
 					IFS="$newlineIFS"
 					mapfile -t layers <<< "$layersFs"
@@ -311,16 +311,20 @@ while [ $# -gt 0 ]; do
 
 					found=""
 					targetArch="$(get_target_arch)"
+					targetVariant="$(get_target_variant)"
 					# parse first level multi-arch manifest
 					for i in "${!layers[@]}"; do
 						layerMeta="${layers[$i]}"
 						maniArch="$(echo "$layerMeta" | jq --raw-output '.platform.architecture')"
-						if [ "$maniArch" = "${targetArch}" ]; then
+						maniVariant="$(echo "$layerMeta" | jq --raw-output '.platform.variant')"
+						if [[ "$maniArch" = "${targetArch}" ]] && [[ -z "${targetVariant}" || "$maniVariant" = "${targetVariant}" ]]; then
 							digest="$(echo "$layerMeta" | jq --raw-output '.digest')"
 							# get second level single manifest
 							submanifestJson="$(
 								curl -fsSL \
 									-H "Authorization: Bearer $token" \
+									-H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+									-H 'Accept: application/vnd.oci.image.index.v1+json' \
 									-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
 									-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
 									-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
@@ -332,7 +336,7 @@ while [ $# -gt 0 ]; do
 						fi
 					done
 					if [ -z "$found" ]; then
-						echo >&2 "error: manifest for $maniArch is not found"
+						echo >&2 "error: manifest for ${targetArch}${targetVariant:+/${targetVariant}} is not found"
 						exit 1
 					fi
 					;;

@@ -1,7 +1,6 @@
 //go:build !windows
-// +build !windows
 
-package authorization // import "github.com/docker/docker/pkg/authorization"
+package authorization
 
 import (
 	"context"
@@ -9,9 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/moby/moby/v2/pkg/plugingetter"
 	"gotest.tools/v3/assert"
-	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestMiddlewareWrapHandler(t *testing.T) {
@@ -35,22 +33,20 @@ func TestMiddlewareWrapHandler(t *testing.T) {
 	assert.Assert(t, mdHandler != nil)
 
 	addr := "www.example.com/auth"
-	req, _ := http.NewRequest(http.MethodGet, addr, nil)
+	req, _ := http.NewRequest(http.MethodGet, addr, http.NoBody)
 	req.RequestURI = addr
 	req.Header.Add("header", "value")
 
 	resp := httptest.NewRecorder()
-	ctx := context.Background()
 
 	t.Run("Error Test Case :", func(t *testing.T) {
 		server.replayResponse = Response{
 			Allow: false,
 			Msg:   "Server Auth Not Allowed",
 		}
-		if err := mdHandler(ctx, resp, req, map[string]string{}); err == nil {
-			assert.Assert(t, is.ErrorContains(err, ""))
+		if err := mdHandler(t.Context(), resp, req, map[string]string{}); err == nil {
+			assert.ErrorContains(t, err, "")
 		}
-
 	})
 
 	t.Run("Positive Test Case :", func(t *testing.T) {
@@ -58,10 +54,8 @@ func TestMiddlewareWrapHandler(t *testing.T) {
 			Allow: true,
 			Msg:   "Server Auth Allowed",
 		}
-		if err := mdHandler(ctx, resp, req, map[string]string{}); err != nil {
+		if err := mdHandler(t.Context(), resp, req, map[string]string{}); err != nil {
 			assert.NilError(t, err)
 		}
-
 	})
-
 }

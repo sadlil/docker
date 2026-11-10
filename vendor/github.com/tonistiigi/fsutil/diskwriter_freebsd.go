@@ -1,4 +1,4 @@
-// +build freebsd
+//go:build freebsd
 
 package fsutil
 
@@ -8,7 +8,9 @@ import (
 )
 
 func createSpecialFile(path string, mode uint32, stat *types.Stat) error {
-	dev := unix.Mkdev(uint32(stat.Devmajor), uint32(stat.Devminor))
+	return unix.Mknod(path, mode, mkdev(stat.Devmajor, stat.Devminor))
+}
 
-	return unix.Mknod(path, mode, dev)
+func mkdev(major int64, minor int64) uint64 {
+	return unix.Mkdev(uint32(major), uint32(minor))
 }

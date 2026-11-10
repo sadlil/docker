@@ -1,4 +1,4 @@
-// +build !windows
+//go:build !windows
 
 /*
    Copyright The containerd Authors.
@@ -19,14 +19,11 @@
 package runc
 
 import (
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
-	"runtime"
+	"fmt"
 )
 
-// NewPipeIO creates pipe pairs to be used with runc
-func NewPipeIO(uid, gid int, opts ...IOOpt) (i IO, err error) {
+// newPipeIO creates pipe pairs to be used with runc
+func newPipeIO(uid, gid int, opts ...IOOpt) (_ IO, retErr error) {
 	option := defaultIOOption()
 	for _, o := range opts {
 		o(option)
@@ -37,55 +34,40 @@ func NewPipeIO(uid, gid int, opts ...IOOpt) (i IO, err error) {
 	)
 	// cleanup in case of an error
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			for _, p := range pipes {
-				p.Close()
+				_ = p.Close()
 			}
 		}
 	}()
 	if option.OpenStdin {
+		var err error
 		if stdin, err = newPipe(); err != nil {
 			return nil, err
 		}
 		pipes = append(pipes, stdin)
-		if err = unix.Fchown(int(stdin.r.Fd()), uid, gid); err != nil {
-			// TODO: revert with proper darwin solution, skipping for now
-			// as darwin chown is returning EINVAL on anonymous pipe
-			if runtime.GOOS == "darwin" {
-				logrus.WithError(err).Debug("failed to chown stdin, ignored")
-			} else {
-				return nil, errors.Wrap(err, "failed to chown stdin")
-			}
+		if err := chownPipe(int(stdin.r.Fd()), uid, gid); err != nil {
+			return nil, fmt.Errorf("failed to chown stdin: %w", err)
 		}
 	}
 	if option.OpenStdout {
+		var err error
 		if stdout, err = newPipe(); err != nil {
 			return nil, err
 		}
 		pipes = append(pipes, stdout)
-		if err = unix.Fchown(int(stdout.w.Fd()), uid, gid); err != nil {
-			// TODO: revert with proper darwin solution, skipping for now
-			// as darwin chown is returning EINVAL on anonymous pipe
-			if runtime.GOOS == "darwin" {
-				logrus.WithError(err).Debug("failed to chown stdout, ignored")
-			} else {
-				return nil, errors.Wrap(err, "failed to chown stdout")
-			}
+		if err := chownPipe(int(stdout.w.Fd()), uid, gid); err != nil {
+			return nil, fmt.Errorf("failed to chown stdout: %w", err)
 		}
 	}
 	if option.OpenStderr {
+		var err error
 		if stderr, err = newPipe(); err != nil {
 			return nil, err
 		}
 		pipes = append(pipes, stderr)
-		if err = unix.Fchown(int(stderr.w.Fd()), uid, gid); err != nil {
-			// TODO: revert with proper darwin solution, skipping for now
-			// as darwin chown is returning EINVAL on anonymous pipe
-			if runtime.GOOS == "darwin" {
-				logrus.WithError(err).Debug("failed to chown stderr, ignored")
-			} else {
-				return nil, errors.Wrap(err, "failed to chown stderr")
-			}
+		if err := chownPipe(int(stderr.w.Fd()), uid, gid); err != nil {
+			return nil, fmt.Errorf("failed to chown stderr: %w", err)
 		}
 	}
 	return &pipeIO{

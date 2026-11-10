@@ -4,27 +4,23 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/client"
+	swarmtypes "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
 	"gotest.tools/v3/poll"
 )
 
 // NoTasksForService verifies that there are no more tasks for the given service
-func NoTasksForService(ctx context.Context, client client.ServiceAPIClient, serviceID string) func(log poll.LogT) poll.Result {
+func NoTasksForService(ctx context.Context, apiClient client.TaskAPIClient, serviceID string) func(log poll.LogT) poll.Result {
 	return func(log poll.LogT) poll.Result {
-		tasks, err := client.TaskList(ctx, types.TaskListOptions{
-			Filters: filters.NewArgs(
-				filters.Arg("service", serviceID),
-			),
+		taskList, err := apiClient.TaskList(ctx, client.TaskListOptions{
+			Filters: make(client.Filters).Add("service", serviceID),
 		})
 		if err == nil {
-			if len(tasks) == 0 {
+			if len(taskList.Items) == 0 {
 				return poll.Success()
 			}
-			if len(tasks) > 0 {
-				return poll.Continue("task count for service %s at %d waiting for 0", serviceID, len(tasks))
+			if len(taskList.Items) > 0 {
+				return poll.Continue("task count for service %s at %d waiting for 0", serviceID, len(taskList.Items))
 			}
 			return poll.Continue("waiting for tasks for service %s to be deleted", serviceID)
 		}
@@ -34,38 +30,39 @@ func NoTasksForService(ctx context.Context, client client.ServiceAPIClient, serv
 }
 
 // NoTasks verifies that all tasks are gone
-func NoTasks(ctx context.Context, client client.ServiceAPIClient) func(log poll.LogT) poll.Result {
+func NoTasks(ctx context.Context, apiClient client.TaskAPIClient) func(log poll.LogT) poll.Result {
 	return func(log poll.LogT) poll.Result {
-		tasks, err := client.TaskList(ctx, types.TaskListOptions{})
+		taskResult, err := apiClient.TaskList(ctx, client.TaskListOptions{})
 		switch {
 		case err != nil:
 			return poll.Error(err)
-		case len(tasks) == 0:
+		case len(taskResult.Items) == 0:
 			return poll.Success()
 		default:
-			return poll.Continue("waiting for all tasks to be removed: task count at %d", len(tasks))
+			return poll.Continue("waiting for all tasks to be removed: task count at %d", len(taskResult.Items))
 		}
 	}
 }
 
 // RunningTasksCount verifies there are `instances` tasks running for `serviceID`
-func RunningTasksCount(client client.ServiceAPIClient, serviceID string, instances uint64) func(log poll.LogT) poll.Result {
+func RunningTasksCount(ctx context.Context, apiClient client.TaskAPIClient, serviceID string, instances uint64) func(log poll.LogT) poll.Result {
 	return func(log poll.LogT) poll.Result {
-		filter := filters.NewArgs()
-		filter.Add("service", serviceID)
-		tasks, err := client.TaskList(context.Background(), types.TaskListOptions{
-			Filters: filter,
+		taskList, err := apiClient.TaskList(ctx, client.TaskListOptions{
+			Filters: make(client.Filters).Add("service", serviceID),
 		})
 		var running int
 		var taskError string
-		for _, task := range tasks {
+		for _, task := range taskList.Items {
 			switch task.Status.State {
 			case swarmtypes.TaskStateRunning:
 				running++
-			case swarmtypes.TaskStateFailed:
+			case swarmtypes.TaskStateFailed, swarmtypes.TaskStateRejected:
 				if task.Status.Err != "" {
+					log.Logf("task %v on node %v %v: %v", task.ID, task.NodeID, task.Status.State, task.Status.Err)
 					taskError = task.Status.Err
 				}
+			default:
+				// not interested in other states.
 			}
 		}
 
@@ -79,7 +76,7 @@ func RunningTasksCount(client client.ServiceAPIClient, serviceID string, instanc
 		case running == int(instances):
 			return poll.Success()
 		default:
-			return poll.Continue("running task count at %d waiting for %d (total tasks: %d)", running, instances, len(tasks))
+			return poll.Continue("running task count at %d waiting for %d (total tasks: %d)", running, instances, len(taskList.Items))
 		}
 	}
 }
@@ -87,28 +84,22 @@ func RunningTasksCount(client client.ServiceAPIClient, serviceID string, instanc
 // JobComplete is a poll function for determining that a ReplicatedJob is
 // completed additionally, while polling, it verifies that the job never
 // exceeds MaxConcurrent running tasks
-func JobComplete(client client.CommonAPIClient, service swarmtypes.Service) func(log poll.LogT) poll.Result {
-	filter := filters.NewArgs()
-	filter.Add("service", service.ID)
+func JobComplete(ctx context.Context, apiClient client.TaskAPIClient, service swarmtypes.Service) func(log poll.LogT) poll.Result {
+	filter := make(client.Filters).Add("service", service.ID)
 
 	var jobIteration swarmtypes.Version
 	if service.JobStatus != nil {
 		jobIteration = service.JobStatus.JobIteration
 	}
 
-	maxRaw := service.Spec.Mode.ReplicatedJob.MaxConcurrent
-	totalRaw := service.Spec.Mode.ReplicatedJob.TotalCompletions
-
-	max := int(*maxRaw)
-	total := int(*totalRaw)
-
+	maxConcurrent := int(*service.Spec.Mode.ReplicatedJob.MaxConcurrent)
+	totalCompletions := int(*service.Spec.Mode.ReplicatedJob.TotalCompletions)
 	previousResult := ""
 
 	return func(log poll.LogT) poll.Result {
-		tasks, err := client.TaskList(context.Background(), types.TaskListOptions{
+		taskList, err := apiClient.TaskList(ctx, client.TaskListOptions{
 			Filters: filter,
 		})
-
 		if err != nil {
 			poll.Error(err)
 		}
@@ -119,7 +110,7 @@ func JobComplete(client client.CommonAPIClient, service swarmtypes.Service) func
 		var runningSlot []int
 		var runningID []string
 
-		for _, task := range tasks {
+		for _, task := range taskList.Items {
 			// make sure the task has the same job iteration
 			if task.JobIteration == nil || task.JobIteration.Index != jobIteration.Index {
 				continue
@@ -131,20 +122,22 @@ func JobComplete(client client.CommonAPIClient, service swarmtypes.Service) func
 				runningID = append(runningID, task.ID)
 			case swarmtypes.TaskStateComplete:
 				completed++
+			default:
+				// not interested in other states.
 			}
 		}
 
 		switch {
-		case running > max:
+		case running > maxConcurrent:
 			return poll.Error(fmt.Errorf(
-				"number of running tasks (%v) exceeds max (%v)", running, max,
+				"number of running tasks (%v) exceeds max (%v)", running, maxConcurrent,
 			))
-		case (completed + running) > total:
+		case (completed + running) > totalCompletions:
 			return poll.Error(fmt.Errorf(
 				"number of tasks exceeds total (%v), %v running and %v completed",
-				total, running, completed,
+				totalCompletions, running, completed,
 			))
-		case completed == total && running == 0:
+		case completed == totalCompletions && running == 0:
 			return poll.Success()
 		default:
 			newRes := fmt.Sprintf(
@@ -158,8 +151,52 @@ func JobComplete(client client.CommonAPIClient, service swarmtypes.Service) func
 
 			return poll.Continue(
 				"Job not yet finished, %v completed and %v running out of %v total",
-				completed, running, total,
+				completed, running, totalCompletions,
 			)
 		}
+	}
+}
+
+// HasLeader polls until any manager node reports itself as the leader.
+func HasLeader(ctx context.Context, apiClient client.NodeAPIClient) func(log poll.LogT) poll.Result {
+	return func(log poll.LogT) poll.Result {
+		result, err := apiClient.NodeList(ctx, client.NodeListOptions{
+			Filters: make(client.Filters).Add("role", "manager"),
+		})
+		if err != nil {
+			return poll.Error(err)
+		}
+		for _, node := range result.Items {
+			if node.ManagerStatus != nil && node.ManagerStatus.Leader {
+				return poll.Success()
+			}
+		}
+		return poll.Continue("no leader elected yet")
+	}
+}
+
+// HasLeaderOtherThan polls until a manager node other than excludedNodeID
+// reports itself as the leader.
+// Pass a client connected to a node that is NOT excludedNodeID, so that
+// the poll keeps working while excludedNodeID's API is unavailable.
+// Errors from NodeList are treated as poll.Continue rather than poll.Error
+// so a brief period of cluster unavailability during the election does not
+// abort the wait.
+func HasLeaderOtherThan(ctx context.Context, apiClient client.NodeAPIClient, excludedNodeID string) func(log poll.LogT) poll.Result {
+	return func(log poll.LogT) poll.Result {
+		result, err := apiClient.NodeList(ctx, client.NodeListOptions{
+			Filters: make(client.Filters).Add("role", "manager"),
+		})
+		if err != nil {
+			// The standby manager itself may be briefly unavailable during
+			// the election; keep retrying rather than failing the poll.
+			return poll.Continue("waiting for node list: %v", err)
+		}
+		for _, node := range result.Items {
+			if node.ManagerStatus != nil && node.ManagerStatus.Leader && node.ID != excludedNodeID {
+				return poll.Success()
+			}
+		}
+		return poll.Continue("no leader other than %s elected yet", excludedNodeID)
 	}
 }

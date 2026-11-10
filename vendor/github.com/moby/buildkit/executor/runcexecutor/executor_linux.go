@@ -1,19 +1,24 @@
 package runcexecutor
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
-	"time"
 
 	"github.com/containerd/console"
 	runc "github.com/containerd/go-runc"
-	"github.com/docker/docker/pkg/signal"
 	"github.com/moby/buildkit/executor"
+	"github.com/moby/buildkit/executor/oci"
+	gatewayapi "github.com/moby/buildkit/frontend/gateway/pb"
+	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/sys/signal"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -22,34 +27,95 @@ func updateRuncFieldsForHostOS(runtime *runc.Runc) {
 	runtime.PdeathSignal = syscall.SIGKILL // this can still leak the process
 }
 
-func (w *runcExecutor) run(ctx context.Context, id, bundle string, process executor.ProcessInfo) error {
-	return w.callWithIO(ctx, id, bundle, process, func(ctx context.Context, started chan<- int, io runc.IO) error {
+func (w *runcExecutor) run(ctx context.Context, id, bundle string, process executor.ProcessInfo, started func(), keep bool) error {
+	killer := newRunProcKiller(w.runc, id)
+	return w.callWithIO(ctx, process, started, killer, func(ctx context.Context, started chan<- int, io runc.IO, pidfile string) error {
+		extraArgs := []string{}
+		if keep {
+			extraArgs = append(extraArgs, "--keep")
+		}
 		_, err := w.runc.Run(ctx, id, bundle, &runc.CreateOpts{
 			NoPivot: w.noPivot,
-			Started: started,
-			IO:      io,
+			// Without a PID namespace, processes left behind by a step outlive the
+			// container and keep its session keyring, until the per-user key quota
+			// is exhausted and every new container fails to start.
+			NoNewKeyring: w.processMode == oci.NoProcessSandbox,
+			Started:      started,
+			IO:           io,
+			ExtraArgs:    extraArgs,
 		})
 		return err
 	})
 }
 
-func (w *runcExecutor) exec(ctx context.Context, id, bundle string, specsProcess *specs.Process, process executor.ProcessInfo) error {
-	return w.callWithIO(ctx, id, bundle, process, func(ctx context.Context, started chan<- int, io runc.IO) error {
+func (w *runcExecutor) exec(ctx context.Context, id string, specsProcess *specs.Process, process executor.ProcessInfo, started func()) error {
+	killer, err := newExecProcKiller(w.runc, id)
+	if err != nil {
+		return errors.Wrap(err, "failed to initialize process killer")
+	}
+	defer killer.Cleanup()
+
+	return w.callWithIO(ctx, process, started, killer, func(ctx context.Context, started chan<- int, io runc.IO, pidfile string) error {
 		return w.runc.Exec(ctx, id, *specsProcess, &runc.ExecOpts{
 			Started: started,
 			IO:      io,
+			PidFile: pidfile,
 		})
 	})
 }
 
-type runcCall func(ctx context.Context, started chan<- int, io runc.IO) error
+type runcCall func(ctx context.Context, started chan<- int, io runc.IO, pidfile string) error
 
-func (w *runcExecutor) callWithIO(ctx context.Context, id, bundle string, process executor.ProcessInfo, call runcCall) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (w *runcExecutor) callWithIO(ctx context.Context, process executor.ProcessInfo, started func(), killer procKiller, call runcCall) error {
+	runcProcess, ctx := runcProcessHandle(ctx, killer)
+	defer runcProcess.Release()
+
+	eg, ctx := errgroup.WithContext(ctx)
+	defer func() {
+		if err := eg.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+			bklog.G(ctx).Errorf("runc process monitoring error: %s", err)
+		}
+	}()
+	defer runcProcess.Shutdown()
+
+	startedCh := make(chan int, 1)
+	eg.Go(func() error {
+		return runcProcess.WaitForStart(ctx, startedCh, started)
+	})
+
+	eg.Go(func() error {
+		return handleSignals(ctx, runcProcess, process.Signal)
+	})
 
 	if !process.Meta.Tty {
-		return call(ctx, nil, &forwardIO{stdin: process.Stdin, stdout: process.Stdout, stderr: process.Stderr})
+		runcIO := &forwardIO{stdout: process.Stdout, stderr: process.Stderr}
+		if process.Stdin != nil {
+			// Forward stdin through an os.Pipe rather than handing the
+			// caller's io.ReadCloser to runc directly. When cmd.Stdin is
+			// an *os.File, exec.Cmd dup2s it into the child and cmd.Wait
+			// returns as soon as the runc subprocess exits. Otherwise
+			// exec.Cmd spawns an internal goroutine that blocks on the
+			// caller's Reader and prevents cmd.Wait from returning after
+			// the in-container process is killed. Stdin is closed in a
+			// defer after call() returns, matching the tty path and the
+			// natural-exit cleanup.
+			pr, pw, err := os.Pipe()
+			if err != nil {
+				return errors.Wrap(err, "failed to create stdin pipe")
+			}
+			runcIO.stdin = pr
+			defer pr.Close()
+			defer process.Stdin.Close()
+			eg.Go(func() error {
+				defer pw.Close()
+				_, err := io.Copy(pw, process.Stdin)
+				if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrClosed) {
+					return nil
+				}
+				return err
+			})
+		}
+		return call(ctx, startedCh, runcIO, killer.pidfile)
 	}
 
 	ptm, ptsName, err := console.NewPty()
@@ -63,18 +129,16 @@ func (w *runcExecutor) callWithIO(ctx context.Context, id, bundle string, proces
 		return err
 	}
 
-	eg, ctx := errgroup.WithContext(ctx)
-
 	defer func() {
 		if process.Stdin != nil {
 			process.Stdin.Close()
 		}
 		pts.Close()
 		ptm.Close()
-		cancel() // this will shutdown resize loop
+		runcProcess.Shutdown()
 		err := eg.Wait()
 		if err != nil {
-			logrus.Warningf("error while shutting down tty io: %s", err)
+			bklog.G(ctx).Warningf("error while shutting down tty io: %s", err)
 		}
 	}()
 
@@ -97,7 +161,7 @@ func (w *runcExecutor) callWithIO(ctx context.Context, id, bundle string, proces
 			if errors.As(err, &ptmClosedError) {
 				if ptmClosedError.Op == "read" &&
 					ptmClosedError.Path == "/dev/ptmx" &&
-					ptmClosedError.Err == syscall.EIO {
+					errors.Is(ptmClosedError.Err, syscall.EIO) {
 					return nil
 				}
 			}
@@ -105,26 +169,13 @@ func (w *runcExecutor) callWithIO(ctx context.Context, id, bundle string, proces
 		})
 	}
 
-	started := make(chan int, 1)
-
+	resizeDone := make(chan struct{})
 	eg.Go(func() error {
-		startedCtx, timeout := context.WithTimeout(ctx, 10*time.Second)
-		defer timeout()
-		var runcProcess *os.Process
-		select {
-		case <-startedCtx.Done():
-			return errors.New("runc started message never received")
-		case pid, ok := <-started:
-			if !ok {
-				return errors.New("runc process failed to send pid")
-			}
-			runcProcess, err = os.FindProcess(pid)
-			if err != nil {
-				return errors.Wrapf(err, "unable to find runc process for pid %d", pid)
-			}
-			defer runcProcess.Release()
+		defer close(resizeDone)
+		err := runcProcess.WaitForReady(ctx)
+		if err != nil {
+			return err
 		}
-
 		for {
 			select {
 			case <-ctx.Done():
@@ -135,15 +186,23 @@ func (w *runcExecutor) callWithIO(ctx context.Context, id, bundle string, proces
 					Width:  uint16(resize.Cols),
 				})
 				if err != nil {
-					logrus.Errorf("failed to resize ptm: %s", err)
+					bklog.G(ctx).Errorf("failed to resize ptm: %s", err)
 				}
-				err = runcProcess.Signal(signal.SIGWINCH)
+				// SIGWINCH must be sent to the runc monitor process, as
+				// terminal resizing is done in runc.
+				err = runcProcess.monitorProcess.Signal(signal.SIGWINCH)
 				if err != nil {
-					logrus.Errorf("failed to send SIGWINCH to process: %s", err)
+					bklog.G(ctx).Errorf("failed to send SIGWINCH to process: %s", err)
 				}
 			}
 		}
 	})
+	// Runs before the cleanup defer above: the resize loop uses ptm's fd, so
+	// stop it before ptm is closed.
+	defer func() {
+		runcProcess.Shutdown()
+		<-resizeDone
+	}()
 
 	runcIO := &forwardIO{}
 	if process.Stdin != nil {
@@ -156,5 +215,46 @@ func (w *runcExecutor) callWithIO(ctx context.Context, id, bundle string, proces
 		runcIO.stderr = pts
 	}
 
-	return call(ctx, started, runcIO)
+	return call(ctx, startedCh, runcIO, killer.pidfile)
+}
+
+func detectOOM(ctx context.Context, ns string, gwErr *gatewayapi.ExitError) {
+	const defaultCgroupMountpoint = "/sys/fs/cgroup"
+
+	if ns == "" {
+		return
+	}
+
+	count, err := readMemoryEvent(filepath.Join(defaultCgroupMountpoint, ns), "oom_kill")
+	if err != nil {
+		bklog.G(ctx).WithError(err).Warn("failed to read oom_kill event")
+		return
+	}
+	if count > 0 {
+		gwErr.Err = syscall.ENOMEM
+	}
+}
+
+func readMemoryEvent(fp string, event string) (uint64, error) {
+	f, err := os.Open(filepath.Join(fp, "memory.events"))
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		parts := strings.Fields(s.Text())
+		if len(parts) != 2 {
+			continue
+		}
+		if parts[0] != event {
+			continue
+		}
+		v, err := strconv.ParseUint(parts[1], 10, 64)
+		if err == nil {
+			return v, nil
+		}
+	}
+	return 0, s.Err()
 }

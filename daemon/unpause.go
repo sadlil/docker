@@ -1,11 +1,12 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/docker/docker/container"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/container"
 )
 
 // ContainerUnpause unpauses a container
@@ -23,21 +24,25 @@ func (daemon *Daemon) containerUnpause(ctr *container.Container) error {
 	defer ctr.Unlock()
 
 	// We cannot unpause the container which is not paused
-	if !ctr.Paused {
+	if !ctr.State.Paused {
 		return fmt.Errorf("Container %s is not paused", ctr.ID)
 	}
+	tsk, err := ctr.GetRunningTask()
+	if err != nil {
+		return err
+	}
 
-	if err := daemon.containerd.Resume(context.Background(), ctr.ID); err != nil {
+	if err := tsk.Resume(context.Background()); err != nil {
 		return fmt.Errorf("Cannot unpause container %s: %s", ctr.ID, err)
 	}
 
-	ctr.Paused = false
+	ctr.State.SetPaused(false)
 	daemon.setStateCounter(ctr)
 	daemon.updateHealthMonitor(ctr)
-	daemon.LogContainerEvent(ctr, "unpause")
+	daemon.LogContainerEvent(ctr, events.ActionUnPause)
 
-	if err := ctr.CheckpointTo(daemon.containersReplica); err != nil {
-		logrus.WithError(err).Warn("could not save container to disk")
+	if err := ctr.CheckpointTo(context.WithoutCancel(context.TODO()), daemon.containersReplica); err != nil {
+		log.G(context.TODO()).WithError(err).Warn("could not save container to disk")
 	}
 
 	return nil

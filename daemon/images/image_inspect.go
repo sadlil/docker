@@ -1,27 +1,35 @@
-package images // import "github.com/docker/docker/daemon/images"
+package images
 
 import (
+	"context"
 	"time"
 
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/image"
-	"github.com/docker/docker/layer"
-	"github.com/pkg/errors"
+	"github.com/distribution/reference"
+	imagetypes "github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/storage"
+	"github.com/moby/moby/v2/daemon/internal/image"
+	"github.com/moby/moby/v2/daemon/internal/layer"
+	"github.com/moby/moby/v2/daemon/server/imagebackend"
 )
 
-// LookupImage looks up an image by name and returns it as an ImageInspect
-// structure.
-func (i *ImageService) LookupImage(name string) (*types.ImageInspect, error) {
-	img, err := i.GetImage(name, nil)
+func (i *ImageService) ImageInspect(ctx context.Context, refOrID string, opts imagebackend.ImageInspectOpts) (*imagebackend.InspectData, error) {
+	img, err := i.GetImage(ctx, refOrID, imagebackend.GetImageOpts{Platform: opts.Platform})
 	if err != nil {
-		return nil, errors.Wrapf(err, "no such image: %s", name)
+		return nil, err
 	}
 
-	refs := i.referenceStore.References(img.ID().Digest())
-	repoTags := []string{}
-	repoDigests := []string{}
-	for _, ref := range refs {
+	size, layerMetadata, err := i.getLayerSizeAndMetadata(img)
+	if err != nil {
+		return nil, err
+	}
+
+	lastUpdated, err := i.imageStore.GetLastUpdated(img.ID())
+	if err != nil {
+		return nil, err
+	}
+
+	var repoTags, repoDigests []string
+	for _, ref := range i.referenceStore.References(img.ID().Digest()) {
 		switch ref.(type) {
 		case reference.NamedTagged:
 			repoTags = append(repoTags, reference.FamiliarString(ref))
@@ -30,68 +38,70 @@ func (i *ImageService) LookupImage(name string) (*types.ImageInspect, error) {
 		}
 	}
 
+	comment := img.Comment
+	if comment == "" && len(img.History) > 0 {
+		comment = img.History[len(img.History)-1].Comment
+	}
+
+	var created string
+	if img.Created != nil {
+		created = img.Created.Format(time.RFC3339Nano)
+	}
+
+	var layers []string
+	for _, l := range img.RootFS.DiffIDs {
+		layers = append(layers, l.String())
+	}
+
+	imgConfig := containerConfigToDockerOCIImageConfig(img.Config)
+	return &imagebackend.InspectData{
+		InspectResponse: imagetypes.InspectResponse{
+			ID:           img.ID().String(),
+			RepoTags:     repoTags,
+			RepoDigests:  repoDigests,
+			Comment:      comment,
+			Created:      created,
+			Author:       img.Author,
+			Config:       &imgConfig,
+			Architecture: img.Architecture,
+			Variant:      img.Variant,
+			Os:           img.OperatingSystem(),
+			OsVersion:    img.OSVersion,
+			Size:         size,
+			GraphDriver: &storage.DriverData{
+				Name: i.layerStore.DriverName(),
+				Data: layerMetadata,
+			},
+			RootFS: imagetypes.RootFS{
+				Type:   img.RootFS.Type,
+				Layers: layers,
+			},
+			Metadata: imagetypes.Metadata{
+				LastTagTime: lastUpdated,
+			},
+		},
+		Parent:          img.Parent.String(),  // field is deprecated with the legacy builder, but still included in response when present (built with legacy builder).
+		DockerVersion:   img.DockerVersion,    // field is deprecated with the legacy builder, but still included in response when present.
+		Container:       img.Container,        // field is deprecated, but still set on API < v1.45.
+		ContainerConfig: &img.ContainerConfig, // field is deprecated, but still set on API < v1.45.
+	}, nil
+}
+
+func (i *ImageService) getLayerSizeAndMetadata(img *image.Image) (int64, map[string]string, error) {
 	var size int64
 	var layerMetadata map[string]string
 	layerID := img.RootFS.ChainID()
 	if layerID != "" {
 		l, err := i.layerStore.Get(layerID)
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		defer layer.ReleaseAndLog(i.layerStore, l)
 		size = l.Size()
 		layerMetadata, err = l.Metadata()
 		if err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 	}
-
-	comment := img.Comment
-	if len(comment) == 0 && len(img.History) > 0 {
-		comment = img.History[len(img.History)-1].Comment
-	}
-
-	lastUpdated, err := i.imageStore.GetLastUpdated(img.ID())
-	if err != nil {
-		return nil, err
-	}
-
-	return &types.ImageInspect{
-		ID:              img.ID().String(),
-		RepoTags:        repoTags,
-		RepoDigests:     repoDigests,
-		Parent:          img.Parent.String(),
-		Comment:         comment,
-		Created:         img.Created.Format(time.RFC3339Nano),
-		Container:       img.Container,
-		ContainerConfig: &img.ContainerConfig,
-		DockerVersion:   img.DockerVersion,
-		Author:          img.Author,
-		Config:          img.Config,
-		Architecture:    img.Architecture,
-		Variant:         img.Variant,
-		Os:              img.OperatingSystem(),
-		OsVersion:       img.OSVersion,
-		Size:            size,
-		VirtualSize:     size, // TODO: field unused, deprecate
-		GraphDriver: types.GraphDriverData{
-			Name: i.layerStore.DriverName(),
-			Data: layerMetadata,
-		},
-		RootFS: rootFSToAPIType(img.RootFS),
-		Metadata: types.ImageMetadata{
-			LastTagTime: lastUpdated,
-		},
-	}, nil
-}
-
-func rootFSToAPIType(rootfs *image.RootFS) types.RootFS {
-	var layers []string
-	for _, l := range rootfs.DiffIDs {
-		layers = append(layers, l.String())
-	}
-	return types.RootFS{
-		Type:   rootfs.Type,
-		Layers: layers,
-	}
+	return size, layerMetadata, nil
 }

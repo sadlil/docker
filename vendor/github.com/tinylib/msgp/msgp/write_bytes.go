@@ -1,6 +1,9 @@
 package msgp
 
 import (
+	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"math"
 	"reflect"
 	"time"
@@ -59,6 +62,16 @@ func AppendArrayHeader(b []byte, sz uint32) []byte {
 // AppendNil appends a 'nil' byte to the slice
 func AppendNil(b []byte) []byte { return append(b, mnil) }
 
+// AppendFloat appends a float to the slice as either float64
+// or float32 when it represents the exact same value
+func AppendFloat(b []byte, f float64) []byte {
+	f32 := float32(f)
+	if float64(f32) == f {
+		return AppendFloat32(b, f32)
+	}
+	return AppendFloat64(b, f)
+}
+
 // AppendFloat64 appends a float64 to the slice
 func AppendFloat64(b []byte, f float64) []byte {
 	o, n := ensure(b, Float64Size)
@@ -71,6 +84,11 @@ func AppendFloat32(b []byte, f float32) []byte {
 	o, n := ensure(b, Float32Size)
 	prefixu32(o[n:], mfloat32, math.Float32bits(f))
 	return o
+}
+
+// AppendDuration appends a time.Duration to the slice
+func AppendDuration(b []byte, d time.Duration) []byte {
+	return AppendInt64(b, int64(d))
 }
 
 // AppendInt64 appends an int64 to the slice
@@ -193,6 +211,26 @@ func AppendBytes(b []byte, bts []byte) []byte {
 	return o[:n+copy(o[n:], bts)]
 }
 
+// AppendBytesHeader appends an 'bin' header with
+// the given size to the slice.
+func AppendBytesHeader(b []byte, sz uint32) []byte {
+	var o []byte
+	var n int
+	switch {
+	case sz <= math.MaxUint8:
+		o, n = ensure(b, 2)
+		prefixu8(o[n:], mbin8, uint8(sz))
+		return o
+	case sz <= math.MaxUint16:
+		o, n = ensure(b, 3)
+		prefixu16(o[n:], mbin16, uint16(sz))
+		return o
+	}
+	o, n = ensure(b, 5)
+	prefixu32(o[n:], mbin32, sz)
+	return o
+}
+
 // AppendBool appends a bool to the slice
 func AppendBool(b []byte, t bool) []byte {
 	if t {
@@ -285,6 +323,40 @@ func AppendTime(b []byte, t time.Time) []byte {
 	return o
 }
 
+// AppendTimeExt will write t using the official msgpack extension spec.
+// https://github.com/msgpack/msgpack/blob/master/spec.md#timestamp-extension-type
+func AppendTimeExt(b []byte, t time.Time) []byte {
+	// Time rounded towards zero.
+	secPrec := t.Truncate(time.Second)
+	remain := t.Sub(secPrec).Nanoseconds()
+	asSecs := secPrec.Unix()
+	switch {
+	case remain == 0 && asSecs > 0 && asSecs <= math.MaxUint32:
+		// 4 bytes
+		o, n := ensure(b, 2+4)
+		o[n+0] = mfixext4
+		o[n+1] = byte(msgTimeExtension)
+		binary.BigEndian.PutUint32(o[n+2:], uint32(asSecs))
+		return o
+	case asSecs < 0 || asSecs >= (1<<34):
+		// 12 bytes
+		o, n := ensure(b, 3+12)
+		o[n+0] = mext8
+		o[n+1] = 12
+		o[n+2] = byte(msgTimeExtension)
+		binary.BigEndian.PutUint32(o[n+3:], uint32(remain))
+		binary.BigEndian.PutUint64(o[n+3+4:], uint64(asSecs))
+		return o
+	default:
+		// 8 bytes
+		o, n := ensure(b, 2+8)
+		o[n+0] = mfixext8
+		o[n+1] = byte(msgTimeExtension)
+		binary.BigEndian.PutUint64(o[n+2:], uint64(asSecs)|(uint64(remain)<<34))
+		return o
+	}
+}
+
 // AppendMapStrStr appends a map[string]string to the slice
 // as a MessagePack map with 'str'-type keys and values
 func AppendMapStrStr(b []byte, m map[string]string) []byte {
@@ -315,13 +387,13 @@ func AppendMapStrIntf(b []byte, m map[string]interface{}) ([]byte, error) {
 
 // AppendIntf appends the concrete type of 'i' to the
 // provided []byte. 'i' must be one of the following:
-//  - 'nil'
-//  - A bool, float, string, []byte, int, uint, or complex
-//  - A map[string]interface{} or map[string]string
-//  - A []T, where T is another supported type
-//  - A *T, where T is another supported type
-//  - A type that satisfieds the msgp.Marshaler interface
-//  - A type that satisfies the msgp.Extension interface
+//   - 'nil'
+//   - A bool, float, string, []byte, int, uint, or complex
+//   - A map[string]T where T is another supported type
+//   - A []T, where T is another supported type
+//   - A *T, where T is another supported type
+//   - A type that satisfies the msgp.Marshaler interface
+//   - A type that satisfies the msgp.Extension interface
 func AppendIntf(b []byte, i interface{}) ([]byte, error) {
 	if i == nil {
 		return AppendNil(b), nil
@@ -370,10 +442,14 @@ func AppendIntf(b []byte, i interface{}) ([]byte, error) {
 		return AppendUint64(b, i), nil
 	case time.Time:
 		return AppendTime(b, i), nil
+	case time.Duration:
+		return AppendDuration(b, i), nil
 	case map[string]interface{}:
 		return AppendMapStrIntf(b, i)
 	case map[string]string:
 		return AppendMapStrStr(b, i), nil
+	case json.Number:
+		return AppendJSONNumber(b, i)
 	case []interface{}:
 		b = AppendArrayHeader(b, uint32(len(i)))
 		var err error
@@ -389,6 +465,21 @@ func AppendIntf(b []byte, i interface{}) ([]byte, error) {
 	var err error
 	v := reflect.ValueOf(i)
 	switch v.Kind() {
+	case reflect.Map:
+		if v.Type().Key().Kind() != reflect.String {
+			return b, errors.New("msgp: map keys must be strings")
+		}
+		ks := v.MapKeys()
+		b = AppendMapHeader(b, uint32(len(ks)))
+		for _, key := range ks {
+			val := v.MapIndex(key)
+			b = AppendString(b, key.String())
+			b, err = AppendIntf(b, val.Interface())
+			if err != nil {
+				return nil, err
+			}
+		}
+		return b, nil
 	case reflect.Array, reflect.Slice:
 		l := v.Len()
 		b = AppendArrayHeader(b, uint32(l))
@@ -408,4 +499,22 @@ func AppendIntf(b []byte, i interface{}) ([]byte, error) {
 	default:
 		return b, &ErrUnsupportedType{T: v.Type()}
 	}
+}
+
+// AppendJSONNumber appends a json.Number to the slice.
+// An error will be returned if the json.Number returns error as both integer and float.
+func AppendJSONNumber(b []byte, n json.Number) ([]byte, error) {
+	if n == "" {
+		// The zero value outputs the 0 integer.
+		return append(b, 0), nil
+	}
+	ii, err := n.Int64()
+	if err == nil {
+		return AppendInt64(b, ii), nil
+	}
+	ff, err := n.Float64()
+	if err == nil {
+		return AppendFloat(b, ff), nil
+	}
+	return b, err
 }

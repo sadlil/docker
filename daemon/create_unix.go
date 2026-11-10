@@ -1,7 +1,6 @@
 //go:build !windows
-// +build !windows
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
@@ -9,50 +8,53 @@ import (
 	"os"
 	"path/filepath"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	mounttypes "github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/oci"
-	"github.com/docker/docker/pkg/stringid"
-	volumeopts "github.com/docker/docker/volume/service/opts"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	containertypes "github.com/moby/moby/api/types/container"
+	mounttypes "github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/idtools"
+	"github.com/moby/moby/v2/daemon/pkg/oci"
+	volumemounts "github.com/moby/moby/v2/daemon/volume/mounts"
+	volumeopts "github.com/moby/moby/v2/daemon/volume/service/opts"
 	"github.com/opencontainers/selinux/go-selinux/label"
-	"github.com/sirupsen/logrus"
+	"github.com/pkg/errors"
 )
 
 // createContainerOSSpecificSettings performs host-OS specific container create functionality
-func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Container, config *containertypes.Config, hostConfig *containertypes.HostConfig) error {
-	if err := daemon.Mount(container); err != nil {
-		return err
-	}
-	defer daemon.Unmount(container)
-
-	rootIDs := daemon.idMapping.RootPair()
-	if err := container.SetupWorkingDirectory(rootIDs); err != nil {
-		return err
-	}
-
+func (daemon *Daemon) createContainerOSSpecificSettings(ctx context.Context, ctr *container.Container) error {
 	// Set the default masked and readonly paths with regard to the host config options if they are not set.
-	if hostConfig.MaskedPaths == nil && !hostConfig.Privileged {
-		hostConfig.MaskedPaths = oci.DefaultSpec().Linux.MaskedPaths // Set it to the default if nil
-		container.HostConfig.MaskedPaths = hostConfig.MaskedPaths
+	if ctr.HostConfig.MaskedPaths == nil && !ctr.HostConfig.Privileged {
+		ctr.HostConfig.MaskedPaths = oci.DefaultSpec().Linux.MaskedPaths // Set it to the default if nil
 	}
-	if hostConfig.ReadonlyPaths == nil && !hostConfig.Privileged {
-		hostConfig.ReadonlyPaths = oci.DefaultSpec().Linux.ReadonlyPaths // Set it to the default if nil
-		container.HostConfig.ReadonlyPaths = hostConfig.ReadonlyPaths
+	if ctr.HostConfig.ReadonlyPaths == nil && !ctr.HostConfig.Privileged {
+		ctr.HostConfig.ReadonlyPaths = oci.DefaultSpec().Linux.ReadonlyPaths // Set it to the default if nil
+	}
+	return nil
+}
+
+// createContainerVolumesOS performs host-OS specific volume creation
+func (daemon *Daemon) createContainerVolumesOS(ctx context.Context, ctr *container.Container, config *containertypes.Config) error {
+	if err := daemon.Mount(ctr); err != nil {
+		return err
+	}
+	defer daemon.Unmount(ctr)
+
+	if err := ctr.SetupWorkingDirectory(daemon.idMapping.RootPair()); err != nil {
+		return err
 	}
 
 	for spec := range config.Volumes {
-		name := stringid.GenerateRandomID()
 		destination := filepath.Clean(spec)
 
 		// Skip volumes for which we already have something mounted on that
 		// destination because of a --volume-from.
-		if container.HasMountFor(destination) {
-			logrus.WithField("container", container.ID).WithField("destination", spec).Debug("mountpoint already exists, skipping anonymous volume")
+		if ctr.HasMountFor(destination) {
+			log.G(ctx).WithField("container", ctr.ID).WithField("destination", spec).Debug("mountpoint already exists, skipping anonymous volume")
 			// Not an error, this could easily have come from the image config.
 			continue
 		}
-		path, err := container.GetResourcePath(destination)
+		path, err := ctr.GetResourcePath(destination)
 		if err != nil {
 			return err
 		}
@@ -62,23 +64,23 @@ func (daemon *Daemon) createContainerOSSpecificSettings(container *container.Con
 			return fmt.Errorf("cannot mount volume over existing file, file exists %s", path)
 		}
 
-		v, err := daemon.volumes.Create(context.TODO(), name, hostConfig.VolumeDriver, volumeopts.WithCreateReference(container.ID))
+		v, err := daemon.volumes.Create(context.TODO(), "", ctr.HostConfig.VolumeDriver, volumeopts.WithCreateReference(ctr.ID))
 		if err != nil {
 			return err
 		}
 
-		if err := label.Relabel(v.Mountpoint, container.MountLabel, true); err != nil {
+		if err := label.Relabel(v.Mountpoint, ctr.MountLabel, true); err != nil {
 			return err
 		}
 
-		container.AddMountPointWithVolume(destination, &volumeWrapper{v: v, s: daemon.volumes}, true)
+		ctr.AddMountPointWithVolume(destination, &volumeWrapper{v: v, s: daemon.volumes}, true)
 	}
-	return daemon.populateVolumes(container)
+	return daemon.populateVolumes(ctx, ctr)
 }
 
 // populateVolumes copies data from the container's rootfs into the volume for non-binds.
 // this is only called when the container is created.
-func (daemon *Daemon) populateVolumes(c *container.Container) error {
+func (daemon *Daemon) populateVolumes(ctx context.Context, c *container.Container) error {
 	for _, mnt := range c.MountPoints {
 		if mnt.Volume == nil {
 			continue
@@ -88,10 +90,52 @@ func (daemon *Daemon) populateVolumes(c *container.Container) error {
 			continue
 		}
 
-		logrus.Debugf("copying image data from %s:%s, to %s", c.ID, mnt.Destination, mnt.Name)
-		if err := c.CopyImagePathContent(mnt.Volume, mnt.Destination); err != nil {
+		if err := daemon.populateVolume(ctx, c, mnt); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+func (daemon *Daemon) populateVolume(ctx context.Context, c *container.Container, mnt *volumemounts.MountPoint) error {
+	ctrDestPath, err := c.GetResourcePath(mnt.Destination)
+	if err != nil {
+		return err
+	}
+
+	stat, err := os.Stat(ctrDestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	// Volume population copies directory contents from the container image
+	// into the volume. This only applies when the source is a directory.
+	if !stat.IsDir() {
+		return nil
+	}
+
+	uid, gid := daemon.idMapping.RootPair()
+	volumePath, cleanup, err := mnt.Setup(ctx, c.MountLabel, idtools.Identity{UID: uid, GID: gid}, nil)
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return nil
+		}
+		log.G(ctx).WithError(err).Debugf("can't copy data from %s:%s, to %s", c.ID, mnt.Destination, volumePath)
+		return errors.Wrapf(err, "failed to populate volume")
+	}
+	defer func() {
+		ctx := context.WithoutCancel(ctx)
+		_ = cleanup(ctx)
+		_ = mnt.Cleanup(ctx)
+	}()
+
+	log.G(ctx).Debugf("copying image data from %s:%s, to %s", c.ID, mnt.Destination, volumePath)
+	if err := c.CopyImagePathContent(volumePath, ctrDestPath); err != nil {
+		return err
+	}
+
 	return nil
 }

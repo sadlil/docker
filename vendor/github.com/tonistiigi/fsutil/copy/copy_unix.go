@@ -1,5 +1,4 @@
-//go:build solaris || darwin || freebsd
-// +build solaris darwin freebsd
+//go:build solaris || darwin || freebsd || openbsd || netbsd
 
 package fs
 
@@ -16,8 +15,7 @@ func getUIDGID(fi os.FileInfo) (uid, gid int) {
 	return int(st.Uid), int(st.Gid)
 }
 
-func (c *copier) copyFileInfo(fi os.FileInfo, name string) error {
-	st := fi.Sys().(*syscall.Stat_t)
+func (c *copier) copyFileInfo(fi os.FileInfo, _, name string) error {
 	chown := c.chown
 	uid, gid := getUIDGID(fi)
 	old := &User{UID: uid, GID: gid}
@@ -31,8 +29,19 @@ func (c *copier) copyFileInfo(fi os.FileInfo, name string) error {
 	}
 
 	m := fi.Mode()
-	if c.mode != nil {
-		m = (m & ^os.FileMode(0777)) | os.FileMode(*c.mode&0777)
+	if c.modeSet != nil {
+		m = c.modeSet.Apply(m)
+	} else if c.mode != nil {
+		m = os.FileMode(*c.mode).Perm()
+		if *c.mode&syscall.S_ISGID != 0 {
+			m |= os.ModeSetgid
+		}
+		if *c.mode&syscall.S_ISUID != 0 {
+			m |= os.ModeSetuid
+		}
+		if *c.mode&syscall.S_ISVTX != 0 {
+			m |= os.ModeSticky
+		}
 	}
 	if (fi.Mode() & os.ModeSymlink) != os.ModeSymlink {
 		if err := os.Chmod(name, m); err != nil {
@@ -40,15 +49,25 @@ func (c *copier) copyFileInfo(fi os.FileInfo, name string) error {
 		}
 	}
 
+	if err := c.copyFileTimestamp(fi, name); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *copier) copyFileTimestamp(fi os.FileInfo, name string) error {
 	if c.utime != nil {
-		if err := Utimes(name, c.utime); err != nil {
-			return err
-		}
-	} else {
-		timespec := []unix.Timespec{unix.Timespec(StatAtime(st)), unix.Timespec(StatMtime(st))}
-		if err := unix.UtimesNanoAt(unix.AT_FDCWD, name, timespec, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return errors.Wrapf(err, "failed to utime %s", name)
-		}
+		return Utimes(name, c.utime)
+	}
+
+	st := fi.Sys().(*syscall.Stat_t)
+	atime, mtime := StatAtime(st), StatMtime(st)
+	timespec := []unix.Timespec{
+		{Sec: atime.Sec, Nsec: atime.Nsec},
+		{Sec: mtime.Sec, Nsec: mtime.Nsec},
+	}
+	if err := unix.UtimesNanoAt(unix.AT_FDCWD, name, timespec, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return errors.Wrapf(err, "failed to utime %s", name)
 	}
 	return nil
 }

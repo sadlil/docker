@@ -1,4 +1,4 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
@@ -6,27 +6,37 @@ import (
 	"encoding/json"
 	"io"
 
-	"github.com/docker/docker/api/types/swarm"
+	"github.com/moby/moby/api/types/swarm"
 )
 
-// NodeInspectWithRaw returns the node information.
-func (cli *Client) NodeInspectWithRaw(ctx context.Context, nodeID string) (swarm.Node, []byte, error) {
-	if nodeID == "" {
-		return swarm.Node{}, nil, objectNotFoundError{object: "node", id: nodeID}
-	}
-	serverResp, err := cli.get(ctx, "/nodes/"+nodeID, nil, nil)
-	defer ensureReaderClosed(serverResp)
+// NodeInspectOptions holds parameters to inspect nodes with.
+type NodeInspectOptions struct{}
+
+// NodeInspectResult holds the result of [Client.NodeInspect].
+type NodeInspectResult struct {
+	Node swarm.Node
+	Raw  json.RawMessage
+}
+
+// NodeInspect returns the node information.
+func (cli *Client) NodeInspect(ctx context.Context, nodeID string, options NodeInspectOptions) (NodeInspectResult, error) {
+	nodeID, err := trimID("node", nodeID)
 	if err != nil {
-		return swarm.Node{}, nil, wrapResponseError(err, serverResp, "node", nodeID)
+		return NodeInspectResult{}, err
+	}
+	resp, err := cli.get(ctx, "/nodes/"+nodeID, nil, nil)
+	defer ensureReaderClosed(resp)
+	if err != nil {
+		return NodeInspectResult{}, err
 	}
 
-	body, err := io.ReadAll(serverResp.body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return swarm.Node{}, nil, err
+		return NodeInspectResult{}, err
 	}
 
 	var response swarm.Node
 	rdr := bytes.NewReader(body)
 	err = json.NewDecoder(rdr).Decode(&response)
-	return response, body, err
+	return NodeInspectResult{Node: response, Raw: body}, err
 }

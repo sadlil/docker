@@ -1,13 +1,20 @@
 //go:build linux
-// +build linux
 
-package btrfs // import "github.com/docker/docker/daemon/graphdriver/btrfs"
+package btrfs
 
 /*
 #include <stdlib.h>
+#include <stdio.h>
 #include <dirent.h>
-#include <btrfs/ioctl.h>
-#include <btrfs/ctree.h>
+
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
+    #error "Headers from kernel >= 4.12 are required to build with Btrfs support."
+    #error "HINT: Set 'DOCKER_BUILDTAGS=exclude_graphdriver_btrfs' to build without Btrfs."
+#endif
+
+#include <linux/btrfs.h>
+#include <linux/btrfs_tree.h>
 
 static void set_name_btrfs_ioctl_vol_args_v2(struct btrfs_ioctl_vol_args_v2* btrfs_struct, const char* value) {
     snprintf(btrfs_struct->name, BTRFS_SUBVOL_NAME_MAX, "%s", value);
@@ -16,6 +23,7 @@ static void set_name_btrfs_ioctl_vol_args_v2(struct btrfs_ioctl_vol_args_v2* btr
 import "C"
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -26,16 +34,16 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/containerd/containerd/pkg/userns"
-	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/pkg/containerfs"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers"
-	units "github.com/docker/go-units"
+	"github.com/containerd/log"
+	"github.com/docker/go-units"
+	"github.com/moby/moby/v2/daemon/graphdriver"
+	"github.com/moby/moby/v2/daemon/internal/containerfs"
+	"github.com/moby/moby/v2/daemon/internal/fstype"
 	"github.com/moby/sys/mount"
+	"github.com/moby/sys/user"
+	"github.com/moby/sys/userns"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -50,8 +58,7 @@ type btrfsOptions struct {
 
 // Init returns a new BTRFS driver.
 // An error is returned if BTRFS is not supported.
-func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
-
+func Init(home string, options []string, idMap user.IdentityMapping) (graphdriver.Driver, error) {
 	// Perform feature detection on /var/lib/docker/btrfs if it's an existing directory.
 	// This covers situations where /var/lib/docker/btrfs is a mount, and on a different
 	// filesystem than /var/lib/docker.
@@ -61,23 +68,17 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		testdir = filepath.Dir(testdir)
 	}
 
-	fsMagic, err := graphdriver.GetFSMagic(testdir)
+	fsMagic, err := fstype.GetFSMagic(testdir)
 	if err != nil {
 		return nil, err
 	}
 
-	if fsMagic != graphdriver.FsMagicBtrfs {
+	if fsMagic != fstype.FsMagicBtrfs {
 		return nil, graphdriver.ErrPrerequisites
 	}
 
-	remappedRoot := idtools.NewIDMappingsFromMaps(uidMaps, gidMaps)
-	currentID := idtools.CurrentIdentity()
-	dirID := idtools.Identity{
-		UID: currentID.UID,
-		GID: remappedRoot.RootPair().GID,
-	}
-
-	if err := idtools.MkdirAllAndChown(home, 0710, dirID); err != nil {
+	_, gid := idMap.RootPair()
+	if err := user.MkdirAndChown(home, 0o710, os.Getuid(), gid); err != nil {
 		return nil, err
 	}
 
@@ -97,8 +98,7 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 
 	driver := &Driver{
 		home:    home,
-		uidMaps: uidMaps,
-		gidMaps: gidMaps,
+		idMap:   idMap,
 		options: opt,
 	}
 
@@ -108,14 +108,14 @@ func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (grap
 		}
 	}
 
-	return graphdriver.NewNaiveDiffDriver(driver, uidMaps, gidMaps), nil
+	return graphdriver.NewNaiveDiffDriver(driver, driver.idMap), nil
 }
 
 func parseOptions(opt []string) (btrfsOptions, bool, error) {
 	var options btrfsOptions
 	userDiskQuota := false
 	for _, option := range opt {
-		key, val, err := parsers.ParseKeyValueOpt(option)
+		key, val, err := graphdriver.ParseStorageOptKeyValue(option)
 		if err != nil {
 			return options, userDiskQuota, err
 		}
@@ -129,7 +129,7 @@ func parseOptions(opt []string) (btrfsOptions, bool, error) {
 			userDiskQuota = true
 			options.minSpace = uint64(minSpace)
 		default:
-			return options, userDiskQuota, fmt.Errorf("Unknown option %s", key)
+			return options, userDiskQuota, errors.New("unknown option " + key)
 		}
 	}
 	return options, userDiskQuota, nil
@@ -139,8 +139,7 @@ func parseOptions(opt []string) (btrfsOptions, bool, error) {
 type Driver struct {
 	// root of the file system
 	home         string
-	uidMaps      []idtools.IDMap
-	gidMaps      []idtools.IDMap
+	idMap        user.IdentityMapping
 	options      btrfsOptions
 	quotaEnabled bool
 	once         sync.Once
@@ -151,18 +150,11 @@ func (d *Driver) String() string {
 	return "btrfs"
 }
 
-// Status returns current driver information in a two dimensional string array.
-// Output contains "Build Version" and "Library Version" of the btrfs libraries used.
-// Version information can be used to check compatibility with your kernel.
+// Status returns the status of the driver.
 func (d *Driver) Status() [][2]string {
-	status := [][2]string{}
-	if bv := btrfsBuildVersion(); bv != "-" {
-		status = append(status, [2]string{"Build Version", bv})
+	return [][2]string{
+		{"Btrfs", ""},
 	}
-	if lv := btrfsLibVersion(); lv != -1 {
-		status = append(status, [2]string{"Library Version", fmt.Sprintf("%d", lv)})
-	}
-	return status
 }
 
 // GetMetadata returns empty metadata for this driver.
@@ -189,7 +181,7 @@ func openDir(path string) (*C.DIR, error) {
 
 	dir := C.opendir(Cpath)
 	if dir == nil {
-		return nil, fmt.Errorf("Can't open dir")
+		return nil, errors.New("Can't open dir")
 	}
 	return dir, nil
 }
@@ -240,9 +232,9 @@ func subvolSnapshot(src, dest, name string) error {
 	var args C.struct_btrfs_ioctl_vol_args_v2
 	args.fd = C.__s64(getDirFd(srcDir))
 
-	var cs = C.CString(name)
+	cs := C.CString(name)
 	C.set_name_btrfs_ioctl_vol_args_v2(&args, cs)
-	C.free(unsafe.Pointer(cs))
+	free(cs)
 
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(destDir), C.BTRFS_IOC_SNAP_CREATE_V2,
 		uintptr(unsafe.Pointer(&args)))
@@ -273,7 +265,7 @@ func subvolDelete(dirpath, name string, quotaEnabled bool) error {
 	var args C.struct_btrfs_ioctl_vol_args
 
 	// walk the btrfs subvolumes
-	walkSubvolumes := func(p string, f os.FileInfo, err error) error {
+	walkSubVolumes := func(p string, f os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) && p != fullPath {
 				// missing most likely because the path was a subvolume that got removed in the previous iteration
@@ -297,7 +289,7 @@ func subvolDelete(dirpath, name string, quotaEnabled bool) error {
 		}
 		return nil
 	}
-	if err := filepath.Walk(path.Join(dirpath, name), walkSubvolumes); err != nil {
+	if err := filepath.WalkDir(path.Join(dirpath, name), walkSubVolumes); err != nil {
 		return fmt.Errorf("Recursively walking subvolumes for %s failed: %v", dirpath, err)
 	}
 
@@ -309,10 +301,10 @@ func subvolDelete(dirpath, name string, quotaEnabled bool) error {
 			_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QGROUP_CREATE,
 				uintptr(unsafe.Pointer(&args)))
 			if errno != 0 {
-				logrus.WithField("storage-driver", "btrfs").Errorf("Failed to delete btrfs qgroup %v for %s: %v", qgroupid, fullPath, errno.Error())
+				log.G(context.TODO()).WithField("storage-driver", "btrfs").Errorf("Failed to delete btrfs qgroup %v for %s: %v", qgroupid, fullPath, errno.Error())
 			}
 		} else {
-			logrus.WithField("storage-driver", "btrfs").Errorf("Failed to lookup btrfs qgroup for %s: %v", fullPath, err.Error())
+			log.G(context.TODO()).WithField("storage-driver", "btrfs").Errorf("Failed to lookup btrfs qgroup for %s: %v", fullPath, err.Error())
 		}
 	}
 
@@ -399,7 +391,7 @@ func subvolLimitQgroup(path string, size uint64) error {
 	defer closeDir(dir)
 
 	var args C.struct_btrfs_ioctl_qgroup_limit_args
-	args.lim.max_referenced = C.__u64(size)
+	args.lim.max_rfer = C.__u64(size)
 	args.lim.flags = C.BTRFS_QGROUP_LIMIT_MAX_RFER
 	_, _, errno := unix.Syscall(unix.SYS_IOCTL, getDirFd(dir), C.BTRFS_IOC_QGROUP_LIMIT,
 		uintptr(unsafe.Pointer(&args)))
@@ -490,18 +482,9 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 	quotas := path.Join(d.home, "quotas")
 	subvolumes := path.Join(d.home, "subvolumes")
-	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
-	if err != nil {
-		return err
-	}
 
-	currentID := idtools.CurrentIdentity()
-	dirID := idtools.Identity{
-		UID: currentID.UID,
-		GID: rootGID,
-	}
-
-	if err := idtools.MkdirAllAndChown(subvolumes, 0710, dirID); err != nil {
+	uid, gid := d.idMap.RootPair()
+	if err := user.MkdirAllAndChown(subvolumes, 0o710, os.Getuid(), gid); err != nil {
 		return err
 	}
 	if parent == "" {
@@ -515,11 +498,28 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 			return err
 		}
 		if !st.IsDir() {
-			return fmt.Errorf("%s: not a directory", parentDir)
+			return errors.New(parentDir + ": not a directory")
 		}
 		if err := subvolSnapshot(parentDir, subvolumes, id); err != nil {
 			return err
 		}
+	}
+
+	subvolPath := path.Join(subvolumes, id)
+
+	// if we have a remapped root (user namespaces enabled), change the created snapshot
+	// dir ownership to match
+	if uid != 0 || gid != 0 {
+		if err := os.Chown(subvolPath, uid, gid); err != nil {
+			return err
+		}
+	}
+
+	// Btrfs creates the subvolume's root inode with 0777&^umask, and the daemon
+	// runs with umask 0000, so set the mode explicitly, like the other
+	// graphdrivers do for the directories they create.
+	if err := os.Chmod(subvolPath, 0o755); err != nil {
+		return err
 	}
 
 	var storageOpt map[string]string
@@ -536,18 +536,10 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 		if err := d.setStorageSize(path.Join(subvolumes, id), driver); err != nil {
 			return err
 		}
-		if err := idtools.MkdirAllAndChown(quotas, 0700, idtools.CurrentIdentity()); err != nil {
+		if err := user.MkdirAllAndChown(quotas, 0o700, os.Getuid(), os.Getegid()); err != nil {
 			return err
 		}
-		if err := os.WriteFile(path.Join(quotas, id), []byte(fmt.Sprint(driver.options.size)), 0644); err != nil {
-			return err
-		}
-	}
-
-	// if we have a remapped root (user namespaces enabled), change the created snapshot
-	// dir ownership to match
-	if rootUID != 0 || rootGID != 0 {
-		if err := os.Chown(path.Join(subvolumes, id), rootUID, rootGID); err != nil {
+		if err := os.WriteFile(path.Join(quotas, id), []byte(strconv.FormatUint(driver.options.size, 10)), 0o644); err != nil {
 			return err
 		}
 	}
@@ -564,7 +556,7 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 func (d *Driver) parseStorageOpt(storageOpt map[string]string, driver *Driver) error {
 	// Read size to change the subvolume disk quota per container
 	for key, val := range storageOpt {
-		key := strings.ToLower(key)
+		key = strings.ToLower(key)
 		switch key {
 		case "size":
 			size, err := units.RAMInBytes(val)
@@ -573,7 +565,7 @@ func (d *Driver) parseStorageOpt(storageOpt map[string]string, driver *Driver) e
 			}
 			driver.options.size = uint64(size)
 		default:
-			return fmt.Errorf("Unknown option %s", key)
+			return errors.New("unknown option " + key)
 		}
 	}
 
@@ -633,29 +625,29 @@ func (d *Driver) Remove(id string) error {
 }
 
 // Get the requested filesystem id.
-func (d *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
+func (d *Driver) Get(id, mountLabel string) (string, error) {
 	dir := d.subvolumesDirID(id)
 	st, err := os.Stat(dir)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
 	if !st.IsDir() {
-		return nil, fmt.Errorf("%s: not a directory", dir)
+		return "", errors.New(dir + ": not a directory")
 	}
 
 	if quota, err := os.ReadFile(d.quotasDirID(id)); err == nil {
 		if size, err := strconv.ParseUint(string(quota), 10, 64); err == nil && size >= d.options.minSpace {
 			if err := d.enableQuota(); err != nil {
-				return nil, err
+				return "", err
 			}
 			if err := subvolLimitQgroup(dir, size); err != nil {
-				return nil, err
+				return "", err
 			}
 		}
 	}
 
-	return containerfs.NewLocalContainerFS(dir), nil
+	return dir, nil
 }
 
 // Put is not implemented for BTRFS as there is no cleanup required for the id.

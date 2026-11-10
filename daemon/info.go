@@ -1,156 +1,208 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/docker/docker/api"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/cli/debug"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/dockerversion"
-	"github.com/docker/docker/pkg/fileutils"
-	"github.com/docker/docker/pkg/parsers/kernel"
-	"github.com/docker/docker/pkg/parsers/operatingsystem"
-	"github.com/docker/docker/pkg/platform"
-	"github.com/docker/docker/pkg/sysinfo"
-	"github.com/docker/docker/pkg/system"
-	"github.com/docker/docker/registry"
-	metrics "github.com/docker/go-metrics"
+	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/log"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/v2/daemon/command/debug"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/internal/filedescriptors"
+	"github.com/moby/moby/v2/daemon/internal/metrics"
+	"github.com/moby/moby/v2/daemon/internal/mod"
+	"github.com/moby/moby/v2/daemon/internal/platform"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/pkg/registry"
+	"github.com/moby/moby/v2/dockerversion"
+	"github.com/moby/moby/v2/pkg/meminfo"
+	"github.com/moby/moby/v2/pkg/parsers/kernel"
+	"github.com/moby/moby/v2/pkg/parsers/operatingsystem"
+	"github.com/moby/moby/v2/pkg/sysinfo"
 	"github.com/opencontainers/selinux/go-selinux"
-	"github.com/sirupsen/logrus"
 )
 
+func doWithTrace[T any](ctx context.Context, name string, f func() T) T {
+	_, span := tracing.StartSpan(ctx, name)
+	defer span.End()
+	return f()
+}
+
 // SystemInfo returns information about the host server the daemon is running on.
-func (daemon *Daemon) SystemInfo() *types.Info {
-	defer metrics.StartTimer(hostInfoFunctions.WithValues("system_info"))()
+//
+// The only error this should return is due to context cancellation/deadline.
+// Anything else should be logged and ignored because this is looking up
+// multiple things and is often used for debugging.
+// The only case valid early return is when the caller doesn't want the result anymore (ie context cancelled).
+func (daemon *Daemon) SystemInfo(ctx context.Context) (*system.Info, error) {
+	defer metrics.StartTimer(metrics.HostInfoFunctions.WithValues("system_info"))()
 
-	sysInfo := daemon.RawSysInfo()
+	sysInfo, err := daemon.RawSysInfo()
+	if err != nil {
+		return nil, err
+	}
+	cfg := daemon.config()
 
-	v := &types.Info{
+	v := &system.Info{
 		ID:                 daemon.id,
-		Images:             daemon.imageService.CountImages(),
+		Images:             daemon.imageService.CountImages(ctx),
 		IPv4Forwarding:     !sysInfo.IPv4ForwardingDisabled,
-		BridgeNfIptables:   !sysInfo.BridgeNFCallIPTablesDisabled,
-		BridgeNfIP6tables:  !sysInfo.BridgeNFCallIP6TablesDisabled,
-		Name:               hostName(),
+		Name:               hostName(ctx),
 		SystemTime:         time.Now().Format(time.RFC3339Nano),
 		LoggingDriver:      daemon.defaultLogConfig.Type,
-		KernelVersion:      kernelVersion(),
-		OperatingSystem:    operatingSystem(),
-		OSVersion:          osVersion(),
+		KernelVersion:      kernelVersion(ctx),
+		OperatingSystem:    operatingSystem(ctx),
+		OSVersion:          osVersion(ctx),
 		IndexServerAddress: registry.IndexServer,
-		OSType:             platform.OSType,
-		Architecture:       platform.Architecture,
-		RegistryConfig:     daemon.registryService.ServiceConfig(),
-		NCPU:               sysinfo.NumCPU(),
-		MemTotal:           memInfo().MemTotal,
+		OSType:             runtime.GOOS,
+		Architecture:       platform.Architecture(),
+		RegistryConfig:     doWithTrace(ctx, "registry.ServiceConfig", daemon.registryService.ServiceConfig),
+		NCPU:               doWithTrace(ctx, "runtime.NumCPU", runtime.NumCPU),
+		MemTotal:           memInfo(ctx).MemTotal,
 		GenericResources:   daemon.genericResources,
-		DockerRootDir:      daemon.configStore.Root,
-		Labels:             daemon.configStore.Labels,
-		ExperimentalBuild:  daemon.configStore.Experimental,
+		DockerRootDir:      cfg.Root,
+		Labels:             cfg.Labels,
+		ExperimentalBuild:  cfg.Experimental,
 		ServerVersion:      dockerversion.Version,
-		HTTPProxy:          config.MaskCredentials(getConfigOrEnv(daemon.configStore.HTTPProxy, "HTTP_PROXY", "http_proxy")),
-		HTTPSProxy:         config.MaskCredentials(getConfigOrEnv(daemon.configStore.HTTPSProxy, "HTTPS_PROXY", "https_proxy")),
-		NoProxy:            getConfigOrEnv(daemon.configStore.NoProxy, "NO_PROXY", "no_proxy"),
-		LiveRestoreEnabled: daemon.configStore.LiveRestoreEnabled,
+		HTTPProxy:          config.MaskCredentials(getConfigOrEnv(cfg.HTTPProxy, "HTTP_PROXY", "http_proxy")),
+		HTTPSProxy:         config.MaskCredentials(getConfigOrEnv(cfg.HTTPSProxy, "HTTPS_PROXY", "https_proxy")),
+		NoProxy:            getConfigOrEnv(cfg.NoProxy, "NO_PROXY", "no_proxy"),
+		LiveRestoreEnabled: cfg.LiveRestoreEnabled,
 		Isolation:          daemon.defaultIsolation,
+		CDISpecDirs:        promoteNil(cfg.CDISpecDirs),
+		NRI:                daemon.nri.GetInfo(),
 	}
 
 	daemon.fillContainerStates(v)
-	daemon.fillDebugInfo(v)
-	daemon.fillAPIInfo(v)
+	daemon.fillDebugInfo(ctx, v)
+	daemon.fillContainerdInfo(v, &cfg.Config)
+	daemon.fillAPIInfo(v, &cfg.Config)
+
 	// Retrieve platform specific info
-	daemon.fillPlatformInfo(v, sysInfo)
-	daemon.fillDriverInfo(v)
-	daemon.fillPluginsInfo(v)
-	daemon.fillSecurityOptions(v, sysInfo)
-	daemon.fillLicense(v)
-	daemon.fillDefaultAddressPools(v)
-
-	if v.DefaultRuntime == config.LinuxV1RuntimeName {
-		v.Warnings = append(v.Warnings, fmt.Sprintf("Configured default runtime %q is deprecated and will be removed in the next release.", config.LinuxV1RuntimeName))
+	if err := daemon.fillPlatformInfo(ctx, v, sysInfo, cfg); err != nil {
+		return nil, err
 	}
+	daemon.fillDriverInfo(v)
+	daemon.fillPluginsInfo(ctx, v, &cfg.Config)
+	daemon.fillSecurityOptions(v, sysInfo, &cfg.Config)
+	daemon.fillLicense(v)
+	daemon.fillDefaultAddressPools(ctx, v, &cfg.Config)
+	daemon.fillFirewallInfo(v)
+	daemon.fillDiscoveredDevicesFromDrivers(ctx, v, &cfg.Config)
 
-	return v
+	return v, nil
 }
 
+const (
+	moduleName           = "github.com/moby/moby/v2"
+	defaultModuleVersion = "v2.0.0+unknown"
+)
+
+var moduleVersion = sync.OnceValue(func() string {
+	if v := mod.Version(moduleName); v != "" {
+		return v
+	}
+	return defaultModuleVersion
+})
+
 // SystemVersion returns version information about the daemon.
-func (daemon *Daemon) SystemVersion() types.Version {
-	defer metrics.StartTimer(hostInfoFunctions.WithValues("system_version"))()
+//
+// The only error this should return is due to context cancellation/deadline.
+// Anything else should be logged and ignored because this is looking up
+// multiple things and is often used for debugging.
+// The only case valid early return is when the caller doesn't want the result anymore (ie context cancelled).
+func (daemon *Daemon) SystemVersion(ctx context.Context) (system.VersionResponse, error) {
+	defer metrics.StartTimer(metrics.HostInfoFunctions.WithValues("system_version"))()
 
-	kernelVersion := kernelVersion()
+	kernelVer := kernelVersion(ctx)
+	cfg := daemon.config()
 
-	v := types.Version{
-		Components: []types.ComponentVersion{
+	v := system.VersionResponse{
+		Platform: system.PlatformInfo{
+			Name: dockerversion.PlatformName,
+		},
+		Version:       dockerversion.Version,
+		APIVersion:    config.MaxAPIVersion,
+		MinAPIVersion: cfg.MinAPIVersion,
+		Os:            runtime.GOOS,
+		Arch:          runtime.GOARCH,
+		Components: []system.ComponentVersion{
 			{
 				Name:    "Engine",
 				Version: dockerversion.Version,
 				Details: map[string]string{
 					"GitCommit":     dockerversion.GitCommit,
-					"ApiVersion":    api.DefaultVersion,
-					"MinAPIVersion": api.MinVersion,
+					"ApiVersion":    config.MaxAPIVersion,
+					"MinAPIVersion": cfg.MinAPIVersion,
 					"GoVersion":     runtime.Version(),
 					"Os":            runtime.GOOS,
 					"Arch":          runtime.GOARCH,
 					"BuildTime":     dockerversion.BuildTime,
-					"KernelVersion": kernelVersion,
-					"Experimental":  fmt.Sprintf("%t", daemon.configStore.Experimental),
+					"KernelVersion": kernelVer,
+					"Module":        moduleName,
+					"ModuleVersion": moduleVersion(),
+					"Experimental":  strconv.FormatBool(cfg.Experimental),
 				},
 			},
 		},
 
-		// Populate deprecated fields for older clients
-		Version:       dockerversion.Version,
+		// Populate deprecated fields for older clients.
+		//
+		// These fields were (soft) deprecated in API v1.35 in favor of the
+		// per-component build-info, but kept for backward-compatibility, see:
+		//
+		// - https://github.com/moby/moby/pull/35705
+		// - https://github.com/moby/moby/pull/51359
 		GitCommit:     dockerversion.GitCommit,
-		APIVersion:    api.DefaultVersion,
-		MinAPIVersion: api.MinVersion,
 		GoVersion:     runtime.Version(),
-		Os:            runtime.GOOS,
-		Arch:          runtime.GOARCH,
+		KernelVersion: kernelVer,
+		Experimental:  cfg.Experimental,
 		BuildTime:     dockerversion.BuildTime,
-		KernelVersion: kernelVersion,
-		Experimental:  daemon.configStore.Experimental,
 	}
 
-	v.Platform.Name = dockerversion.PlatformName
-
-	daemon.fillPlatformVersion(&v)
-	return v
+	if err := daemon.fillPlatformVersion(ctx, &v, cfg); err != nil {
+		return v, err
+	}
+	return v, nil
 }
 
-func (daemon *Daemon) fillDriverInfo(v *types.Info) {
-	switch daemon.graphDriver {
-	case "aufs", "devicemapper", "overlay":
-		v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: the %s storage-driver is deprecated, and will be removed in a future release.", daemon.graphDriver))
-	}
-
-	v.Driver = daemon.graphDriver
+func (daemon *Daemon) fillDriverInfo(v *system.Info) {
+	v.Driver = daemon.imageService.StorageDriver()
 	v.DriverStatus = daemon.imageService.LayerStoreStatus()
-
 	fillDriverWarnings(v)
 }
 
-func (daemon *Daemon) fillPluginsInfo(v *types.Info) {
-	v.Plugins = types.PluginsInfo{
+func (daemon *Daemon) fillPluginsInfo(ctx context.Context, v *system.Info, cfg *config.Config) {
+	v.Plugins = system.PluginsInfo{
 		Volume:  daemon.volumes.GetDriverList(),
-		Network: daemon.GetNetworkDriverList(),
+		Network: daemon.GetNetworkDriverList(ctx),
 
 		// The authorization plugins are returned in the order they are
 		// used as they constitute a request/response modification chain.
-		Authorization: daemon.configStore.AuthorizationPlugins,
+		Authorization: cfg.AuthorizationPlugins,
 		Log:           logger.ListDrivers(),
 	}
 }
 
-func (daemon *Daemon) fillSecurityOptions(v *types.Info, sysInfo *sysinfo.SysInfo) {
+// fillSecurityOptions fills the [system.Info.SecurityOptions] field based
+// on the daemon configuration.
+//
+// TODO(thaJeztah): consider making [system.Info.SecurityOptions] a structured response as originally intended in https://github.com/moby/moby/pull/26276
+func (daemon *Daemon) fillSecurityOptions(v *system.Info, sysInfo *sysinfo.SysInfo, cfg *config.Config) {
 	var securityOptions []string
 	if sysInfo.AppArmor {
-		securityOptions = append(securityOptions, "name=apparmor")
+		profile := daemon.appArmorProfilePath
+		if profile == "" {
+			profile = "default"
+		}
+		securityOptions = append(securityOptions, "name=apparmor,profile="+profile)
 	}
 	if sysInfo.Seccomp && supportsSeccomp {
 		if daemon.seccompProfilePath != config.SeccompProfileDefault {
@@ -161,21 +213,24 @@ func (daemon *Daemon) fillSecurityOptions(v *types.Info, sysInfo *sysinfo.SysInf
 	if selinux.GetEnabled() {
 		securityOptions = append(securityOptions, "name=selinux")
 	}
-	if rootIDs := daemon.idMapping.RootPair(); rootIDs.UID != 0 || rootIDs.GID != 0 {
+	if uid, gid := daemon.idMapping.RootPair(); uid != 0 || gid != 0 {
 		securityOptions = append(securityOptions, "name=userns")
 	}
-	if daemon.Rootless() {
+	if Rootless(cfg) {
 		securityOptions = append(securityOptions, "name=rootless")
 	}
-	if daemon.cgroupNamespacesEnabled(sysInfo) {
+	if cgroupNamespacesEnabled(sysInfo, cfg) {
 		securityOptions = append(securityOptions, "name=cgroupns")
+	}
+	if noNewPrivileges(cfg) {
+		securityOptions = append(securityOptions, "name=no-new-privileges")
 	}
 
 	v.SecurityOptions = securityOptions
 }
 
-func (daemon *Daemon) fillContainerStates(v *types.Info) {
-	cRunning, cPaused, cStopped := stateCtr.get()
+func (daemon *Daemon) fillContainerStates(v *system.Info) {
+	cRunning, cPaused, cStopped := metrics.StateCtr.Get()
 	v.Containers = cRunning + cPaused + cStopped
 	v.ContainersPaused = cPaused
 	v.ContainersRunning = cRunning
@@ -190,87 +245,122 @@ func (daemon *Daemon) fillContainerStates(v *types.Info) {
 // this information optional (cli to request "with debugging information"), or
 // only collect it if the daemon has debug enabled. For the CLI code, see
 // https://github.com/docker/cli/blob/v20.10.12/cli/command/system/info.go#L239-L244
-func (daemon *Daemon) fillDebugInfo(v *types.Info) {
+func (daemon *Daemon) fillDebugInfo(ctx context.Context, v *system.Info) {
 	v.Debug = debug.IsEnabled()
-	v.NFd = fileutils.GetTotalUsedFds()
+	v.NFd = filedescriptors.GetTotalUsedFds(ctx)
 	v.NGoroutines = runtime.NumGoroutine()
 	v.NEventsListener = daemon.EventsService.SubscribersCount()
 }
 
-func (daemon *Daemon) fillAPIInfo(v *types.Info) {
+// fillContainerdInfo provides information about the containerd configuration
+// for debugging purposes.
+func (daemon *Daemon) fillContainerdInfo(v *system.Info, cfg *config.Config) {
+	if cfg.Features["embedded-containerd"] {
+		v.Warnings = append(v.Warnings, "NOTE: Running with experimental embedded-containerd mode. In a future release, this mode may be used by default when no system containerd is available, rather than starting and supervising a separate containerd process. The option used to enable this mode may also change.")
+	}
+	if cfg.ContainerdAddr == "" {
+		return
+	}
+	v.Containerd = &system.ContainerdInfo{
+		Address: cfg.ContainerdAddr,
+		Namespaces: system.ContainerdNamespaces{
+			Containers: cfg.ContainerdNamespace,
+			Plugins:    cfg.ContainerdPluginNamespace,
+		},
+	}
+}
+
+func (daemon *Daemon) fillAPIInfo(v *system.Info, cfg *config.Config) {
 	const warn string = `
          Access to the remote API is equivalent to root access on the host. Refer
          to the 'Docker daemon attack surface' section in the documentation for
          more information: https://docs.docker.com/go/attack-surface/`
 
-	cfg := daemon.configStore
 	for _, host := range cfg.Hosts {
 		// cnf.Hosts is normalized during startup, so should always have a scheme/proto
-		h := strings.SplitN(host, "://", 2)
-		proto := h[0]
-		addr := h[1]
+		proto, addr, _ := strings.Cut(host, "://")
 		if proto != "tcp" {
 			continue
 		}
+		const removal = "In future versions this will be a hard failure preventing the daemon from starting! Learn more at: https://docs.docker.com/go/api-security/"
 		if cfg.TLS == nil || !*cfg.TLS {
-			v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: API is accessible on http://%s without encryption.%s", addr, warn))
+			v.Warnings = append(v.Warnings, fmt.Sprintf("[DEPRECATION NOTICE]: API is accessible on http://%s without encryption.%s\n%s", addr, warn, removal))
 			continue
 		}
 		if cfg.TLSVerify == nil || !*cfg.TLSVerify {
-			v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: API is accessible on https://%s without TLS client verification.%s", addr, warn))
+			v.Warnings = append(v.Warnings, fmt.Sprintf("[DEPRECATION NOTICE]: API is accessible on https://%s without TLS client verification.%s\n%s", addr, warn, removal))
 			continue
 		}
 	}
 }
 
-func (daemon *Daemon) fillDefaultAddressPools(v *types.Info) {
-	for _, pool := range daemon.configStore.DefaultAddressPools.Value() {
-		v.DefaultAddressPools = append(v.DefaultAddressPools, types.NetworkAddressPool{
+func (daemon *Daemon) fillDefaultAddressPools(ctx context.Context, v *system.Info, cfg *config.Config) {
+	_, span := tracing.StartSpan(ctx, "fillDefaultAddressPools")
+	defer span.End()
+	for _, pool := range cfg.DefaultAddressPools.Value() {
+		v.DefaultAddressPools = append(v.DefaultAddressPools, system.NetworkAddressPool{
 			Base: pool.Base,
 			Size: pool.Size,
 		})
 	}
 }
 
-func hostName() string {
-	hostname := ""
-	if hn, err := os.Hostname(); err != nil {
-		logrus.Warnf("Could not get hostname: %v", err)
-	} else {
-		hostname = hn
+func (daemon *Daemon) fillFirewallInfo(v *system.Info) {
+	if daemon.netController == nil {
+		return
 	}
-	return hostname
+	v.FirewallBackend = daemon.netController.FirewallBackend()
 }
 
-func kernelVersion() string {
-	var kernelVersion string
-	if kv, err := kernel.GetKernelVersion(); err != nil {
-		logrus.Warnf("Could not get kernel version: %v", err)
-	} else {
-		kernelVersion = kv.String()
-	}
-	return kernelVersion
-}
-
-func memInfo() *system.MemInfo {
-	memInfo, err := system.ReadMemInfo()
+func hostName(ctx context.Context) string {
+	ctx, span := tracing.StartSpan(ctx, "hostName")
+	defer span.End()
+	hn, err := os.Hostname()
 	if err != nil {
-		logrus.Errorf("Could not read system memory info: %v", err)
-		memInfo = &system.MemInfo{}
+		log.G(ctx).WithError(err).Warn("Could not get hostname")
+		return ""
 	}
-	return memInfo
+	return hn
 }
 
-func operatingSystem() (operatingSystem string) {
-	defer metrics.StartTimer(hostInfoFunctions.WithValues("operating_system"))()
+func kernelVersion(ctx context.Context) string {
+	ctx, span := tracing.StartSpan(ctx, "kernelVersion")
+	defer span.End()
+
+	var ver string
+	if kv, err := kernel.GetKernelVersion(); err != nil {
+		log.G(ctx).WithError(err).Warn("Could not get kernel version")
+	} else {
+		ver = kv.String()
+	}
+	return ver
+}
+
+func memInfo(ctx context.Context) *meminfo.Memory {
+	ctx, span := tracing.StartSpan(ctx, "memInfo")
+	defer span.End()
+
+	mi, err := meminfo.Read()
+	if err != nil {
+		log.G(ctx).WithError(err).Error("Could not read system memory info")
+		return &meminfo.Memory{}
+	}
+	return mi
+}
+
+func operatingSystem(ctx context.Context) (operatingSystem string) {
+	ctx, span := tracing.StartSpan(ctx, "operatingSystem")
+	defer span.End()
+
+	defer metrics.StartTimer(metrics.HostInfoFunctions.WithValues("operating_system"))()
 
 	if s, err := operatingsystem.GetOperatingSystem(); err != nil {
-		logrus.Warnf("Could not get operating system name: %v", err)
+		log.G(ctx).WithError(err).Warn("Could not get operating system name")
 	} else {
 		operatingSystem = s
 	}
 	if inContainer, err := operatingsystem.IsContainerized(); err != nil {
-		logrus.Errorf("Could not determine if daemon is containerized: %v", err)
+		log.G(ctx).WithError(err).Error("Could not determine if daemon is containerized")
 		operatingSystem += " (error determining if containerized)"
 	} else if inContainer {
 		operatingSystem += " (containerized)"
@@ -279,12 +369,16 @@ func operatingSystem() (operatingSystem string) {
 	return operatingSystem
 }
 
-func osVersion() (version string) {
-	defer metrics.StartTimer(hostInfoFunctions.WithValues("os_version"))()
+func osVersion(ctx context.Context) (version string) {
+	ctx, span := tracing.StartSpan(ctx, "osVersion")
+	defer span.End()
+
+	defer metrics.StartTimer(metrics.HostInfoFunctions.WithValues("os_version"))()
 
 	version, err := operatingsystem.GetOperatingSystemVersion()
 	if err != nil {
-		logrus.Warnf("Could not get operating system version: %v", err)
+		log.G(ctx).WithError(err).Warn("Could not get operating system version")
+		return ""
 	}
 
 	return version
@@ -304,4 +398,50 @@ func getConfigOrEnv(config string, env ...string) string {
 		return config
 	}
 	return getEnvAny(env...)
+}
+
+// promoteNil converts a nil slice to an empty slice of that type.
+// A non-nil slice is returned as is.
+func promoteNil[S ~[]E, E any](s S) S {
+	if s == nil {
+		return S{}
+	}
+	return s
+}
+
+// fillDiscoveredDevicesFromDrivers iterates over registered device drivers
+// and calls their ListDevices method (if available) to populate system info.
+func (daemon *Daemon) fillDiscoveredDevicesFromDrivers(ctx context.Context, v *system.Info, cfg *config.Config) {
+	ctx, span := tracing.StartSpan(ctx, "daemon.fillDiscoveredDevicesFromDrivers")
+	defer span.End()
+
+	// Make sure v.DiscoveredDevices is initialized to an empty slice instead of nil.
+	// This ensures that the JSON output is always a valid array, even if no devices are discovered.
+	v.DiscoveredDevices = []system.DeviceInfo{}
+
+	for driverName, driver := range deviceDrivers {
+		if driver.ListDevices == nil {
+			log.G(ctx).WithField("driver", driverName).Trace("Device driver does not implement ListDevices method.")
+			continue
+		}
+
+		ls, err := driver.ListDevices(ctx, cfg)
+		if err != nil {
+			log.G(ctx).WithFields(log.Fields{
+				"driver": driverName,
+				"error":  err,
+			}).Warn("Failed to list devices for driver")
+			v.Warnings = append(v.Warnings, fmt.Sprintf("Failed to list devices from driver '%s': %v", driverName, err))
+			continue
+		}
+
+		if len(ls.Warnings) > 0 {
+			v.Warnings = append(v.Warnings, ls.Warnings...)
+		}
+
+		for _, device := range ls.Devices {
+			device.Source = driverName
+			v.DiscoveredDevices = append(v.DiscoveredDevices, device)
+		}
+	}
 }

@@ -1,71 +1,74 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerStatsError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ContainerStats(context.Background(), "nothing", false)
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
+	_, err = client.ContainerStats(t.Context(), "nothing", ContainerStatsOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ContainerStats(t.Context(), "", ContainerStatsOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ContainerStats(t.Context(), "    ", ContainerStatsOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestContainerStats(t *testing.T) {
-	expectedURL := "/containers/container_id/stats"
-	cases := []struct {
+	const expectedURL = "/containers/container_id/stats"
+	tests := []struct {
 		stream         bool
 		expectedStream string
 	}{
 		{
-			expectedStream: "0",
+			expectedStream: "false",
 		},
 		{
 			stream:         true,
-			expectedStream: "1",
+			expectedStream: "true",
 		},
 	}
-	for _, c := range cases {
-		client := &Client{
-			client: newMockClient(func(r *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(r.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, r.URL)
-				}
+	for _, tc := range tests {
+		client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+				return nil, err
+			}
 
-				query := r.URL.Query()
-				stream := query.Get("stream")
-				if stream != c.expectedStream {
-					return nil, fmt.Errorf("stream not set in URL query properly. Expected '%s', got %s", c.expectedStream, stream)
-				}
-
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte("response"))),
-				}, nil
-			}),
-		}
-		resp, err := client.ContainerStats(context.Background(), "container_id", c.stream)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
+			query := req.URL.Query()
+			stream := query.Get("stream")
+			if stream != tc.expectedStream {
+				return nil, fmt.Errorf("stream not set in URL query properly. Expected '%s', got %s", tc.expectedStream, stream)
+			}
+			return mockJSONResponse(http.StatusOK, nil, container.StatsResponse{ID: "container_id"})(req)
+		}))
+		assert.NilError(t, err)
+		resp, err := client.ContainerStats(t.Context(), "container_id", ContainerStatsOptions{
+			Stream: tc.stream,
+		})
+		assert.NilError(t, err)
+		t.Cleanup(func() {
+			_ = resp.Body.Close()
+		})
 		content, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(content) != "response" {
-			t.Fatalf("expected response to contain 'response', got %s", string(content))
-		}
+		assert.NilError(t, err)
+
+		var stats container.StatsResponse
+		err = json.Unmarshal(content, &stats)
+		assert.NilError(t, err)
+		assert.Check(t, is.Equal(stats.ID, "container_id"))
 	}
 }

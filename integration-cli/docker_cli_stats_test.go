@@ -2,25 +2,35 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
-func (s *DockerSuite) TestStatsNoStream(c *testing.T) {
-	// Windows does not support stats
-	testRequires(c, DaemonIsLinux)
-	out, _ := dockerCmd(c, "run", "-d", "busybox", "top")
-	id := strings.TrimSpace(out)
-	assert.NilError(c, waitRun(id))
+type DockerCLIStatsSuite struct {
+	ds *DockerSuite
+}
 
-	statsCmd := exec.Command(dockerBinary, "stats", "--no-stream", id)
+func (s *DockerCLIStatsSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
+}
+
+func (s *DockerCLIStatsSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
+}
+
+func (s *DockerCLIStatsSuite) TestStatsNoStream(c *testing.T) {
+	cID := runSleepingContainer(c)
+	cli.WaitRun(c, cID)
+
+	statsCmd := exec.Command(dockerBinary, "stats", "--no-stream", cID)
 	type output struct {
 		out []byte
 		err error
@@ -35,17 +45,14 @@ func (s *DockerSuite) TestStatsNoStream(c *testing.T) {
 	select {
 	case outerr := <-ch:
 		assert.NilError(c, outerr.err, "Error running stats: %v", outerr.err)
-		assert.Assert(c, is.Contains(string(outerr.out), id[:12]), "running container wasn't present in output")
+		assert.Assert(c, is.Contains(string(outerr.out), cID[:12]), "running container wasn't present in output")
 	case <-time.After(3 * time.Second):
 		statsCmd.Process.Kill()
 		c.Fatalf("stats did not return immediately when not streaming")
 	}
 }
 
-func (s *DockerSuite) TestStatsContainerNotFound(c *testing.T) {
-	// Windows does not support stats
-	testRequires(c, DaemonIsLinux)
-
+func (s *DockerCLIStatsSuite) TestStatsContainerNotFound(c *testing.T) {
 	out, _, err := dockerCmdWithError("stats", "notfound")
 	assert.ErrorContains(c, err, "")
 	assert.Assert(c, is.Contains(out, "No such container: notfound"), "Expected to fail on not found container stats, got %q instead", out)
@@ -55,22 +62,16 @@ func (s *DockerSuite) TestStatsContainerNotFound(c *testing.T) {
 	assert.Assert(c, is.Contains(out, "No such container: notfound"), "Expected to fail on not found container stats with --no-stream, got %q instead", out)
 }
 
-func (s *DockerSuite) TestStatsAllRunningNoStream(c *testing.T) {
-	// Windows does not support stats
-	testRequires(c, DaemonIsLinux)
+func (s *DockerCLIStatsSuite) TestStatsAllRunningNoStream(c *testing.T) {
+	id1 := runSleepingContainer(c)[:12]
+	cli.WaitRun(c, id1)
+	id2 := runSleepingContainer(c)[:12]
+	cli.WaitRun(c, id2)
+	id3 := runSleepingContainer(c)[:12]
+	cli.WaitRun(c, id3)
+	cli.DockerCmd(c, "stop", id3)
 
-	out, _ := dockerCmd(c, "run", "-d", "busybox", "top")
-	id1 := strings.TrimSpace(out)[:12]
-	assert.NilError(c, waitRun(id1))
-	out, _ = dockerCmd(c, "run", "-d", "busybox", "top")
-	id2 := strings.TrimSpace(out)[:12]
-	assert.NilError(c, waitRun(id2))
-	out, _ = dockerCmd(c, "run", "-d", "busybox", "top")
-	id3 := strings.TrimSpace(out)[:12]
-	assert.NilError(c, waitRun(id3))
-	dockerCmd(c, "stop", id3)
-
-	out, _ = dockerCmd(c, "stats", "--no-stream")
+	out := cli.DockerCmd(c, "stats", "--no-stream").Combined()
 	if !strings.Contains(out, id1) || !strings.Contains(out, id2) {
 		c.Fatalf("Expected stats output to contain both %s and %s, got %s", id1, id2, out)
 	}
@@ -91,19 +92,14 @@ func (s *DockerSuite) TestStatsAllRunningNoStream(c *testing.T) {
 	assert.Assert(c, realData != nil, "stat result are empty: %s", out)
 }
 
-func (s *DockerSuite) TestStatsAllNoStream(c *testing.T) {
-	// Windows does not support stats
-	testRequires(c, DaemonIsLinux)
+func (s *DockerCLIStatsSuite) TestStatsAllNoStream(c *testing.T) {
+	id1 := runSleepingContainer(c)[:12]
+	cli.WaitRun(c, id1)
+	cli.DockerCmd(c, "stop", id1)
+	id2 := runSleepingContainer(c)[:12]
+	cli.WaitRun(c, id2)
 
-	out, _ := dockerCmd(c, "run", "-d", "busybox", "top")
-	id1 := strings.TrimSpace(out)[:12]
-	assert.NilError(c, waitRun(id1))
-	dockerCmd(c, "stop", id1)
-	out, _ = dockerCmd(c, "run", "-d", "busybox", "top")
-	id2 := strings.TrimSpace(out)[:12]
-	assert.NilError(c, waitRun(id2))
-
-	out, _ = dockerCmd(c, "stats", "--all", "--no-stream")
+	out := cli.DockerCmd(c, "stats", "--all", "--no-stream").Combined()
 	if !strings.Contains(out, id1) || !strings.Contains(out, id2) {
 		c.Fatalf("Expected stats output to contain both %s and %s, got %s", id1, id2, out)
 	}
@@ -121,10 +117,7 @@ func (s *DockerSuite) TestStatsAllNoStream(c *testing.T) {
 	assert.Assert(c, realData == nil, "stat result of %s should be empty : %s", id1, out)
 }
 
-func (s *DockerSuite) TestStatsAllNewContainersAdded(c *testing.T) {
-	// Windows does not support stats
-	testRequires(c, DaemonIsLinux)
-
+func (s *DockerCLIStatsSuite) TestStatsAllNewContainersAdded(c *testing.T) {
 	id := make(chan string)
 	addedChan := make(chan struct{})
 
@@ -151,7 +144,7 @@ func (s *DockerSuite) TestStatsAllNewContainersAdded(c *testing.T) {
 	}()
 
 	out := runSleepingContainer(c, "-d")
-	assert.NilError(c, waitRun(strings.TrimSpace(out)))
+	cli.WaitRun(c, out)
 	id <- strings.TrimSpace(out)[:12]
 
 	select {
@@ -162,14 +155,11 @@ func (s *DockerSuite) TestStatsAllNewContainersAdded(c *testing.T) {
 	}
 }
 
-func (s *DockerSuite) TestStatsFormatAll(c *testing.T) {
-	// Windows does not support stats
-	testRequires(c, DaemonIsLinux)
-
-	cli.DockerCmd(c, "run", "-d", "--name=RunningOne", "busybox", "top")
+func (s *DockerCLIStatsSuite) TestStatsFormatAll(c *testing.T) {
+	runSleepingContainer(c, "--name=RunningOne")
 	cli.WaitRun(c, "RunningOne")
-	cli.DockerCmd(c, "run", "-d", "--name=ExitedOne", "busybox", "top")
-	cli.DockerCmd(c, "stop", "ExitedOne")
+	runSleepingContainer(c, "--name=ExitedOne")
+	cli.DockerCmd(c, "kill", "ExitedOne")
 	cli.WaitExited(c, "ExitedOne", 5*time.Second)
 
 	out := cli.DockerCmd(c, "stats", "--no-stream", "--format", "{{.Name}}").Combined()

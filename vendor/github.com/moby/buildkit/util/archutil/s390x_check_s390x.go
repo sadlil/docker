@@ -1,7 +1,7 @@
-// +build s390x
+//go:build s390x
 
 package archutil
 
-func s390xSupported() error {
-	return nil
+func s390xSupported() (string, error) {
+	return "", nil
 }

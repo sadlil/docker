@@ -1,40 +1,75 @@
 //go:build linux
-// +build linux
 
-// Package journald provides the log driver for forwarding server logs
-// to endpoints that receive the systemd format.
-package journald // import "github.com/docker/docker/daemon/logger/journald"
+package journald
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"strconv"
-	"sync"
+	"sync/atomic"
+	"time"
 	"unicode"
 
 	"github.com/coreos/go-systemd/v22/journal"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/sirupsen/logrus"
+
+	"github.com/moby/moby/v2/daemon/internal/stringid"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/loggerutils"
 )
 
 const name = "journald"
 
+// Well-known user journal fields.
+// https://www.freedesktop.org/software/systemd/man/systemd.journal-fields.html
+const (
+	fieldSyslogIdentifier = "SYSLOG_IDENTIFIER"
+	fieldSyslogTimestamp  = "SYSLOG_TIMESTAMP"
+)
+
+// User journal fields used by the log driver.
+const (
+	fieldContainerID     = "CONTAINER_ID"
+	fieldContainerIDFull = "CONTAINER_ID_FULL"
+	fieldContainerName   = "CONTAINER_NAME"
+	fieldContainerTag    = "CONTAINER_TAG"
+	fieldImageName       = "IMAGE_NAME"
+
+	// Fields used to serialize PLogMetaData.
+
+	fieldPLogID         = "CONTAINER_PARTIAL_ID"
+	fieldPLogOrdinal    = "CONTAINER_PARTIAL_ORDINAL"
+	fieldPLogLast       = "CONTAINER_PARTIAL_LAST"
+	fieldPartialMessage = "CONTAINER_PARTIAL_MESSAGE"
+
+	fieldLogEpoch   = "CONTAINER_LOG_EPOCH"
+	fieldLogOrdinal = "CONTAINER_LOG_ORDINAL"
+)
+
+// waitUntilFlushed is set if read support is enabled and a no-op otherwise.
+var waitUntilFlushed func(*journald) error
+
 type journald struct {
-	mu      sync.Mutex        //nolint:structcheck,unused
-	vars    map[string]string // additional variables and values to send to the journal along with the log message
-	readers map[*logger.LogWatcher]struct{}
+	// Epoch identifier to distinguish sequence numbers from this instance
+	// vs. other instances.
+	epoch string
+	// Sequence number of the most recent message sent by this instance of
+	// the log driver, starting from 1. Corollary: ordinal == 0 implies no
+	// messages have been sent by this instance.
+	ordinal atomic.Uint64
+
+	vars map[string]string // additional variables and values to send to the journal along with the log message
+
+	closed chan struct{}
+
+	// Overrides for unit tests.
+
+	sendToJournal   func(message string, priority journal.Priority, vars map[string]string) error
+	journalReadDir  string        //nolint:unused // Referenced in read.go, which has more restrictive build constraints.
+	readSyncTimeout time.Duration //nolint:unused // Referenced in read.go, which has more restrictive build constraints.
 }
 
-func init() {
-	if err := logger.RegisterLogDriver(name, New); err != nil {
-		logrus.Fatal(err)
-	}
-	if err := logger.RegisterLogOptValidator(name, validateLogOpt); err != nil {
-		logrus.Fatal(err)
-	}
-}
-
-// sanitizeKeyMode returns the sanitized string so that it could be used in journald.
+// sanitizeKeyMod returns the sanitized string so that it could be used in journald.
 // In journald log, there are special requirements for fields.
 // Fields must be composed of uppercase letters, numbers, and underscores, but must
 // not start with an underscore.
@@ -46,10 +81,11 @@ func sanitizeKeyMod(s string) string {
 		} else if ('Z' < v || v < 'A') && ('9' < v || v < '0') {
 			v = '_'
 		}
-		// If (n == "" && v == '_'), then we will skip as this is the beginning with '_'
-		if !(n == "" && v == '_') {
-			n += string(v)
+		if n == "" && v == '_' {
+			// skip leading underscores
+			continue
 		}
+		n += string(v)
 	}
 	return n
 }
@@ -58,43 +94,49 @@ func sanitizeKeyMod(s string) string {
 // the context.
 func New(info logger.Info) (logger.Logger, error) {
 	if !journal.Enabled() {
-		return nil, fmt.Errorf("journald is not enabled on this host")
+		return nil, errors.New("journald is not enabled on this host")
 	}
 
+	return newJournald(info)
+}
+
+func newJournald(info logger.Info) (*journald, error) {
 	// parse log tag
 	tag, err := loggerutils.ParseLogTag(info, loggerutils.DefaultTemplate)
 	if err != nil {
 		return nil, err
 	}
 
+	epoch := stringid.GenerateRandomID()
+
 	vars := map[string]string{
-		"CONTAINER_ID":      info.ContainerID[:12],
-		"CONTAINER_ID_FULL": info.ContainerID,
-		"CONTAINER_NAME":    info.Name(),
-		"CONTAINER_TAG":     tag,
-		"IMAGE_NAME":        info.ImageName(),
-		"SYSLOG_IDENTIFIER": tag,
+		fieldContainerID:      info.ContainerID[:12],
+		fieldContainerIDFull:  info.ContainerID,
+		fieldContainerName:    info.Name(),
+		fieldContainerTag:     tag,
+		fieldImageName:        info.ImageName(),
+		fieldSyslogIdentifier: tag,
+		fieldLogEpoch:         epoch,
 	}
 	extraAttrs, err := info.ExtraAttributes(sanitizeKeyMod)
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range extraAttrs {
-		vars[k] = v
-	}
-	return &journald{vars: vars, readers: make(map[*logger.LogWatcher]struct{})}, nil
+	maps.Copy(vars, extraAttrs)
+	return &journald{
+		epoch:         epoch,
+		vars:          vars,
+		closed:        make(chan struct{}),
+		sendToJournal: journal.Send,
+	}, nil
 }
 
-// We don't actually accept any options, but we have to supply a callback for
-// the factory to pass the (probably empty) configuration map to.
 func validateLogOpt(cfg map[string]string) error {
 	for key := range cfg {
 		switch key {
-		case "labels":
-		case "labels-regex":
-		case "env":
-		case "env-regex":
-		case "tag":
+		case logger.AttrEnv, logger.AttrEnvRegex, logger.AttrLabels, logger.AttrLabelsRegex, logger.AttrLogTag:
+			// Common attributes handled through [logger.Info.ExtraAttributes] and [loggerutils.ParseLogTag].
+			continue
 		default:
 			return fmt.Errorf("unknown log opt '%s' for journald log driver", key)
 		}
@@ -102,30 +144,44 @@ func validateLogOpt(cfg map[string]string) error {
 	return nil
 }
 
-func (s *journald) Log(msg *logger.Message) error {
+func (s *journald) Log(msg *logger.Message) (err error) {
+	defer func() {
+		if err == nil {
+			logger.PutMessage(msg)
+		}
+	}()
+
 	vars := map[string]string{}
-	for k, v := range s.vars {
-		vars[k] = v
+	maps.Copy(vars, s.vars)
+	if !msg.Timestamp.IsZero() {
+		vars[fieldSyslogTimestamp] = msg.Timestamp.Format(time.RFC3339Nano)
 	}
 	if msg.PLogMetaData != nil {
-		vars["CONTAINER_PARTIAL_ID"] = msg.PLogMetaData.ID
-		vars["CONTAINER_PARTIAL_ORDINAL"] = strconv.Itoa(msg.PLogMetaData.Ordinal)
-		vars["CONTAINER_PARTIAL_LAST"] = strconv.FormatBool(msg.PLogMetaData.Last)
+		vars[fieldPLogID] = msg.PLogMetaData.ID
+		vars[fieldPLogOrdinal] = strconv.Itoa(msg.PLogMetaData.Ordinal)
+		vars[fieldPLogLast] = strconv.FormatBool(msg.PLogMetaData.Last)
 		if !msg.PLogMetaData.Last {
-			vars["CONTAINER_PARTIAL_MESSAGE"] = "true"
+			vars[fieldPartialMessage] = "true"
 		}
 	}
 
-	line := string(msg.Line)
-	source := msg.Source
-	logger.PutMessage(msg)
+	seq := s.ordinal.Add(1)
+	vars[fieldLogOrdinal] = strconv.FormatUint(seq, 10)
 
-	if source == "stderr" {
-		return journal.Send(line, journal.PriErr, vars)
+	if msg.Source == "stderr" {
+		return s.sendToJournal(string(msg.Line), journal.PriErr, vars)
 	}
-	return journal.Send(line, journal.PriInfo, vars)
+	return s.sendToJournal(string(msg.Line), journal.PriInfo, vars)
 }
 
 func (s *journald) Name() string {
 	return name
+}
+
+func (s *journald) Close() error {
+	close(s.closed)
+	if waitUntilFlushed != nil {
+		return waitUntilFlushed(s)
+	}
+	return nil
 }

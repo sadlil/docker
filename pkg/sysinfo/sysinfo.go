@@ -1,6 +1,5 @@
-package sysinfo // import "github.com/docker/docker/pkg/sysinfo"
-
-import "github.com/docker/docker/pkg/parsers"
+// Package sysinfo stores information about which features a kernel supports.
+package sysinfo
 
 // Opt for New().
 type Opt func(info *SysInfo)
@@ -22,14 +21,11 @@ type SysInfo struct {
 	// Whether the kernel supports cgroup namespaces or not
 	CgroupNamespaces bool
 
+	// TimeNamespaces indicates whether the kernel supports time namespaces.
+	TimeNamespaces bool
+
 	// Whether IPv4 forwarding is supported or not, if this was disabled, networking will not work
 	IPv4ForwardingDisabled bool
-
-	// Whether bridge-nf-call-iptables is supported or not
-	BridgeNFCallIPTablesDisabled bool
-
-	// Whether bridge-nf-call-ip6tables is supported or not
-	BridgeNFCallIP6TablesDisabled bool
 
 	// Whether the cgroup has the mountpoint of "devices" or not
 	CgroupDevicesEnabled bool
@@ -70,12 +66,6 @@ type cgroupMemInfo struct {
 
 	// Whether memory swappiness is supported or not
 	MemorySwappiness bool
-
-	// Whether kernel memory limit is supported or not
-	KernelMemory bool
-
-	// Whether kernel memory TCP limit is supported or not
-	KernelMemoryTCP bool
 }
 
 type cgroupCPUInfo struct {
@@ -113,11 +103,21 @@ type cgroupCpusetInfo struct {
 	// Whether Cpuset is supported or not
 	Cpuset bool
 
-	// Available Cpuset's cpus
+	// Available Cpuset's cpus as read from "cpuset.cpus.effective" (cgroups v2)
+	// or "cpuset.cpus" (cgroups v1).
 	Cpus string
 
-	// Available Cpuset's memory nodes
+	// CPUSets holds the list of available cpusets parsed from "cpuset.cpus.effective" (cgroups v2)
+	// or "cpuset.cpus" (cgroups v1).
+	CPUSets map[int]struct{}
+
+	// Available Cpuset's memory nodes as read from "cpuset.mems.effective" (cgroups v2)
+	// or "cpuset.mems" (cgroups v1).
 	Mems string
+
+	// MemSets holds the list of available cpusets parsed from "cpuset.mems.effective" (cgroups v2)
+	// or "cpuset.mems" (cgroups v1).
+	MemSets map[int]struct{}
 }
 
 type cgroupPids struct {
@@ -128,38 +128,13 @@ type cgroupPids struct {
 // IsCpusetCpusAvailable returns `true` if the provided string set is contained
 // in cgroup's cpuset.cpus set, `false` otherwise.
 // If error is not nil a parsing error occurred.
-func (c cgroupCpusetInfo) IsCpusetCpusAvailable(provided string) (bool, error) {
-	return isCpusetListAvailable(provided, c.Cpus)
+func (c cgroupCpusetInfo) IsCpusetCpusAvailable(requested string) (bool, error) {
+	return isCpusetListAvailable(requested, c.CPUSets)
 }
 
 // IsCpusetMemsAvailable returns `true` if the provided string set is contained
 // in cgroup's cpuset.mems set, `false` otherwise.
 // If error is not nil a parsing error occurred.
-func (c cgroupCpusetInfo) IsCpusetMemsAvailable(provided string) (bool, error) {
-	return isCpusetListAvailable(provided, c.Mems)
-}
-
-func isCpusetListAvailable(provided, available string) (bool, error) {
-	parsedAvailable, err := parsers.ParseUintList(available)
-	if err != nil {
-		return false, err
-	}
-	// 8192 is the normal maximum number of CPUs in Linux, so accept numbers up to this
-	// or more if we actually have more CPUs.
-	max := 8192
-	for m := range parsedAvailable {
-		if m > max {
-			max = m
-		}
-	}
-	parsedProvided, err := parsers.ParseUintListMaximum(provided, max)
-	if err != nil {
-		return false, err
-	}
-	for k := range parsedProvided {
-		if !parsedAvailable[k] {
-			return false, nil
-		}
-	}
-	return true, nil
+func (c cgroupCpusetInfo) IsCpusetMemsAvailable(requested string) (bool, error) {
+	return isCpusetListAvailable(requested, c.MemSets)
 }

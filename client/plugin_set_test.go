@@ -1,48 +1,41 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestPluginSetError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	err := client.PluginSet(context.Background(), "plugin_name", []string{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.PluginSet(t.Context(), "plugin_name", PluginSetOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.PluginSet(t.Context(), "", PluginSetOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.PluginSet(t.Context(), "    ", PluginSetOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestPluginSet(t *testing.T) {
-	expectedURL := "/plugins/plugin_name/set"
+	const expectedURL = "/plugins/plugin_name/set"
 
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
-			if req.Method != http.MethodPost {
-				return nil, fmt.Errorf("expected POST method, got %s", req.Method)
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader([]byte(""))),
-			}, nil
-		}),
-	}
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+			return nil, err
+		}
+		return mockResponse(http.StatusOK, nil, "")(req)
+	}))
+	assert.NilError(t, err)
 
-	err := client.PluginSet(context.Background(), "plugin_name", []string{"arg1"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, err = client.PluginSet(t.Context(), "plugin_name", PluginSetOptions{Args: []string{"arg1"}})
+	assert.NilError(t, err)
 }

@@ -1,48 +1,47 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/image"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestImageListError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	_, err := client.ImageList(context.Background(), types.ImageListOptions{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.ImageList(t.Context(), ImageListOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+}
+
+// TestImageListConnectionError verifies that connection errors occurring
+// during API-version negotiation are not shadowed by API-version errors.
+//
+// Regression test for https://github.com/docker/cli/issues/4890
+func TestImageListConnectionError(t *testing.T) {
+	client, err := New(WithHost("tcp://no-such-host.invalid"))
+	assert.NilError(t, err)
+
+	_, err = client.ImageList(t.Context(), ImageListOptions{})
+	assert.Check(t, is.ErrorType(err, IsErrConnectionFailed))
 }
 
 func TestImageList(t *testing.T) {
-	expectedURL := "/images/json"
+	const expectedURL = "/images/json"
 
-	noDanglingfilters := filters.NewArgs()
-	noDanglingfilters.Add("dangling", "false")
-
-	filters := filters.NewArgs()
-	filters.Add("label", "label1")
-	filters.Add("label", "label2")
-	filters.Add("dangling", "true")
-
-	listCases := []struct {
-		options             types.ImageListOptions
+	tests := []struct {
+		doc                 string
+		options             ImageListOptions
 		expectedQueryParams map[string]string
 	}{
 		{
-			options: types.ImageListOptions{},
+			doc:     "no options",
+			options: ImageListOptions{},
 			expectedQueryParams: map[string]string{
 				"all":     "",
 				"filter":  "",
@@ -50,8 +49,12 @@ func TestImageList(t *testing.T) {
 			},
 		},
 		{
-			options: types.ImageListOptions{
-				Filters: filters,
+			doc: "label filters and dangling",
+			options: ImageListOptions{
+				Filters: make(Filters).
+					Add("label", "label1").
+					Add("label", "label2").
+					Add("dangling", "true"),
 			},
 			expectedQueryParams: map[string]string{
 				"all":     "",
@@ -60,8 +63,9 @@ func TestImageList(t *testing.T) {
 			},
 		},
 		{
-			options: types.ImageListOptions{
-				Filters: noDanglingfilters,
+			doc: "label filters no dangling",
+			options: ImageListOptions{
+				Filters: make(Filters).Add("dangling", "false"),
 			},
 			expectedQueryParams: map[string]string{
 				"all":     "",
@@ -69,92 +73,50 @@ func TestImageList(t *testing.T) {
 				"filters": `{"dangling":{"false":true}}`,
 			},
 		},
+		{
+			doc: "with shared size",
+			options: ImageListOptions{
+				SharedSize: true,
+			},
+			expectedQueryParams: map[string]string{
+				"shared-size": "1",
+			},
+		},
+		{
+			doc: "with identity",
+			options: ImageListOptions{
+				Identity: true,
+			},
+			expectedQueryParams: map[string]string{
+				"identity":  "1",
+				"manifests": "1",
+			},
+		},
 	}
-	for _, listCase := range listCases {
-		client := &Client{
-			client: newMockClient(func(req *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(req.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
+	for _, tc := range tests {
+		t.Run(tc.doc, func(t *testing.T) {
+			client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+				if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+					return nil, err
 				}
 				query := req.URL.Query()
-				for key, expected := range listCase.expectedQueryParams {
+				for key, expected := range tc.expectedQueryParams {
 					actual := query.Get(key)
 					if actual != expected {
 						return nil, fmt.Errorf("%s not set in URL query properly. Expected '%s', got %s", key, expected, actual)
 					}
 				}
-				content, err := json.Marshal([]types.ImageSummary{
-					{
-						ID: "image_id2",
-					},
-					{
-						ID: "image_id2",
-					},
-				})
-				if err != nil {
-					return nil, err
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader(content)),
-				}, nil
-			}),
-		}
+				return mockJSONResponse(http.StatusOK, nil, []image.Summary{
+					{ID: "image_id2"},
+					{ID: "image_id2"},
+				})(req)
+			}))
+			assert.NilError(t, err)
+			defer func() { _ = client.Close() }()
 
-		images, err := client.ImageList(context.Background(), listCase.options)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(images) != 2 {
-			t.Fatalf("expected 2 images, got %v", images)
-		}
-	}
-}
-
-func TestImageListApiBefore125(t *testing.T) {
-	expectedFilter := "image:tag"
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			query := req.URL.Query()
-			actualFilter := query.Get("filter")
-			if actualFilter != expectedFilter {
-				return nil, fmt.Errorf("filter not set in URL query properly. Expected '%s', got %s", expectedFilter, actualFilter)
-			}
-			actualFilters := query.Get("filters")
-			if actualFilters != "" {
-				return nil, fmt.Errorf("filters should have not been present, were with value: %s", actualFilters)
-			}
-			content, err := json.Marshal([]types.ImageSummary{
-				{
-					ID: "image_id2",
-				},
-				{
-					ID: "image_id2",
-				},
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(content)),
-			}, nil
-		}),
-		version: "1.24",
-	}
-
-	filters := filters.NewArgs()
-	filters.Add("reference", "image:tag")
-
-	options := types.ImageListOptions{
-		Filters: filters,
-	}
-
-	images, err := client.ImageList(context.Background(), options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(images) != 2 {
-		t.Fatalf("expected 2 images, got %v", images)
+			images, err := client.ImageList(t.Context(), tc.options)
+			assert.NilError(t, err)
+			assert.Check(t, is.Len(images.Items, 2))
+		})
 	}
 }

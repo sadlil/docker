@@ -1,13 +1,15 @@
+//go:build windows
+
 package computestorage
 
 import (
 	"context"
 	"encoding/json"
 
-	"github.com/Microsoft/hcsshim/internal/oc"
+	"github.com/Microsoft/hcsshim/internal/ot"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/pkg/errors"
-	"go.opencensus.io/trace"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/sys/windows"
 )
 
@@ -21,12 +23,12 @@ import (
 //
 // `options` are the options applied while processing the layer.
 func SetupBaseOSLayer(ctx context.Context, layerPath string, vhdHandle windows.Handle, options OsLayerOptions) (err error) {
-	title := "hcsshim.SetupBaseOSLayer"
-	ctx, span := trace.StartSpan(ctx, title) //nolint:ineffassign,staticcheck
+	title := "hcsshim::SetupBaseOSLayer"
+	ctx, span := ot.StartSpan(ctx, title) //nolint:ineffassign,staticcheck
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(
-		trace.StringAttribute("layerPath", layerPath),
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(
+		attribute.String("layerPath", layerPath),
 	)
 
 	bytes, err := json.Marshal(options)
@@ -48,17 +50,21 @@ func SetupBaseOSLayer(ctx context.Context, layerPath string, vhdHandle windows.H
 // `volumePath` is the path to the volume to be used for setup.
 //
 // `options` are the options applied while processing the layer.
+//
+// NOTE: This API is only available on builds of Windows greater than 19645. Inside we
+// check if the hosts build has the API available by using 'GetVersion' which requires
+// the calling application to be manifested. https://docs.microsoft.com/en-us/windows/win32/sbscs/manifests
 func SetupBaseOSVolume(ctx context.Context, layerPath, volumePath string, options OsLayerOptions) (err error) {
 	if osversion.Build() < 19645 {
 		return errors.New("SetupBaseOSVolume is not present on builds older than 19645")
 	}
-	title := "hcsshim.SetupBaseOSVolume"
-	ctx, span := trace.StartSpan(ctx, title) //nolint:ineffassign,staticcheck
+	title := "hcsshim::SetupBaseOSVolume"
+	ctx, span := ot.StartSpan(ctx, title) //nolint:ineffassign,staticcheck
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(
-		trace.StringAttribute("layerPath", layerPath),
-		trace.StringAttribute("volumePath", volumePath),
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(
+		attribute.String("layerPath", layerPath),
+		attribute.String("volumePath", volumePath),
 	)
 
 	bytes, err := json.Marshal(options)

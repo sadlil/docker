@@ -1,36 +1,55 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/volume"
 )
 
-// VolumesPrune requests the daemon to delete unused data
-func (cli *Client) VolumesPrune(ctx context.Context, pruneFilters filters.Args) (types.VolumesPruneReport, error) {
-	var report types.VolumesPruneReport
+// VolumePruneOptions holds parameters to prune volumes.
+type VolumePruneOptions struct {
+	// All controls whether named volumes should also be pruned. By
+	// default, only anonymous volumes are pruned.
+	All bool
 
-	if err := cli.NewVersionError("1.25", "volume prune"); err != nil {
-		return report, err
+	// Filters to apply when pruning.
+	Filters Filters
+}
+
+// VolumePruneResult holds the result from the [Client.VolumePrune] method.
+type VolumePruneResult struct {
+	Report volume.PruneReport
+}
+
+// VolumePrune requests the daemon to delete unused data
+func (cli *Client) VolumePrune(ctx context.Context, options VolumePruneOptions) (VolumePruneResult, error) {
+	if options.All {
+		if _, ok := options.Filters["all"]; ok {
+			return VolumePruneResult{}, cerrdefs.ErrInvalidArgument.WithMessage(`conflicting options: cannot specify both "all" and "all" filter`)
+		}
+		if options.Filters == nil {
+			options.Filters = Filters{}
+		}
+		options.Filters.Add("all", "true")
 	}
 
-	query, err := getFiltersQuery(pruneFilters)
+	query := url.Values{}
+	options.Filters.updateURLValues(query)
+
+	resp, err := cli.post(ctx, "/volumes/prune", query, nil, nil)
+	defer ensureReaderClosed(resp)
 	if err != nil {
-		return report, err
+		return VolumePruneResult{}, err
 	}
 
-	serverResp, err := cli.post(ctx, "/volumes/prune", query, nil, nil)
-	defer ensureReaderClosed(serverResp)
-	if err != nil {
-		return report, err
+	var report volume.PruneReport
+	if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		return VolumePruneResult{}, fmt.Errorf("error retrieving volume prune report: %v", err)
 	}
 
-	if err := json.NewDecoder(serverResp.body).Decode(&report); err != nil {
-		return report, fmt.Errorf("Error retrieving volume prune report: %v", err)
-	}
-
-	return report, nil
+	return VolumePruneResult{Report: report}, nil
 }

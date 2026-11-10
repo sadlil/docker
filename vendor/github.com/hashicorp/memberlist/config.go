@@ -1,3 +1,6 @@
+// Copyright IBM Corp. 2013, 2026
+// SPDX-License-Identifier: MPL-2.0
+
 package memberlist
 
 import (
@@ -9,7 +12,8 @@ import (
 	"strings"
 	"time"
 
-	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-metrics"
+	"github.com/hashicorp/go-multierror"
 )
 
 type Config struct {
@@ -20,6 +24,17 @@ type Config struct {
 	// other nodes. If this is left nil, then memberlist will by default
 	// make a NetTransport using BindAddr and BindPort from this structure.
 	Transport Transport
+
+	// Label is an optional set of bytes to include on the outside of each
+	// packet and stream.
+	//
+	// If gossip encryption is enabled and this is set it is treated as GCM
+	// authenticated data.
+	Label string
+
+	// SkipInboundLabelCheck skips the check that inbound packets and gossip
+	// streams need to be label prefixed.
+	SkipInboundLabelCheck bool
 
 	// Configuration related to what address to bind to and ports to
 	// listen on. The port is used for both UDP and TCP gossip. It is
@@ -233,10 +248,24 @@ type Config struct {
 	// RequireNodeNames controls if the name of a node is required when sending
 	// a message to that node.
 	RequireNodeNames bool
+
 	// CIDRsAllowed If nil, allow any connection (default), otherwise specify all networks
 	// allowed to connect (you must specify IPv6/IPv4 separately)
 	// Using [] will block all connections.
 	CIDRsAllowed []net.IPNet
+
+	// MetricLabels is a map of optional labels to apply to all metrics emitted.
+	MetricLabels []metrics.Label
+
+	// QueueCheckInterval is the interval at which we check the message
+	// queue to apply the warning and max depth.
+	QueueCheckInterval time.Duration
+
+	// MsgpackUseNewTimeFormat when set to true, force the underlying msgpack
+	// codec to use the new format of time.Time when encoding (used in
+	// go-msgpack v1.1.5 by default). Decoding is not affected, as all
+	// go-msgpack v2.1.0+ decoders know how to decode both formats.
+	MsgpackUseNewTimeFormat bool
 }
 
 // ParseCIDRs return a possible empty list of all Network that have been parsed
@@ -306,6 +335,8 @@ func DefaultLANConfig() *Config {
 		HandoffQueueDepth: 1024,
 		UDPBufferSize:     1400,
 		CIDRsAllowed:      nil, // same as allow all
+
+		QueueCheckInterval: 30 * time.Second,
 	}
 }
 

@@ -1,5 +1,3 @@
-// +build dfrunsecurity
-
 package dockerfile2llb
 
 import (

@@ -5,31 +5,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/gogo/googleapis/google/rpc"
-	gogotypes "github.com/gogo/protobuf/types"
-	"github.com/golang/protobuf/ptypes/any"
+	"github.com/containerd/containerd/v2/defaults"
+	distreference "github.com/distribution/reference"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/frontend/gateway/client"
-	"github.com/moby/buildkit/frontend/gateway/errdefs"
 	pb "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/identity"
 	opspb "github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/apicaps"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/grpcerrors"
+	"github.com/moby/buildkit/util/imageutil"
+	"github.com/moby/sys/signal"
 	digest "github.com/opencontainers/go-digest"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	fstypes "github.com/tonistiigi/fsutil/types"
 	"golang.org/x/sync/errgroup"
 	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -41,8 +47,9 @@ type GrpcClient interface {
 }
 
 func New(ctx context.Context, opts map[string]string, session, product string, c pb.LLBBridgeClient, w []client.WorkerInfo) (GrpcClient, error) {
-	pingCtx, pingCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer pingCancel()
+	pingCtx, pingCancel := context.WithCancelCause(ctx)
+	pingCtx, _ = context.WithTimeoutCause(pingCtx, 15*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
+	defer pingCancel(errors.WithStack(context.Canceled))
 	resp, err := c.Ping(pingCtx, &pb.PingRequest{})
 	if err != nil {
 		return nil, err
@@ -90,7 +97,8 @@ func convertRef(ref client.Reference) (*pb.Ref, error) {
 	if !ok {
 		return nil, errors.Errorf("invalid return reference type %T", ref)
 	}
-	return &pb.Ref{Id: r.id, Def: r.def}, nil
+	// Return only needs the ID of the reference held by the server.
+	return &pb.Ref{Id: r.id}, nil
 }
 
 func RunFromEnvironment(ctx context.Context, f client.BuildFunc) error {
@@ -113,7 +121,7 @@ func (c *grpcClient) Run(ctx context.Context, f client.BuildFunc) (retError erro
 			req := &pb.ReturnRequest{}
 			if retError == nil {
 				if res == nil {
-					res = &client.Result{}
+					res = client.NewResult()
 				}
 				pbRes := &pb.Result{
 					Metadata: res.Metadata,
@@ -158,17 +166,42 @@ func (c *grpcClient) Run(ctx context.Context, f client.BuildFunc) (retError erro
 						}
 					}
 				}
+
+				if res.Attestations != nil {
+					attestations := map[string]*pb.Attestations{}
+					for k, as := range res.Attestations {
+						for _, a := range as {
+							pbAtt, err := client.AttestationToPB(&a)
+							if err != nil {
+								retError = err
+								continue
+							}
+							pbRef, err := convertRef(a.Ref)
+							if err != nil {
+								retError = err
+								continue
+							}
+							pbAtt.Ref = pbRef
+							if attestations[k] == nil {
+								attestations[k] = &pb.Attestations{}
+							}
+							attestations[k].Attestation = append(attestations[k].Attestation, pbAtt)
+						}
+					}
+					pbRes.Attestations = attestations
+				}
+
 				if retError == nil {
 					req.Result = pbRes
 				}
 			}
 			if retError != nil {
-				st, _ := status.FromError(grpcerrors.ToGRPC(retError))
+				st, _ := status.FromError(grpcerrors.ToGRPC(ctx, retError))
 				stp := st.Proto()
-				req.Error = &rpc.Status{
+				req.Error = &spb.Status{
 					Code:    stp.Code,
 					Message: stp.Message,
-					Details: convertToGogoAny(stp.Details),
+					Details: stp.Details,
 				}
 			}
 			if _, err := c.client.Return(ctx, req); err != nil && retError == nil {
@@ -220,8 +253,8 @@ func (c *grpcClient) Run(ctx context.Context, f client.BuildFunc) (retError erro
 
 // defaultCaps returns the capabilities that were implemented when capabilities
 // support was added. This list is frozen and should never be changed.
-func defaultCaps() []apicaps.PBCap {
-	return []apicaps.PBCap{
+func defaultCaps() []*apicaps.PBCap {
+	return []*apicaps.PBCap{
 		{ID: string(pb.CapSolveBase), Enabled: true},
 		{ID: string(pb.CapSolveInlineReturn), Enabled: true},
 		{ID: string(pb.CapResolveImage), Enabled: true},
@@ -231,8 +264,8 @@ func defaultCaps() []apicaps.PBCap {
 
 // defaultLLBCaps returns the LLB capabilities that were implemented when capabilities
 // support was added. This list is frozen and should never be changed.
-func defaultLLBCaps() []apicaps.PBCap {
-	return []apicaps.PBCap{
+func defaultLLBCaps() []*apicaps.PBCap {
+	return []*apicaps.PBCap{
 		{ID: string(opspb.CapSourceImage), Enabled: true},
 		{ID: string(opspb.CapSourceLocal), Enabled: true},
 		{ID: string(opspb.CapSourceLocalUnique), Enabled: true},
@@ -298,31 +331,52 @@ func (c *grpcClient) requestForRef(ref client.Reference) (*pb.SolveRequest, erro
 	return req, nil
 }
 
+func (c *grpcClient) Warn(ctx context.Context, dgst digest.Digest, msg string, opts client.WarnOpts) error {
+	_, err := c.client.Warn(ctx, &pb.WarnRequest{
+		Digest: string(dgst),
+		Level:  int64(opts.Level),
+		Short:  []byte(msg),
+		Info:   opts.SourceInfo,
+		Ranges: opts.Range,
+		Detail: opts.Detail,
+		Url:    opts.URL,
+	})
+	return err
+}
+
 func (c *grpcClient) Solve(ctx context.Context, creq client.SolveRequest) (res *client.Result, err error) {
 	if creq.Definition != nil {
 		for _, md := range creq.Definition.Metadata {
 			for cap := range md.Caps {
-				if err := c.llbCaps.Supports(cap); err != nil {
+				if err := c.llbCaps.Supports(apicaps.CapID(cap)); err != nil {
 					return nil, err
 				}
 			}
 		}
 	}
-	var (
-		// old API
-		legacyRegistryCacheImports []string
-		// new API (CapImportCaches)
-		cacheImports []*pb.CacheOptionsEntry
-	)
-	supportCapImportCaches := c.caps.Supports(pb.CapImportCaches) == nil
+	var cacheImports []*pb.CacheOptionsEntry
 	for _, im := range creq.CacheImports {
-		if !supportCapImportCaches && im.Type == "registry" {
-			legacyRegistryCacheImports = append(legacyRegistryCacheImports, im.Attrs["ref"])
-		} else {
-			cacheImports = append(cacheImports, &pb.CacheOptionsEntry{
-				Type:  im.Type,
-				Attrs: im.Attrs,
-			})
+		cacheImports = append(cacheImports, &pb.CacheOptionsEntry{
+			Type:  im.Type,
+			Attrs: im.Attrs,
+		})
+	}
+
+	// these options are added by go client in solve()
+	if _, ok := creq.FrontendOpt["cache-imports"]; !ok {
+		if v, ok := c.opts["cache-imports"]; ok {
+			if creq.FrontendOpt == nil {
+				creq.FrontendOpt = map[string]string{}
+			}
+			creq.FrontendOpt["cache-imports"] = v
+		}
+	}
+	if _, ok := creq.FrontendOpt["cache-from"]; !ok {
+		if v, ok := c.opts["cache-from"]; ok {
+			if creq.FrontendOpt == nil {
+				creq.FrontendOpt = map[string]string{}
+			}
+			creq.FrontendOpt["cache-from"] = v
 		}
 	}
 
@@ -333,10 +387,8 @@ func (c *grpcClient) Solve(ctx context.Context, creq client.SolveRequest) (res *
 		FrontendInputs:      creq.FrontendInputs,
 		AllowResultReturn:   true,
 		AllowResultArrayRef: true,
-		// old API
-		ImportCacheRefsDeprecated: legacyRegistryCacheImports,
-		// new API
-		CacheImports: cacheImports,
+		CacheImports:        cacheImports,
+		SourcePolicies:      creq.SourcePolicies,
 	}
 
 	// backwards compatibility with inline return
@@ -348,30 +400,15 @@ func (c *grpcClient) Solve(ctx context.Context, creq client.SolveRequest) (res *
 		if c.caps.Supports(pb.CapGatewayEvaluateSolve) == nil {
 			req.Evaluate = creq.Evaluate
 		} else {
-			// If evaluate is not supported, fallback to running Stat(".") in order to
-			// trigger an evaluation of the result.
+			// If evaluate is not supported, fallback to running Stat(".") in
+			// order to trigger an evaluation of the result.
 			defer func() {
 				if res == nil {
 					return
 				}
-
-				var (
-					id  string
-					ref client.Reference
-				)
-				ref, err = res.SingleRef()
-				if err != nil {
-					for refID := range res.Refs {
-						id = refID
-						break
-					}
-				} else {
-					id = ref.(*reference).id
-				}
-
-				_, err = c.client.StatFile(ctx, &pb.StatFileRequest{
-					Ref:  id,
-					Path: ".",
+				err = res.EachRef(func(ref client.Reference) error {
+					_, err := ref.StatFile(ctx, client.StatRequest{Path: "."})
+					return err
 				})
 			}()
 		}
@@ -382,7 +419,7 @@ func (c *grpcClient) Solve(ctx context.Context, creq client.SolveRequest) (res *
 		return nil, err
 	}
 
-	res = &client.Result{}
+	res = client.NewResult()
 	if resp.Result == nil {
 		if id := resp.Ref; id != "" {
 			c.requests[id] = req
@@ -397,30 +434,38 @@ func (c *grpcClient) Solve(ctx context.Context, creq client.SolveRequest) (res *
 			}
 		case *pb.Result_RefsDeprecated:
 			for k, v := range pbRes.RefsDeprecated.Refs {
-				ref := &reference{id: v, c: c}
-				if v == "" {
-					ref = nil
+				var ref client.Reference
+				if v != "" {
+					ref = &reference{id: v, c: c}
 				}
 				res.AddRef(k, ref)
 			}
 		case *pb.Result_Ref:
 			if pbRes.Ref.Id != "" {
-				ref, err := newReference(c, pbRes.Ref)
-				if err != nil {
-					return nil, err
-				}
-				res.SetRef(ref)
+				res.SetRef(newReference(c, pbRes.Ref))
 			}
 		case *pb.Result_Refs:
 			for k, v := range pbRes.Refs.Refs {
-				var ref *reference
+				var ref client.Reference
 				if v.Id != "" {
-					ref, err = newReference(c, v)
+					ref = newReference(c, v)
+				}
+				res.AddRef(k, ref)
+			}
+		}
+
+		if resp.Result.Attestations != nil {
+			for p, as := range resp.Result.Attestations {
+				for _, a := range as.Attestation {
+					att, err := client.AttestationFromPB[client.Reference](a)
 					if err != nil {
 						return nil, err
 					}
+					if a.Ref.Id != "" {
+						att.Ref = newReference(c, a.Ref)
+					}
+					res.AddAttestation(p, *att)
 				}
-				res.AddRef(k, ref)
 			}
 		}
 	}
@@ -428,9 +473,63 @@ func (c *grpcClient) Solve(ctx context.Context, creq client.SolveRequest) (res *
 	return res, nil
 }
 
-func (c *grpcClient) ResolveImageConfig(ctx context.Context, ref string, opt llb.ResolveImageConfigOpt) (digest.Digest, []byte, error) {
+func (c *grpcClient) ResolveSourceMetadata(ctx context.Context, op *opspb.SourceOp, opt sourceresolver.Opt) (*sourceresolver.MetaResponse, error) {
+	requiresImageAttestationResolve := opt.ImageOpt != nil && (opt.ImageOpt.AttestationChain || len(opt.ImageOpt.ResolveAttestations) > 0)
+	requiresHTTPChecksumRequest := opt.HTTPOpt != nil && opt.HTTPOpt.ChecksumReq != nil
+
+	if c.caps.Supports(pb.CapSourceMetaResolver) != nil {
+		if requiresImageAttestationResolve {
+			return nil, errors.New("image attestation resolution requires source metadata resolver support")
+		}
+		var ref string
+		if v, ok := strings.CutPrefix(op.Identifier, "docker-image://"); ok {
+			ref = v
+		} else if v, ok := strings.CutPrefix(op.Identifier, "oci-layout://"); ok {
+			ref = v
+		} else {
+			if requiresHTTPChecksumRequest {
+				return nil, errors.New("http checksum request requires source metadata resolver support")
+			}
+			return &sourceresolver.MetaResponse{Op: op}, nil
+		}
+		retRef, dgst, config, err := c.ResolveImageConfig(ctx, ref, opt)
+		if err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(op.Identifier, "docker-image://") {
+			op.Identifier = "docker-image://" + retRef
+		} else if strings.HasPrefix(op.Identifier, "oci-layout://") {
+			op.Identifier = "oci-layout://" + retRef
+		}
+
+		return &sourceresolver.MetaResponse{
+			Op: op,
+			Image: &sourceresolver.ResolveImageResponse{
+				Digest: dgst,
+				Config: config,
+			},
+		}, nil
+	}
+
+	if requiresImageAttestationResolve {
+		if err := c.caps.Supports(pb.CapSourceMetaResolverImageAttestations); err != nil {
+			return nil, errors.Wrap(err, "image attestation resolution requires additional source metadata resolver support")
+		}
+	}
+	if requiresHTTPChecksumRequest {
+		if err := c.caps.Supports(pb.CapSourceMetaResolverHTTPChecksumRequest); err != nil {
+			return nil, errors.Wrap(err, "http checksum request requires additional source metadata resolver support")
+		}
+	}
+
+	var platform *ocispecs.Platform
+	if imgOpt := opt.ImageOpt; imgOpt != nil && imgOpt.Platform != nil {
+		platform = imgOpt.Platform
+	} else if ociOpt := opt.OCILayoutOpt; ociOpt != nil && ociOpt.Platform != nil {
+		platform = ociOpt.Platform
+	}
 	var p *opspb.Platform
-	if platform := opt.Platform; platform != nil {
+	if platform != nil {
 		p = &opspb.Platform{
 			OS:           platform.OS,
 			Architecture: platform.Architecture,
@@ -439,11 +538,230 @@ func (c *grpcClient) ResolveImageConfig(ctx context.Context, ref string, opt llb
 			OSFeatures:   platform.OSFeatures,
 		}
 	}
-	resp, err := c.client.ResolveImageConfig(ctx, &pb.ResolveImageConfigRequest{Ref: ref, Platform: p, ResolveMode: opt.ResolveMode, LogName: opt.LogName})
-	if err != nil {
-		return "", nil, err
+
+	req := &pb.ResolveSourceMetaRequest{
+		Source:         op,
+		Platform:       p,
+		LogName:        opt.LogName,
+		SourcePolicies: opt.SourcePolicies,
 	}
-	return resp.Digest, resp.Config, nil
+	if opt.ImageOpt != nil {
+		attestationChain := opt.ImageOpt.AttestationChain
+		if len(opt.ImageOpt.ResolveAttestations) > 0 {
+			attestationChain = true
+		}
+		req.ResolveMode = opt.ImageOpt.ResolveMode
+		req.Image = &pb.ResolveSourceImageRequest{
+			NoConfig:            opt.ImageOpt.NoConfig,
+			AttestationChain:    attestationChain,
+			ResolveAttestations: slices.Clone(opt.ImageOpt.ResolveAttestations),
+		}
+	}
+
+	if opt.GitOpt != nil {
+		req.Git = &pb.ResolveSourceGitRequest{
+			ReturnObject: opt.GitOpt.ReturnObject,
+		}
+	}
+	if requiresHTTPChecksumRequest {
+		algo, err := toPBHTTPChecksumAlgo(opt.HTTPOpt.ChecksumReq.Algo)
+		if err != nil {
+			return nil, err
+		}
+		req.HTTP = &pb.ResolveSourceHTTPRequest{
+			ChecksumRequest: &pb.ChecksumRequest{
+				Algo:   algo,
+				Suffix: slices.Clone(opt.HTTPOpt.ChecksumReq.Suffix),
+			},
+		}
+	}
+
+	resp, err := c.client.ResolveSourceMeta(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	r := &sourceresolver.MetaResponse{
+		Op: resp.Source,
+	}
+	if resp.Image != nil {
+		r.Image = imgResponseFromPB(resp.Image)
+	}
+	if resp.Git != nil {
+		r.Git = &sourceresolver.ResolveGitResponse{
+			Checksum:       resp.Git.Checksum,
+			Ref:            resp.Git.Ref,
+			CommitChecksum: resp.Git.CommitChecksum,
+			CommitObject:   resp.Git.CommitObject,
+			TagObject:      resp.Git.TagObject,
+		}
+	}
+	if resp.HTTP != nil {
+		dgst, err := digest.Parse(resp.HTTP.Checksum)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid http checksum digest %q", resp.HTTP.Checksum)
+		}
+
+		r.HTTP = &sourceresolver.ResolveHTTPResponse{
+			Digest:   dgst,
+			Filename: resp.HTTP.Filename,
+		}
+		if resp.HTTP.LastModified != nil {
+			tm := resp.HTTP.LastModified.AsTime()
+			r.HTTP.LastModified = &tm
+		}
+		if resp.HTTP.ChecksumResponse != nil {
+			r.HTTP.ChecksumResponse = &sourceresolver.ResolveHTTPChecksumResponse{
+				Digest: resp.HTTP.ChecksumResponse.Digest,
+				Suffix: slices.Clone(resp.HTTP.ChecksumResponse.Suffix),
+			}
+		}
+	}
+	if requiresHTTPChecksumRequest {
+		if resp.HTTP == nil || resp.HTTP.ChecksumResponse == nil {
+			return nil, errors.New("http checksum request was sent but response did not include checksum response")
+		}
+	}
+	return r, nil
+}
+
+func toPBHTTPChecksumAlgo(in sourceresolver.ResolveHTTPChecksumAlgo) (pb.ChecksumRequest_ChecksumAlgo, error) {
+	switch in {
+	case sourceresolver.ResolveHTTPChecksumAlgoSHA256:
+		return pb.ChecksumRequest_CHECKSUM_ALGO_SHA256, nil
+	case sourceresolver.ResolveHTTPChecksumAlgoSHA384:
+		return pb.ChecksumRequest_CHECKSUM_ALGO_SHA384, nil
+	case sourceresolver.ResolveHTTPChecksumAlgoSHA512:
+		return pb.ChecksumRequest_CHECKSUM_ALGO_SHA512, nil
+	default:
+		return pb.ChecksumRequest_CHECKSUM_ALGO_SHA256, errors.Errorf("invalid http checksum algorithm: %d", in)
+	}
+}
+
+func imgResponseFromPB(resp *pb.ResolveSourceImageResponse) *sourceresolver.ResolveImageResponse {
+	r := &sourceresolver.ResolveImageResponse{
+		Digest: digest.Digest(resp.Digest),
+		Config: resp.Config,
+	}
+	if resp.AttestationChain != nil {
+		ac := &sourceresolver.AttestationChain{
+			Root:                digest.Digest(resp.AttestationChain.Root),
+			ImageManifest:       digest.Digest(resp.AttestationChain.ImageManifest),
+			AttestationManifest: digest.Digest(resp.AttestationChain.AttestationManifest),
+			SignatureManifests:  []digest.Digest{},
+			Blobs:               map[digest.Digest]sourceresolver.Blob{},
+		}
+		for _, sm := range resp.AttestationChain.SignatureManifests {
+			ac.SignatureManifests = append(ac.SignatureManifests, digest.Digest(sm))
+		}
+		for k, v := range resp.AttestationChain.Blobs {
+			ac.Blobs[digest.Digest(k)] = sourceresolver.Blob{
+				Descriptor: descriptorFromPB(v.GetDescriptor_()),
+				Data:       v.Data,
+			}
+		}
+		r.AttestationChain = ac
+	}
+	return r
+}
+
+func descriptorFromPB(pbDesc *pb.Descriptor) ocispecs.Descriptor {
+	if pbDesc == nil {
+		return ocispecs.Descriptor{}
+	}
+	return ocispecs.Descriptor{
+		MediaType:   pbDesc.GetMediaType(),
+		Size:        pbDesc.GetSize(),
+		Digest:      digest.Digest(pbDesc.GetDigest()),
+		Annotations: maps.Clone(pbDesc.GetAnnotations()),
+	}
+}
+
+func (c *grpcClient) resolveImageConfigViaSourceMetadata(ctx context.Context, ref string, opt sourceresolver.Opt, p *opspb.Platform) (string, digest.Digest, []byte, error) {
+	op := &opspb.SourceOp{
+		Identifier: "docker-image://" + ref,
+	}
+	if opt.OCILayoutOpt != nil {
+		named, err := distreference.ParseNormalizedNamed(ref)
+		if err != nil {
+			return "", "", nil, err
+		}
+		op.Identifier = "oci-layout://" + named.String()
+		op.Attrs = map[string]string{
+			opspb.AttrOCILayoutSessionID: opt.OCILayoutOpt.Store.SessionID,
+			opspb.AttrOCILayoutStoreID:   opt.OCILayoutOpt.Store.StoreID,
+		}
+	}
+
+	req := &pb.ResolveSourceMetaRequest{
+		Source:         op,
+		Platform:       p,
+		LogName:        opt.LogName,
+		SourcePolicies: opt.SourcePolicies,
+	}
+	resp, err := c.client.ResolveSourceMeta(ctx, req)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if resp.Image == nil {
+		return "", "", nil, &imageutil.ResolveToNonImageError{Ref: ref, Updated: resp.Source.Identifier}
+	}
+	ref = strings.TrimPrefix(resp.Source.Identifier, "docker-image://")
+	ref = strings.TrimPrefix(ref, "oci-layout://")
+	return ref, digest.Digest(resp.Image.Digest), resp.Image.Config, nil
+}
+
+func (c *grpcClient) ResolveImageConfig(ctx context.Context, ref string, opt sourceresolver.Opt) (string, digest.Digest, []byte, error) {
+	var platform *ocispecs.Platform
+	if imgOpt := opt.ImageOpt; imgOpt != nil && imgOpt.Platform != nil {
+		platform = imgOpt.Platform
+	} else if ociOpt := opt.OCILayoutOpt; ociOpt != nil && ociOpt.Platform != nil {
+		platform = ociOpt.Platform
+	}
+
+	var p *opspb.Platform
+	if platform != nil {
+		p = &opspb.Platform{
+			OS:           platform.OS,
+			Architecture: platform.Architecture,
+			Variant:      platform.Variant,
+			OSVersion:    platform.OSVersion,
+			OSFeatures:   platform.OSFeatures,
+		}
+	}
+
+	if c.caps.Supports(pb.CapSourceMetaResolver) == nil {
+		return c.resolveImageConfigViaSourceMetadata(ctx, ref, opt, p)
+	}
+
+	req := &pb.ResolveImageConfigRequest{
+		Ref:            ref,
+		LogName:        opt.LogName,
+		SourcePolicies: opt.SourcePolicies,
+		Platform:       p,
+	}
+	if iopt := opt.ImageOpt; iopt != nil {
+		req.ResolveMode = iopt.ResolveMode
+		req.ResolverType = int32(sourceresolver.ResolverTypeRegistry)
+	}
+
+	if iopt := opt.OCILayoutOpt; iopt != nil {
+		req.ResolverType = int32(sourceresolver.ResolverTypeOCILayout)
+		req.StoreID = iopt.Store.StoreID
+		req.SessionID = iopt.Store.SessionID
+	}
+
+	resp, err := c.client.ResolveImageConfig(ctx, req)
+	if err != nil {
+		return "", "", nil, err
+	}
+	newRef := resp.Ref
+	if newRef == "" {
+		// No ref returned, use the original one.
+		// This could occur if the version of buildkitd is too old.
+		newRef = ref
+	}
+	return newRef, digest.Digest(resp.Digest), resp.Config, nil
 }
 
 func (c *grpcClient) BuildOpts() client.BuildOpts {
@@ -455,6 +773,27 @@ func (c *grpcClient) BuildOpts() client.BuildOpts {
 		LLBCaps:   c.llbCaps,
 		Caps:      c.caps,
 	}
+}
+
+func (c *grpcClient) CurrentFrontend() (*llb.State, error) {
+	fp := "/run/config/buildkit/metadata/frontend.bin"
+	if _, err := os.Stat(fp); err != nil {
+		return nil, nil
+	}
+	dt, err := os.ReadFile(fp)
+	if err != nil {
+		return nil, err
+	}
+	var def opspb.Definition
+	if err := def.UnmarshalVT(dt); err != nil {
+		return nil, err
+	}
+	op, err := llb.NewDefinitionOp(&def)
+	if err != nil {
+		return nil, err
+	}
+	st := llb.NewState(op)
+	return &st, nil
 }
 
 func (c *grpcClient) Inputs(ctx context.Context) (map[string]llb.State, error) {
@@ -483,13 +822,14 @@ func (c *grpcClient) Inputs(ctx context.Context) (map[string]llb.State, error) {
 // communication channel between the process and the ExecProcess message
 // stream.
 type procMessageForwarder struct {
-	done      chan struct{}
-	closeOnce sync.Once
-	msgs      chan *pb.ExecMessage
+	ctx  context.Context
+	done chan struct{}
+	msgs chan *pb.ExecMessage
 }
 
-func newProcMessageForwarder() *procMessageForwarder {
+func newProcMessageForwarder(ctx context.Context) *procMessageForwarder {
 	return &procMessageForwarder{
+		ctx:  ctx,
 		done: make(chan struct{}),
 		msgs: make(chan *pb.ExecMessage),
 	}
@@ -499,28 +839,25 @@ func (b *procMessageForwarder) Send(ctx context.Context, m *pb.ExecMessage) {
 	select {
 	case <-ctx.Done():
 	case <-b.done:
-		b.closeOnce.Do(func() {
-			close(b.msgs)
-		})
 	case b.msgs <- m:
 	}
 }
 
-func (b *procMessageForwarder) Recv(ctx context.Context) (m *pb.ExecMessage, ok bool) {
+func (b *procMessageForwarder) Recv(ctx context.Context) (*pb.ExecMessage, error) {
 	select {
 	case <-ctx.Done():
-		return nil, true
+		return nil, context.Cause(ctx)
+	case <-b.ctx.Done():
+		return nil, context.Cause(b.ctx)
 	case <-b.done:
-		return nil, false
-	case m = <-b.msgs:
-		return m, true
+		return nil, nil
+	case m := <-b.msgs:
+		return m, nil
 	}
 }
 
 func (b *procMessageForwarder) Close() {
 	close(b.done)
-	b.Recv(context.Background())      // flush any messages in queue
-	b.Send(context.Background(), nil) // ensure channel is closed
 }
 
 // messageForwarder manages a single grpc stream for ExecProcess to facilitate
@@ -529,11 +866,14 @@ func (b *procMessageForwarder) Close() {
 type messageForwarder struct {
 	client pb.LLBBridgeClient
 	ctx    context.Context
-	cancel func()
+	cancel func(error)
 	eg     *errgroup.Group
 	mu     sync.Mutex
 	pids   map[string]*procMessageForwarder
 	stream pb.LLBBridge_ExecProcessClient
+	// Keep send serialization separate from mu so the receive loop can deliver
+	// process output while Send is blocked on flow control.
+	sendMu sync.Mutex
 	// startOnce used to only start the exec message forwarder once,
 	// so we only have one exec stream per client
 	startOnce sync.Once
@@ -543,7 +883,7 @@ type messageForwarder struct {
 }
 
 func newMessageForwarder(ctx context.Context, client pb.LLBBridgeClient) *messageForwarder {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	eg, ctx := errgroup.WithContext(ctx)
 	return &messageForwarder{
 		client: client,
@@ -573,10 +913,15 @@ func (m *messageForwarder) Start() (err error) {
 		m.eg.Go(func() error {
 			for {
 				msg, err := m.stream.Recv()
+				if err != nil {
+					// EOF and cancellation also end delivery to every process,
+					// even though they are not errors for Release.
+					m.cancel(errors.Wrap(err, "remote exec stream closed"))
+				}
 				if errors.Is(err, io.EOF) || grpcerrors.Code(err) == codes.Canceled {
 					return nil
 				}
-				logrus.Debugf("|<--- %s", debugMessage(msg))
+				bklog.G(m.ctx).Debugf("|<--- %s", debugMessage(msg))
 
 				if err != nil {
 					return err
@@ -587,7 +932,7 @@ func (m *messageForwarder) Start() (err error) {
 				m.mu.Unlock()
 
 				if !ok {
-					logrus.Debugf("Received exec message for unregistered process: %s", msg.String())
+					bklog.G(m.ctx).Debugf("Received exec message for unregistered process: %s", msg.String())
 					continue
 				}
 				msgs.Send(m.ctx, msg)
@@ -608,6 +953,8 @@ func debugMessage(msg *pb.ExecMessage) string {
 		return fmt.Sprintf("File Message %s, fd=%d, %d bytes", msg.ProcessID, m.File.Fd, len(m.File.Data))
 	case *pb.ExecMessage_Resize:
 		return fmt.Sprintf("Resize Message %s", msg.ProcessID)
+	case *pb.ExecMessage_Signal:
+		return fmt.Sprintf("Signal Message %s: %s", msg.ProcessID, m.Signal.Name)
 	case *pb.ExecMessage_Started:
 		return fmt.Sprintf("Started Message %s", msg.ProcessID)
 	case *pb.ExecMessage_Exit:
@@ -621,23 +968,25 @@ func debugMessage(msg *pb.ExecMessage) string {
 func (m *messageForwarder) Send(msg *pb.ExecMessage) error {
 	m.mu.Lock()
 	_, ok := m.pids[msg.ProcessID]
-	defer m.mu.Unlock()
+	m.mu.Unlock()
 	if !ok {
 		return errors.Errorf("process %s has ended, not sending message %#v", msg.ProcessID, msg.Input)
 	}
-	logrus.Debugf("|---> %s", debugMessage(msg))
+	bklog.G(m.ctx).Debugf("|---> %s", debugMessage(msg))
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
 	return m.stream.Send(msg)
 }
 
 func (m *messageForwarder) Release() error {
-	m.cancel()
+	m.cancel(errors.WithStack(context.Canceled))
 	return m.eg.Wait()
 }
 
 func (m *messageForwarder) Register(pid string) *procMessageForwarder {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	sender := newProcMessageForwarder()
+	sender := newProcMessageForwarder(m.ctx)
 	m.pids[pid] = sender
 	return sender
 }
@@ -703,12 +1052,15 @@ func (c *grpcClient) NewContainer(ctx context.Context, req client.NewContainerRe
 		})
 	}
 
-	logrus.Debugf("|---> NewContainer %s", id)
+	bklog.G(ctx).Debugf("|---> NewContainer %s", id)
 	_, err = c.client.NewContainer(ctx, &pb.NewContainerRequest{
 		ContainerID: id,
 		Mounts:      mounts,
 		Platform:    req.Platform,
 		Constraints: req.Constraints,
+		Network:     req.NetMode,
+		ExtraHosts:  req.ExtraHosts,
+		Hostname:    req.Hostname,
 	})
 	if err != nil {
 		return nil, err
@@ -722,6 +1074,7 @@ func (c *grpcClient) NewContainer(ctx context.Context, req client.NewContainerRe
 
 	return &container{
 		client:   c.client,
+		caps:     c.caps,
 		id:       id,
 		execMsgs: c.execMsgs,
 	}, nil
@@ -729,6 +1082,7 @@ func (c *grpcClient) NewContainer(ctx context.Context, req client.NewContainerRe
 
 type container struct {
 	client   pb.LLBBridgeClient
+	caps     apicaps.CapSet
 	id       string
 	execMsgs *messageForwarder
 }
@@ -736,6 +1090,12 @@ type container struct {
 func (ctr *container) Start(ctx context.Context, req client.StartRequest) (client.ContainerProcess, error) {
 	pid := fmt.Sprintf("%s:%s", ctr.id, identity.NewID())
 	msgs := ctr.execMsgs.Register(pid)
+
+	if len(req.SecretEnv) > 0 {
+		if err := ctr.caps.Supports(pb.CapGatewayExecSecretEnv); err != nil {
+			return nil, err
+		}
+	}
 
 	init := &pb.InitMessage{
 		ContainerID: ctr.id,
@@ -745,9 +1105,11 @@ func (ctr *container) Start(ctx context.Context, req client.StartRequest) (clien
 			Cwd:  req.Cwd,
 			User: req.User,
 		},
-		Tty:      req.Tty,
-		Security: req.SecurityMode,
+		Tty:       req.Tty,
+		Security:  req.SecurityMode,
+		Secretenv: req.SecretEnv,
 	}
+	init.Meta.RemoveMountStubsRecursive = req.RemoveMountStubsRecursive
 	if req.Stdin != nil {
 		init.Fds = append(init.Fds, 0)
 	}
@@ -768,9 +1130,13 @@ func (ctr *container) Start(ctx context.Context, req client.StartRequest) (clien
 		return nil, err
 	}
 
-	msg, _ := msgs.Recv(ctx)
+	msg, err := msgs.Recv(ctx)
+	if err != nil {
+		ctr.execMsgs.Deregister(pid)
+		return nil, err
+	}
 	if msg == nil {
-		return nil, errors.Errorf("failed to receive started message")
+		return nil, errors.New("failed to receive started message")
 	}
 	started := msg.GetStarted()
 	if started == nil {
@@ -813,13 +1179,11 @@ func (ctr *container) Start(ctx context.Context, req client.StartRequest) (clien
 				processID: pid,
 				fd:        0,
 			}
-			_, err := io.Copy(m, stdinReader)
-			// ignore ErrClosedPipe, it is EOF for our usage.
-			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				return err
+			_, copyErr := io.Copy(m, stdinReader)
+			if copyErr != nil && !errors.Is(copyErr, io.ErrClosedPipe) {
+				return copyErr
 			}
-			// not an error so must be eof
-			return ctr.execMsgs.Send(&pb.ExecMessage{
+			err := ctr.execMsgs.Send(&pb.ExecMessage{
 				ProcessID: pid,
 				Input: &pb.ExecMessage_File{
 					File: &pb.FdMessage{
@@ -828,26 +1192,27 @@ func (ctr *container) Start(ctx context.Context, req client.StartRequest) (clien
 					},
 				},
 			})
+			// Cleanup still sends EOF to unblock remote stdin, but a failed send
+			// must not replace the process result that triggered cleanup.
+			if errors.Is(copyErr, io.ErrClosedPipe) {
+				return nil
+			}
+			return err
 		})
 	}
 
 	ctrProc.eg.Go(func() error {
 		var closeDoneOnce sync.Once
+		defer closeDoneOnce.Do(func() { close(done) })
 		var exitError error
 		for {
-			msg, ok := msgs.Recv(ctx)
-			if !ok {
+			msg, err := msgs.Recv(ctx)
+			if err != nil {
+				return err
+			}
+			if msg == nil {
 				// no more messages, return
 				return exitError
-			}
-
-			if msg == nil {
-				// empty message from ctx cancel, so just start shutting down
-				// input, but continue processing more exit/done messages
-				closeDoneOnce.Do(func() {
-					close(done)
-				})
-				continue
 			}
 
 			if file := msg.GetFile(); file != nil {
@@ -880,10 +1245,10 @@ func (ctr *container) Start(ctx context.Context, req client.StartRequest) (clien
 				exitError = grpcerrors.FromGRPC(status.ErrorProto(&spb.Status{
 					Code:    exit.Error.Code,
 					Message: exit.Error.Message,
-					Details: convertGogoAny(exit.Error.Details),
+					Details: exit.Error.Details,
 				}))
-				if exit.Code != errdefs.UnknownExitStatus {
-					exitError = &errdefs.ExitError{ExitCode: exit.Code, Err: exitError}
+				if exit.Code != pb.UnknownExitStatus {
+					exitError = &pb.ExitError{ExitCode: exit.Code, Err: exitError}
 				}
 			} else if serverDone := msg.GetDone(); serverDone != nil {
 				return exitError
@@ -897,11 +1262,75 @@ func (ctr *container) Start(ctx context.Context, req client.StartRequest) (clien
 }
 
 func (ctr *container) Release(ctx context.Context) error {
-	logrus.Debugf("|---> ReleaseContainer %s", ctr.id)
+	bklog.G(ctx).Debugf("|---> ReleaseContainer %s", ctr.id)
 	_, err := ctr.client.ReleaseContainer(ctx, &pb.ReleaseContainerRequest{
 		ContainerID: ctr.id,
 	})
 	return err
+}
+
+func (ctr *container) ReadFile(ctx context.Context, req client.ReadContainerRequest) ([]byte, error) {
+	if err := ctr.caps.Supports(pb.CapGatewayExecFilesystem); err != nil {
+		return nil, err
+	}
+
+	bklog.G(ctx).Debugf("|---> ReadFileContainer %s@%d", ctr.id, req.MountIndex)
+	in := &pb.ReadFileRequest{
+		Ref:        ctr.id,
+		FilePath:   req.Filename,
+		MountIndex: int32(req.MountIndex),
+	}
+	if req.Range != nil {
+		in.Range = &pb.FileRange{
+			Length: int64(req.Range.Length),
+			Offset: int64(req.Range.Offset),
+		}
+	}
+
+	resp, err := ctr.client.ReadFileContainer(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+func (ctr *container) ReadDir(ctx context.Context, req client.ReadDirContainerRequest) ([]*fstypes.Stat, error) {
+	if err := ctr.caps.Supports(pb.CapGatewayExecFilesystem); err != nil {
+		return nil, err
+	}
+
+	bklog.G(ctx).Debugf("|---> ReadDirContainer %s@%d", ctr.id, req.MountIndex)
+	in := &pb.ReadDirRequest{
+		Ref:            ctr.id,
+		DirPath:        req.Path,
+		IncludePattern: req.IncludePattern,
+		MountIndex:     int32(req.MountIndex),
+	}
+
+	resp, err := ctr.client.ReadDirContainer(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Entries, nil
+}
+
+func (ctr *container) StatFile(ctx context.Context, req client.StatContainerRequest) (*fstypes.Stat, error) {
+	if err := ctr.caps.Supports(pb.CapGatewayExecFilesystem); err != nil {
+		return nil, err
+	}
+
+	bklog.G(ctx).Debugf("|---> StatFileContainer %s@%d", ctr.id, req.MountIndex)
+	in := &pb.StatFileRequest{
+		Ref:        ctr.id,
+		Path:       req.Path,
+		MountIndex: int32(req.MountIndex),
+	}
+
+	resp, err := ctr.client.StatFileContainer(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Stat, nil
 }
 
 type containerProcess struct {
@@ -927,14 +1356,37 @@ func (ctrProc *containerProcess) Resize(_ context.Context, size client.WinSize) 
 	})
 }
 
+var sigToName = map[syscall.Signal]string{}
+
+func init() {
+	for name, value := range signal.SignalMap {
+		sigToName[value] = name
+	}
+}
+
+func (ctrProc *containerProcess) Signal(_ context.Context, sig syscall.Signal) error {
+	name := sigToName[sig]
+	if name == "" {
+		return errors.Errorf("unknown signal %v", sig)
+	}
+	return ctrProc.execMsgs.Send(&pb.ExecMessage{
+		ProcessID: ctrProc.id,
+		Input: &pb.ExecMessage_Signal{
+			Signal: &pb.SignalMessage{
+				Name: name,
+			},
+		},
+	})
+}
+
 type reference struct {
 	c   *grpcClient
 	id  string
 	def *opspb.Definition
 }
 
-func newReference(c *grpcClient, ref *pb.Ref) (*reference, error) {
-	return &reference{c: c, id: ref.Id, def: ref.Def}, nil
+func newReference(c *grpcClient, ref *pb.Ref) *reference {
+	return &reference{c: c, id: ref.Id, def: ref.Def}
 }
 
 func (r *reference) ToState() (st llb.State, err error) {
@@ -944,7 +1396,7 @@ func (r *reference) ToState() (st llb.State, err error) {
 	}
 
 	if r.def == nil {
-		return st, errors.Errorf("gateway did not return reference with definition")
+		return st, errors.New("gateway did not return reference with definition")
 	}
 
 	defop, err := llb.NewDefinitionOp(r.def)
@@ -953,6 +1405,15 @@ func (r *reference) ToState() (st llb.State, err error) {
 	}
 
 	return llb.NewState(defop), nil
+}
+
+func (r *reference) Evaluate(ctx context.Context) error {
+	req := &pb.EvaluateRequest{Ref: r.id}
+	_, err := r.c.client.Evaluate(ctx, req)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *reference) ReadFile(ctx context.Context, req client.ReadRequest) ([]byte, error) {
@@ -1002,16 +1463,24 @@ func (r *reference) StatFile(ctx context.Context, req client.StatRequest) (*fsty
 }
 
 func grpcClientConn(ctx context.Context) (context.Context, *grpc.ClientConn, error) {
-	dialOpt := grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-		return stdioConn(), nil
-	})
-
-	cc, err := grpc.DialContext(ctx, "localhost", dialOpt, grpc.WithInsecure(), grpc.WithUnaryInterceptor(grpcerrors.UnaryClientInterceptor), grpc.WithStreamInterceptor(grpcerrors.StreamClientInterceptor))
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to create grpc client")
+	dialOpts := []grpc.DialOption{
+		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			return stdioConn(), nil
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(grpcerrors.UnaryClientInterceptor),
+		grpc.WithStreamInterceptor(grpcerrors.StreamClientInterceptor),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	//nolint:staticcheck // ignore SA1019 NewClient has different behavior and needs to be tested
+	cc, err := grpc.DialContext(ctx, "localhost", dialOpts...)
+	if err != nil {
+		return ctx, nil, errors.Wrap(err, "failed to create grpc client")
+	}
+
+	ctx, cancel := context.WithCancelCause(ctx)
 	_ = cancel
 	// go monitorHealth(ctx, cc, cancel)
 
@@ -1031,21 +1500,24 @@ type conn struct {
 func (s *conn) LocalAddr() net.Addr {
 	return dummyAddr{}
 }
+
 func (s *conn) RemoteAddr() net.Addr {
 	return dummyAddr{}
 }
+
 func (s *conn) SetDeadline(t time.Time) error {
 	return nil
 }
+
 func (s *conn) SetReadDeadline(t time.Time) error {
 	return nil
 }
+
 func (s *conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-type dummyAddr struct {
-}
+type dummyAddr struct{}
 
 func (d dummyAddr) Network() string {
 	return "pipe"
@@ -1091,20 +1563,4 @@ func workers() []client.WorkerInfo {
 
 func product() string {
 	return os.Getenv("BUILDKIT_EXPORTEDPRODUCT")
-}
-
-func convertGogoAny(in []*gogotypes.Any) []*any.Any {
-	out := make([]*any.Any, len(in))
-	for i := range in {
-		out[i] = &any.Any{TypeUrl: in[i].TypeUrl, Value: in[i].Value}
-	}
-	return out
-}
-
-func convertToGogoAny(in []*any.Any) []*gogotypes.Any {
-	out := make([]*gogotypes.Any, len(in))
-	for i := range in {
-		out[i] = &gogotypes.Any{TypeUrl: in[i].TypeUrl, Value: in[i].Value}
-	}
-	return out
 }

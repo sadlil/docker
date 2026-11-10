@@ -1,21 +1,41 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
 
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
 )
 
+// ContainerUpdateOptions holds options for [Client.ContainerUpdate].
+type ContainerUpdateOptions struct {
+	Resources     *container.Resources
+	RestartPolicy *container.RestartPolicy
+}
+
+// ContainerUpdateResult is the result from updating a container.
+type ContainerUpdateResult struct {
+	// Warnings encountered when updating the container.
+	Warnings []string
+}
+
 // ContainerUpdate updates the resources of a container.
-func (cli *Client) ContainerUpdate(ctx context.Context, containerID string, updateConfig container.UpdateConfig) (container.ContainerUpdateOKBody, error) {
-	var response container.ContainerUpdateOKBody
-	serverResp, err := cli.post(ctx, "/containers/"+containerID+"/update", nil, updateConfig, nil)
-	defer ensureReaderClosed(serverResp)
+func (cli *Client) ContainerUpdate(ctx context.Context, containerID string, options ContainerUpdateOptions) (ContainerUpdateResult, error) {
+	containerID, err := trimID("container", containerID)
 	if err != nil {
-		return response, err
+		return ContainerUpdateResult{}, err
 	}
 
-	err = json.NewDecoder(serverResp.body).Decode(&response)
-	return response, err
+	resp, err := cli.post(ctx, "/containers/"+containerID+"/update", nil, nil, container.UpdateConfig{
+		Resources:     valueOrZero(options.Resources),
+		RestartPolicy: valueOrZero(options.RestartPolicy),
+	})
+	defer ensureReaderClosed(resp)
+	if err != nil {
+		return ContainerUpdateResult{}, err
+	}
+
+	var response container.UpdateResponse
+	err = json.NewDecoder(resp.Body).Decode(&response)
+	return ContainerUpdateResult{Warnings: response.Warnings}, err
 }

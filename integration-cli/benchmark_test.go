@@ -1,24 +1,39 @@
 package main
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/moby/moby/v2/integration-cli/cli"
 	"gotest.tools/v3/assert"
 )
 
-func (s *DockerSuite) BenchmarkConcurrentContainerActions(c *testing.B) {
+type DockerBenchmarkSuite struct {
+	ds *DockerSuite
+}
+
+func (s *DockerBenchmarkSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
+}
+
+func (s *DockerBenchmarkSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
+}
+
+func (s *DockerBenchmarkSuite) BenchmarkConcurrentContainerActions(c *testing.B) {
 	maxConcurrency := runtime.GOMAXPROCS(0)
 	numIterations := c.N
 	outerGroup := &sync.WaitGroup{}
 	outerGroup.Add(maxConcurrency)
 	chErr := make(chan error, numIterations*2*maxConcurrency)
 
-	for i := 0; i < maxConcurrency; i++ {
+	for range maxConcurrency {
 		go func() {
 			defer outerGroup.Done()
 			innerGroup := &sync.WaitGroup{}
@@ -26,12 +41,12 @@ func (s *DockerSuite) BenchmarkConcurrentContainerActions(c *testing.B) {
 
 			go func() {
 				defer innerGroup.Done()
-				for i := 0; i < numIterations; i++ {
+				for range numIterations {
 					args := []string{"run", "-d", "busybox"}
 					args = append(args, sleepCommandForDaemonPlatform()...)
 					out, _, err := dockerCmdWithError(args...)
 					if err != nil {
-						chErr <- fmt.Errorf(out)
+						chErr <- errors.New(out)
 						return
 					}
 
@@ -44,39 +59,39 @@ func (s *DockerSuite) BenchmarkConcurrentContainerActions(c *testing.B) {
 					defer os.RemoveAll(tmpDir)
 					out, _, err = dockerCmdWithError("cp", id+":/tmp", tmpDir)
 					if err != nil {
-						chErr <- fmt.Errorf(out)
+						chErr <- errors.New(out)
 						return
 					}
 
 					out, _, err = dockerCmdWithError("kill", id)
 					if err != nil {
-						chErr <- fmt.Errorf(out)
+						chErr <- errors.New(out)
 					}
 
 					out, _, err = dockerCmdWithError("start", id)
 					if err != nil {
-						chErr <- fmt.Errorf(out)
+						chErr <- errors.New(out)
 					}
 
 					out, _, err = dockerCmdWithError("kill", id)
 					if err != nil {
-						chErr <- fmt.Errorf(out)
+						chErr <- errors.New(out)
 					}
 
 					// don't do an rm -f here since it can potentially ignore errors from the graphdriver
 					out, _, err = dockerCmdWithError("rm", id)
 					if err != nil {
-						chErr <- fmt.Errorf(out)
+						chErr <- errors.New(out)
 					}
 				}
 			}()
 
 			go func() {
 				defer innerGroup.Done()
-				for i := 0; i < numIterations; i++ {
+				for range numIterations {
 					out, _, err := dockerCmdWithError("ps")
 					if err != nil {
-						chErr <- fmt.Errorf(out)
+						chErr <- errors.New(out)
 					}
 				}
 			}()
@@ -90,5 +105,28 @@ func (s *DockerSuite) BenchmarkConcurrentContainerActions(c *testing.B) {
 
 	for err := range chErr {
 		assert.NilError(c, err)
+	}
+}
+
+func (s *DockerBenchmarkSuite) BenchmarkLogsCLIRotateFollow(c *testing.B) {
+	out := cli.DockerCmd(c, "run", "-d", "--log-opt", "max-size=1b", "--log-opt", "max-file=10", "busybox", "sh", "-c", "while true; do usleep 50000; echo hello; done").Combined()
+	id := strings.TrimSpace(out)
+	ch := make(chan error, 1)
+	go func() {
+		ch <- nil
+		out, _, _ := dockerCmdWithError("logs", "-f", id)
+		// if this returns at all, it's an error
+		ch <- errors.New(out)
+	}()
+
+	<-ch
+	select {
+	case <-time.After(30 * time.Second):
+		// ran for 30 seconds with no problem
+		return
+	case err := <-ch:
+		if err != nil {
+			c.Fatal(err)
+		}
 	}
 }

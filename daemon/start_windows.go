@@ -1,15 +1,22 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
-	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/pkg/system"
+	"context"
+
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/moby/moby/v2/daemon/container"
 )
 
-func (daemon *Daemon) getLibcontainerdCreateOptions(_ *container.Container) (string, interface{}, error) {
-	if system.ContainerdRuntimeSupported() {
-		opts := &options.Options{}
-		return "io.containerd.runhcs.v1", opts, nil
+func (daemon *Daemon) getLibcontainerdCreateOptions(daemonCfg *configStore, container *container.Container) (string, any, error) {
+	if container.HostConfig.Runtime == "" {
+		if daemonCfg.DefaultRuntime != "" {
+			container.HostConfig.Runtime = daemonCfg.DefaultRuntime
+		} else {
+			container.HostConfig.Runtime = defaults.DefaultRuntime
+		}
+
+		container.CheckpointTo(context.WithoutCancel(context.TODO()), daemon.containersReplica)
 	}
-	return "", nil, nil
+
+	return container.HostConfig.Runtime, nil, nil
 }

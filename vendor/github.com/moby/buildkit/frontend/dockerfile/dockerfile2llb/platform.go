@@ -1,14 +1,14 @@
 package dockerfile2llb
 
 import (
-	"github.com/containerd/containerd/platforms"
-	"github.com/moby/buildkit/frontend/dockerfile/instructions"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/containerd/platforms"
+	"github.com/moby/buildkit/client/llb"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 type platformOpt struct {
-	targetPlatform specs.Platform
-	buildPlatforms []specs.Platform
+	targetPlatform ocispecs.Platform
+	buildPlatforms []ocispecs.Platform
 	implicitTarget bool
 }
 
@@ -18,10 +18,10 @@ func buildPlatformOpt(opt *ConvertOpt) *platformOpt {
 	implicitTargetPlatform := false
 
 	if opt.TargetPlatform != nil && opt.BuildPlatforms == nil {
-		buildPlatforms = []specs.Platform{*opt.TargetPlatform}
+		buildPlatforms = []ocispecs.Platform{*opt.TargetPlatform}
 	}
 	if len(buildPlatforms) == 0 {
-		buildPlatforms = []specs.Platform{platforms.DefaultSpec()}
+		buildPlatforms = []ocispecs.Platform{platforms.DefaultSpec()}
 	}
 
 	if opt.TargetPlatform == nil {
@@ -36,23 +36,32 @@ func buildPlatformOpt(opt *ConvertOpt) *platformOpt {
 	}
 }
 
-func getPlatformArgs(po *platformOpt) []instructions.KeyValuePairOptional {
+func defaultArgs(po *platformOpt, overrides map[string]string, target string) *llb.EnvList {
 	bp := po.buildPlatforms[0]
 	tp := po.targetPlatform
-	m := map[string]string{
-		"BUILDPLATFORM":  platforms.Format(bp),
-		"BUILDOS":        bp.OS,
-		"BUILDARCH":      bp.Architecture,
-		"BUILDVARIANT":   bp.Variant,
-		"TARGETPLATFORM": platforms.Format(tp),
-		"TARGETOS":       tp.OS,
-		"TARGETARCH":     tp.Architecture,
-		"TARGETVARIANT":  tp.Variant,
+	if target == "" {
+		target = "default"
 	}
-	opts := make([]instructions.KeyValuePairOptional, 0, len(m))
-	for k, v := range m {
-		s := v
-		opts = append(opts, instructions.KeyValuePairOptional{Key: k, Value: &s})
+	s := [...][2]string{
+		{"BUILDPLATFORM", platforms.Format(bp)},
+		{"BUILDOS", bp.OS},
+		{"BUILDOSVERSION", bp.OSVersion},
+		{"BUILDARCH", bp.Architecture},
+		{"BUILDVARIANT", bp.Variant},
+		{"TARGETPLATFORM", platforms.FormatAll(tp)},
+		{"TARGETOS", tp.OS},
+		{"TARGETOSVERSION", tp.OSVersion},
+		{"TARGETARCH", tp.Architecture},
+		{"TARGETVARIANT", tp.Variant},
+		{"TARGETSTAGE", target},
 	}
-	return opts
+	env := &llb.EnvList{}
+	for _, kv := range s {
+		v := kv[1]
+		if ov, ok := overrides[kv[0]]; ok {
+			v = ov
+		}
+		env = env.AddOrReplace(kv[0], v)
+	}
+	return env
 }

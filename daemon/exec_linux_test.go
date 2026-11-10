@@ -1,22 +1,46 @@
 //go:build linux
-// +build linux
 
 package daemon
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
-	"github.com/containerd/containerd/pkg/apparmor"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/config"
-	"github.com/docker/docker/daemon/exec"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"gotest.tools/v3/assert"
 )
 
+func TestExecSetPlatformOptPreservesUmaskWhenResolvingUser(t *testing.T) {
+	root := t.TempDir()
+	assert.NilError(t, os.MkdirAll(filepath.Join(root, "etc"), 0o755))
+	assert.NilError(t, os.WriteFile(filepath.Join(root, "etc/passwd"), []byte("test:x:1234:5678::/:/bin/sh\n"), 0o644))
+	assert.NilError(t, os.WriteFile(filepath.Join(root, "etc/group"), []byte("test:x:5678:\n"), 0o644))
+
+	c := &container.Container{
+		BaseFS: root,
+		SecurityOptions: container.SecurityOptions{
+			AppArmorProfile: unconfinedAppArmorProfile,
+		},
+		HostConfig: &containertypes.HostConfig{},
+	}
+	ec := &container.ExecConfig{Container: c, User: "1234:5678"}
+	umask := uint32(0o027)
+	p := &specs.Process{User: specs.User{Umask: &umask}}
+	cfg := &configStore{}
+
+	err := (&Daemon{}).execSetPlatformOpt(t.Context(), &cfg.Config, ec, p)
+	assert.NilError(t, err)
+	assert.Equal(t, p.User.UID, uint32(1234))
+	assert.Equal(t, p.User.GID, uint32(5678))
+	assert.Assert(t, p.User.Umask != nil)
+	assert.Equal(t, *p.User.Umask, umask)
+}
+
 func TestExecSetPlatformOptAppArmor(t *testing.T) {
-	appArmorEnabled := apparmor.HostSupports()
+	appArmorEnabled := appArmorSupported()
 
 	tests := []struct {
 		doc             string
@@ -51,7 +75,9 @@ func TestExecSetPlatformOptAppArmor(t *testing.T) {
 		},
 	}
 
-	d := &Daemon{configStore: &config.Config{}}
+	cfg := &configStore{}
+	d := &Daemon{}
+	d.configStore.Store(cfg)
 
 	// Currently, `docker exec --privileged` inherits the Privileged configuration
 	// of the container, and does not disable AppArmor.
@@ -62,7 +88,6 @@ func TestExecSetPlatformOptAppArmor(t *testing.T) {
 	// both give the same result.
 	for _, execPrivileged := range []bool{false, true} {
 		for _, tc := range tests {
-			tc := tc
 			doc := tc.doc
 			if !appArmorEnabled {
 				// no profile should be set if the host does not support AppArmor
@@ -74,15 +99,15 @@ func TestExecSetPlatformOptAppArmor(t *testing.T) {
 			}
 			t.Run(doc, func(t *testing.T) {
 				c := &container.Container{
-					AppArmorProfile: tc.appArmorProfile,
+					SecurityOptions: container.SecurityOptions{AppArmorProfile: tc.appArmorProfile},
 					HostConfig: &containertypes.HostConfig{
 						Privileged: tc.privileged,
 					},
 				}
-				ec := &exec.Config{Privileged: execPrivileged}
+				ec := &container.ExecConfig{Container: c, Privileged: execPrivileged}
 				p := &specs.Process{}
 
-				err := d.execSetPlatformOpt(c, ec, p)
+				err := d.execSetPlatformOpt(t.Context(), &cfg.Config, ec, p)
 				assert.NilError(t, err)
 				assert.Equal(t, p.ApparmorProfile, tc.expectedProfile)
 			})

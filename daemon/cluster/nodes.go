@@ -1,39 +1,33 @@
-package cluster // import "github.com/docker/docker/daemon/cluster"
+package cluster
 
 import (
 	"context"
 
-	apitypes "github.com/docker/docker/api/types"
-	types "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/daemon/cluster/convert"
-	"github.com/docker/docker/errdefs"
-	swarmapi "github.com/docker/swarmkit/api"
+	types "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/v2/daemon/cluster/convert"
+	"github.com/moby/moby/v2/daemon/server/swarmbackend"
+	"github.com/moby/moby/v2/errdefs"
+	swarmapi "github.com/moby/swarmkit/v2/api"
 	"google.golang.org/grpc"
 )
 
 // GetNodes returns a list of all nodes known to a cluster.
-func (c *Cluster) GetNodes(options apitypes.NodeListOptions) ([]types.Node, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	state := c.currentNodeState()
-	if !state.IsActiveManager() {
-		return nil, c.errNoManager(state)
-	}
-
+func (c *Cluster) GetNodes(options swarmbackend.NodeListOptions) ([]types.Node, error) {
 	filters, err := newListNodesFilters(options.Filters)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := c.getRequestContext()
-	defer cancel()
-
-	r, err := state.controlClient.ListNodes(
-		ctx,
-		&swarmapi.ListNodesRequest{Filters: filters},
-		grpc.MaxCallRecvMsgSize(defaultRecvSizeForListResponse),
-	)
+	var r *swarmapi.ListNodesResponse
+	err = c.lockedManagerAction(context.TODO(), func(ctx context.Context, state nodeState) error {
+		var err error
+		r, err = state.controlClient.ListNodes(
+			ctx,
+			&swarmapi.ListNodesRequest{Filters: filters},
+			grpc.MaxCallRecvMsgSize(defaultRecvSizeForListResponse),
+		)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +44,7 @@ func (c *Cluster) GetNodes(options apitypes.NodeListOptions) ([]types.Node, erro
 func (c *Cluster) GetNode(input string) (types.Node, error) {
 	var node *swarmapi.Node
 
-	if err := c.lockedManagerAction(func(ctx context.Context, state nodeState) error {
+	if err := c.lockedManagerAction(context.TODO(), func(ctx context.Context, state nodeState) error {
 		n, err := getNode(ctx, state.controlClient, input)
 		if err != nil {
 			return err
@@ -66,13 +60,14 @@ func (c *Cluster) GetNode(input string) (types.Node, error) {
 
 // UpdateNode updates existing nodes properties.
 func (c *Cluster) UpdateNode(input string, version uint64, spec types.NodeSpec) error {
-	return c.lockedManagerAction(func(_ context.Context, state nodeState) error {
+	return c.lockedManagerAction(context.TODO(), func(_ context.Context, state nodeState) error {
 		nodeSpec, err := convert.NodeSpecToGRPC(spec)
 		if err != nil {
 			return errdefs.InvalidParameter(err)
 		}
 
-		ctx, cancel := c.getRequestContext()
+		ctx := context.TODO()
+		ctx, cancel := context.WithTimeout(ctx, swarmRequestTimeout)
 		defer cancel()
 
 		currentNode, err := getNode(ctx, state.controlClient, input)
@@ -96,7 +91,7 @@ func (c *Cluster) UpdateNode(input string, version uint64, spec types.NodeSpec) 
 
 // RemoveNode removes a node from a cluster
 func (c *Cluster) RemoveNode(input string, force bool) error {
-	return c.lockedManagerAction(func(ctx context.Context, state nodeState) error {
+	return c.lockedManagerAction(context.TODO(), func(ctx context.Context, state nodeState) error {
 		node, err := getNode(ctx, state.controlClient, input)
 		if err != nil {
 			return err

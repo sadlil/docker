@@ -1,29 +1,32 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 	"fmt"
 	"io"
 
-	"github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/container/stream"
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/containerd/log"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	containertypes "github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/internal/stdcopymux"
+	"github.com/moby/moby/v2/daemon/internal/stream"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/server/backend"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/moby/term"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // ContainerAttach attaches to logs according to the config passed in. See ContainerAttachConfig.
-func (daemon *Daemon) ContainerAttach(prefixOrName string, c *backend.ContainerAttachConfig) error {
+func (daemon *Daemon) ContainerAttach(prefixOrName string, req *backend.ContainerAttachConfig) error {
 	keys := []byte{}
 	var err error
-	if c.DetachKeys != "" {
-		keys, err = term.ToBytes(c.DetachKeys)
+	if req.DetachKeys != "" {
+		keys, err = term.ToBytes(req.DetachKeys)
 		if err != nil {
-			return errdefs.InvalidParameter(errors.Errorf("Invalid detach keys (%s) provided", c.DetachKeys))
+			return errdefs.InvalidParameter(errors.Errorf("Invalid detach keys (%s) provided", req.DetachKeys))
 		}
 	}
 
@@ -31,34 +34,49 @@ func (daemon *Daemon) ContainerAttach(prefixOrName string, c *backend.ContainerA
 	if err != nil {
 		return err
 	}
-	if ctr.IsPaused() {
-		err := fmt.Errorf("container %s is paused, unpause the container before attach", prefixOrName)
-		return errdefs.Conflict(err)
+	if ctr.State.IsPaused() {
+		return errdefs.Conflict(fmt.Errorf("container %s is paused, unpause the container before attach", prefixOrName))
 	}
-	if ctr.IsRestarting() {
-		err := fmt.Errorf("container %s is restarting, wait until the container is running", prefixOrName)
-		return errdefs.Conflict(err)
+	if ctr.State.IsRestarting() {
+		return errdefs.Conflict(fmt.Errorf("container %s is restarting, wait until the container is running", prefixOrName))
 	}
 
 	cfg := stream.AttachConfig{
-		UseStdin:   c.UseStdin,
-		UseStdout:  c.UseStdout,
-		UseStderr:  c.UseStderr,
+		UseStdin:   req.UseStdin,
+		UseStdout:  req.UseStdout,
+		UseStderr:  req.UseStderr,
 		TTY:        ctr.Config.Tty,
 		CloseStdin: ctr.Config.StdinOnce,
 		DetachKeys: keys,
 	}
 	ctr.StreamConfig.AttachStreams(&cfg)
 
-	inStream, outStream, errStream, err := c.GetStreams()
+	clientCtx, closeNotify := context.WithCancel(context.Background())
+	defer closeNotify()
+	go func() {
+		<-clientCtx.Done()
+		// The client has disconnected
+		// In this case we need to close the container's output streams so that the goroutines used to copy
+		// to the client streams are unblocked and can exit.
+		if cfg.CStdout != nil {
+			cfg.CStdout.Close()
+		}
+		if cfg.CStderr != nil {
+			cfg.CStderr.Close()
+		}
+	}()
+
+	multiplexed := !ctr.Config.Tty && req.MuxStreams
+	inStream, outStream, errStream, err := req.GetStreams(multiplexed, closeNotify)
 	if err != nil {
 		return err
 	}
+
 	defer inStream.Close()
 
-	if !ctr.Config.Tty && c.MuxStreams {
-		errStream = stdcopy.NewStdWriter(errStream, stdcopy.Stderr)
-		outStream = stdcopy.NewStdWriter(outStream, stdcopy.Stdout)
+	if multiplexed {
+		errStream = stdcopymux.NewStdWriter(errStream, stdcopy.Stderr)
+		outStream = stdcopymux.NewStdWriter(outStream, stdcopy.Stdout)
 	}
 
 	if cfg.UseStdin {
@@ -71,8 +89,8 @@ func (daemon *Daemon) ContainerAttach(prefixOrName string, c *backend.ContainerA
 		cfg.Stderr = errStream
 	}
 
-	if err := daemon.containerAttach(ctr, &cfg, c.Logs, c.Stream); err != nil {
-		fmt.Fprintf(outStream, "Error attaching: %s\n", err)
+	if err := daemon.containerAttach(ctr, &cfg, req.Logs, req.Stream); err != nil {
+		_, _ = fmt.Fprintln(outStream, "Error attaching:", err)
 	}
 	return nil
 }
@@ -105,16 +123,19 @@ func (daemon *Daemon) ContainerAttachRaw(prefixOrName string, stdin io.ReadClose
 	return daemon.containerAttach(ctr, &cfg, false, doStream)
 }
 
-func (daemon *Daemon) containerAttach(c *container.Container, cfg *stream.AttachConfig, logs, doStream bool) error {
-	if logs {
-		logDriver, logCreated, err := daemon.getLogger(c)
+func (daemon *Daemon) containerAttach(ctr *container.Container, cfg *stream.AttachConfig, enableLogs, doStream bool) error {
+	if enableLogs {
+		logDriver, logCreated, err := daemon.getLogger(ctr)
 		if err != nil {
 			return err
 		}
 		if logCreated {
 			defer func() {
 				if err = logDriver.Close(); err != nil {
-					logrus.Errorf("Error closing logger: %v", err)
+					log.G(context.TODO()).WithFields(log.Fields{
+						"error":     err,
+						"container": ctr.ID,
+					}).Error("Error closing logger")
 				}
 			}()
 		}
@@ -122,13 +143,13 @@ func (daemon *Daemon) containerAttach(c *container.Container, cfg *stream.Attach
 		if !ok {
 			return logger.ErrReadLogsNotSupported{}
 		}
-		logs := cLog.ReadLogs(logger.ReadConfig{Tail: -1})
-		defer logs.ConsumerGone()
+		logWatcher := cLog.ReadLogs(context.TODO(), logger.ReadConfig{Tail: -1})
+		defer logWatcher.ConsumerGone()
 
 	LogLoop:
 		for {
 			select {
-			case msg, ok := <-logs.Msg:
+			case msg, ok := <-logWatcher.Msg:
 				if !ok {
 					break LogLoop
 				}
@@ -138,14 +159,17 @@ func (daemon *Daemon) containerAttach(c *container.Container, cfg *stream.Attach
 				if msg.Source == "stderr" && cfg.Stderr != nil {
 					cfg.Stderr.Write(msg.Line)
 				}
-			case err := <-logs.Err:
-				logrus.Errorf("Error streaming logs: %v", err)
+			case err := <-logWatcher.Err:
+				log.G(context.TODO()).WithFields(log.Fields{
+					"error":     err,
+					"container": ctr.ID,
+				}).Error("Error streaming logs")
 				break LogLoop
 			}
 		}
 	}
 
-	daemon.LogContainerEvent(c, "attach")
+	daemon.LogContainerEvent(ctr, events.ActionAttach)
 
 	if !doStream {
 		return nil
@@ -154,33 +178,38 @@ func (daemon *Daemon) containerAttach(c *container.Container, cfg *stream.Attach
 	if cfg.Stdin != nil {
 		r, w := io.Pipe()
 		go func(stdin io.ReadCloser) {
-			defer w.Close()
-			defer logrus.Debug("Closing buffered stdin pipe")
 			io.Copy(w, stdin)
+			log.G(context.TODO()).WithFields(log.Fields{
+				"container": ctr.ID,
+			}).Debug("Closing buffered stdin pipe")
+			w.Close()
 		}(cfg.Stdin)
 		cfg.Stdin = r
 	}
 
-	if !c.Config.OpenStdin {
+	if !ctr.Config.OpenStdin {
 		cfg.Stdin = nil
 	}
 
-	if c.Config.StdinOnce && !c.Config.Tty {
+	if ctr.Config.StdinOnce && !ctr.Config.Tty {
 		// Wait for the container to stop before returning.
-		waitChan := c.Wait(context.Background(), container.WaitConditionNotRunning)
+		waitChan := ctr.State.Wait(context.Background(), containertypes.WaitConditionNotRunning)
 		defer func() {
 			<-waitChan // Ignore returned exit code.
 		}()
 	}
 
-	ctx := c.InitAttachContext()
-	err := <-c.StreamConfig.CopyStreams(ctx, cfg)
+	ctx := ctr.AttachContext()
+	err := <-ctr.StreamConfig.CopyStreams(ctx, cfg)
 	if err != nil {
 		var ierr term.EscapeError
 		if errors.Is(err, context.Canceled) || errors.As(err, &ierr) {
-			daemon.LogContainerEvent(c, "detach")
+			daemon.LogContainerEvent(ctr, events.ActionDetach)
 		} else {
-			logrus.Errorf("attach failed with error: %v", err)
+			log.G(ctx).WithFields(log.Fields{
+				"error":     err,
+				"container": ctr.ID,
+			}).Error("attach failed with error")
 		}
 	}
 

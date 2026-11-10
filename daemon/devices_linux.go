@@ -1,38 +1,22 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
-import (
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/pkg/capabilities"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
-)
+import "tags.cncf.io/container-device-interface/pkg/cdi"
 
-var deviceDrivers = map[string]*deviceDriver{}
-
-type deviceDriver struct {
-	capset     capabilities.Set
-	updateSpec func(*specs.Spec, *deviceInstance) error
-}
-
-type deviceInstance struct {
-	req          container.DeviceRequest
-	selectedCaps []string
-}
-
-func registerDeviceDriver(name string, d *deviceDriver) {
-	deviceDrivers[name] = d
-}
-
-func (daemon *Daemon) handleDevice(req container.DeviceRequest, spec *specs.Spec) error {
-	if req.Driver == "" {
-		for _, dd := range deviceDrivers {
-			if selected := dd.capset.Match(req.Capabilities); selected != nil {
-				return dd.updateSpec(spec, &deviceInstance{req: req, selectedCaps: selected})
-			}
+// RegisterGPUDeviceDrivers registers GPU device drivers.
+// If the cdiCache is provided, it is used to detect presence of CDI specs for AMD GPUs.
+// For NVIDIA GPUs, presence of CDI specs is detected by checking for the nvidia-cdi-hook binary.
+func RegisterGPUDeviceDrivers(cdiCache *cdi.Cache) {
+	// Register NVIDIA device drivers.
+	if nvidiaDrivers := getNVIDIADeviceDrivers(); len(nvidiaDrivers) > 0 {
+		for name, driver := range nvidiaDrivers {
+			registerDeviceDriver(name, driver)
 		}
-	} else if dd := deviceDrivers[req.Driver]; dd != nil {
-		if selected := dd.capset.Match(req.Capabilities); selected != nil {
-			return dd.updateSpec(spec, &deviceInstance{req: req, selectedCaps: selected})
-		}
+		return
 	}
-	return incompatibleDeviceRequest{req.Driver, req.Capabilities}
+
+	// Register AMD driver if AMD CDI spec or helper binary is present.
+	if amdDriver := getAMDDeviceDrivers(cdiCache); amdDriver != nil {
+		registerDeviceDriver("amd", amdDriver)
+		return
+	}
 }

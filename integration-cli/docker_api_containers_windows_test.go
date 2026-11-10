@@ -1,26 +1,25 @@
 //go:build windows
-// +build windows
 
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"math/rand"
 	"strings"
 	"testing"
 
-	winio "github.com/Microsoft/go-winio"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/pkg/errors"
+	"github.com/Microsoft/go-winio"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/internal/testutil"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
-func (s *DockerSuite) TestContainersAPICreateMountsBindNamedPipe(c *testing.T) {
+func (s *DockerAPISuite) TestContainersAPICreateMountsBindNamedPipe(c *testing.T) {
 	// Create a host pipe to map into the container
 	hostPipeName := fmt.Sprintf(`\\.\pipe\docker-cli-test-pipe-%x`, rand.Uint64())
 	pc := &winio.PipeConfig{
@@ -49,33 +48,33 @@ func (s *DockerSuite) TestContainersAPICreateMountsBindNamedPipe(c *testing.T) {
 	cmd := fmt.Sprintf("echo %s > %s", text, containerPipeName)
 	name := "test-bind-npipe"
 
-	ctx := context.Background()
-	client := testEnv.APIClient()
-	_, err = client.ContainerCreate(ctx,
-		&container.Config{
-			Image: testEnv.PlatformDefaults.BaseImage,
-			Cmd:   []string{"cmd", "/c", cmd},
-		}, &container.HostConfig{
-			Mounts: []mount.Mount{
-				{
-					Type:   "npipe",
-					Source: hostPipeName,
-					Target: containerPipeName,
+	ctx := testutil.GetContext(c)
+	apiClient := testEnv.APIClient()
+	_, err = apiClient.ContainerCreate(ctx,
+		client.ContainerCreateOptions{
+			Config: &container.Config{
+				Image: testEnv.PlatformDefaults.BaseImage,
+				Cmd:   []string{"cmd", "/c", cmd},
+			},
+			HostConfig: &container.HostConfig{
+				Mounts: []mount.Mount{
+					{
+						Type:   "npipe",
+						Source: hostPipeName,
+						Target: containerPipeName,
+					},
 				},
 			},
+			NetworkingConfig: &network.NetworkingConfig{},
+			Name:             name,
 		},
-		nil, nil, name)
+	)
 	assert.NilError(c, err)
 
-	err = client.ContainerStart(ctx, name, types.ContainerStartOptions{})
+	_, err = apiClient.ContainerStart(ctx, name, client.ContainerStartOptions{})
 	assert.NilError(c, err)
 
 	err = <-ch
 	assert.NilError(c, err)
 	assert.Check(c, is.Equal(text, strings.TrimSpace(string(b))))
-}
-
-func mountWrapper(device, target, mType, options string) error {
-	// This should never be called.
-	return errors.Errorf("there is no implementation of Mount on this platform")
 }

@@ -3,16 +3,19 @@ package ops
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/continuity/fs"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/frontend"
-	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver"
-	"github.com/moby/buildkit/solver/llbsolver"
+	"github.com/moby/buildkit/solver/llbsolver/ops/opsutils"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/cachedigest"
+	"github.com/moby/buildkit/util/openfile"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -20,24 +23,28 @@ import (
 
 const buildCacheType = "buildkit.build.v0"
 
-type buildOp struct {
+const maxBuildDefinitionSize = defaults.DefaultMaxRecvMsgSize
+
+type BuildOp struct {
 	op *pb.BuildOp
 	b  frontend.FrontendLLBBridge
 	v  solver.Vertex
 }
 
-func NewBuildOp(v solver.Vertex, op *pb.Op_Build, b frontend.FrontendLLBBridge, _ worker.Worker) (solver.Op, error) {
-	if err := llbsolver.ValidateOp(&pb.Op{Op: op}); err != nil {
+var _ solver.Op = &BuildOp{}
+
+func NewBuildOp(v solver.Vertex, op *pb.Op_Build, b frontend.FrontendLLBBridge, _ worker.Worker) (*BuildOp, error) {
+	if err := opsutils.Validate(&pb.Op{Op: op}); err != nil {
 		return nil, err
 	}
-	return &buildOp{
+	return &BuildOp{
 		op: op.Build,
 		b:  b,
 		v:  v,
 	}, nil
 }
 
-func (b *buildOp) CacheMap(ctx context.Context, g session.Group, index int) (*solver.CacheMap, bool, error) {
+func (b *BuildOp) CacheMap(ctx context.Context, job solver.JobContext, index int) (*solver.CacheMap, bool, error) {
 	dt, err := json.Marshal(struct {
 		Type string
 		Exec *pb.BuildOp
@@ -49,8 +56,12 @@ func (b *buildOp) CacheMap(ctx context.Context, g session.Group, index int) (*so
 		return nil, false, err
 	}
 
+	dgst, err := cachedigest.FromBytes(dt, cachedigest.TypeJSON)
+	if err != nil {
+		return nil, false, err
+	}
 	return &solver.CacheMap{
-		Digest: digest.FromBytes(dt),
+		Digest: dgst,
 		Deps: make([]struct {
 			Selector          digest.Digest
 			ComputeDigestFunc solver.ResultBasedCacheFunc
@@ -59,9 +70,9 @@ func (b *buildOp) CacheMap(ctx context.Context, g session.Group, index int) (*so
 	}, true, nil
 }
 
-func (b *buildOp) Exec(ctx context.Context, g session.Group, inputs []solver.Result) (outputs []solver.Result, retErr error) {
-	if b.op.Builder != pb.LLBBuilder {
-		return nil, errors.Errorf("only LLB builder is currently allowed")
+func (b *BuildOp) Exec(ctx context.Context, job solver.JobContext, inputs []solver.Result) (outputs []solver.Result, retErr error) {
+	if b.op.Builder != int64(pb.LLBBuilder) {
+		return nil, errors.New("only LLB builder is currently allowed")
 	}
 
 	builderInputs := b.op.Inputs
@@ -71,7 +82,7 @@ func (b *buildOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 	}
 
 	i := int(llbDef.Input)
-	if i >= len(inputs) {
+	if i < 0 || i >= len(inputs) {
 		return nil, errors.Errorf("invalid index %v", i) // TODO: this should be validated before
 	}
 	inp := inputs[i]
@@ -81,6 +92,7 @@ func (b *buildOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 		return nil, errors.Errorf("invalid reference for build %T", inp.Sys())
 	}
 
+	g := job.Session()
 	mount, err := ref.ImmutableRef.Mount(ctx, true, g)
 	if err != nil {
 		return nil, err
@@ -104,17 +116,30 @@ func (b *buildOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 		fn = override
 	}
 
+	// paths below are daemon-side locations, report the requested filename
+	defer func() {
+		var pathErr *os.PathError
+		if errors.As(retErr, &pathErr) {
+			pathErr.Path = fn
+		}
+	}()
+
 	newfn, err := fs.RootPath(root, fn)
 	if err != nil {
 		return nil, errors.Wrapf(err, "working dir %s points to invalid target", fn)
 	}
 
-	f, err := os.Open(newfn)
+	f, err := openfile.Regular(newfn)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to open %s", newfn)
+		return nil, err
 	}
 
-	def, err := llb.ReadFrom(f)
+	lr := &io.LimitedReader{R: f, N: int64(maxBuildDefinitionSize) + 1}
+	def, err := llb.ReadFrom(lr)
+	if lr.N == 0 {
+		f.Close()
+		return nil, errors.Errorf("%s exceeds maximum allowed size of %d bytes", fn, maxBuildDefinitionSize)
+	}
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -130,9 +155,12 @@ func (b *buildOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 		return nil, err
 	}
 
-	for _, r := range newRes.Refs {
-		r.Release(context.TODO())
-	}
+	newRes.EachRef(func(ref solver.ResultProxy) error {
+		if ref == newRes.Ref {
+			return nil
+		}
+		return ref.Release(context.TODO())
+	})
 
 	r, err := newRes.Ref.Result(ctx)
 	if err != nil {
@@ -142,7 +170,9 @@ func (b *buildOp) Exec(ctx context.Context, g session.Group, inputs []solver.Res
 	return []solver.Result{r}, err
 }
 
-func (b *buildOp) Acquire(ctx context.Context) (solver.ReleaseFunc, error) {
+func (b *BuildOp) Acquire(ctx context.Context) (solver.ReleaseFunc, error) {
 	// buildOp itself does not count towards parallelism budget.
 	return func() {}, nil
 }
+
+func (b *BuildOp) IsProvenanceProvider() {}

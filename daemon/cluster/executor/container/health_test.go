@@ -1,27 +1,22 @@
 //go:build !windows
-// +build !windows
 
-package container // import "github.com/docker/docker/daemon/cluster/executor/container"
+package container
 
 import (
-	"context"
+	"errors"
 	"testing"
 	"time"
 
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon"
-	"github.com/docker/docker/daemon/events"
-	"github.com/docker/swarmkit/api"
+	containertypes "github.com/moby/moby/api/types/container"
+	eventtypes "github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/events"
+	"github.com/moby/swarmkit/v2/api"
 )
 
 func TestHealthStates(t *testing.T) {
-
 	// set up environment: events, task, container ....
-	e := events.New()
-	_, l, _ := e.Subscribe()
-	defer e.Evict(l)
-
 	task := &api.Task{
 		ID:        "id",
 		ServiceID: "sid",
@@ -38,33 +33,21 @@ func TestHealthStates(t *testing.T) {
 		Annotations: api.Annotations{Name: "name"},
 	}
 
-	c := &container.Container{
-		ID:   "id",
-		Name: "name",
-		Config: &containertypes.Config{
-			Image: "image_name",
-			Labels: map[string]string{
-				"com.docker.swarm.task.id": "id",
-			},
-		},
-	}
-
 	daemon := &daemon.Daemon{
-		EventsService: e,
+		EventsService: events.New(),
 	}
 
-	controller, err := newController(daemon, nil, nil, task, nil, nil)
+	ctrlr, err := newController(daemon, nil, nil, task, nil, nil)
 	if err != nil {
 		t.Fatalf("create controller fail %v", err)
 	}
 
 	errChan := make(chan error, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	// fire checkHealth
 	go func() {
-		err := controller.checkHealth(ctx)
+		err := ctrlr.checkHealth(ctx)
 		select {
 		case errChan <- err:
 		case <-ctx.Done():
@@ -73,15 +56,25 @@ func TestHealthStates(t *testing.T) {
 
 	// send an event and expect to get expectedErr
 	// if expectedErr is nil, shouldn't get any error
-	logAndExpect := func(msg string, expectedErr error) {
-		daemon.LogContainerEvent(c, msg)
+	logAndExpect := func(msg eventtypes.Action, expectedErr error) {
+		ctr := &container.Container{
+			ID:   "id",
+			Name: "name",
+			Config: &containertypes.Config{
+				Image: "image_name",
+				Labels: map[string]string{
+					"com.docker.swarm.task.id": "id",
+				},
+			},
+		}
+		daemon.LogContainerEvent(ctr, msg)
 
 		timer := time.NewTimer(1 * time.Second)
 		defer timer.Stop()
 
 		select {
 		case err := <-errChan:
-			if err != expectedErr {
+			if !errors.Is(err, expectedErr) {
 				t.Fatalf("expect error %v, but get %v", expectedErr, err)
 			}
 		case <-timer.C:
@@ -92,10 +85,10 @@ func TestHealthStates(t *testing.T) {
 	}
 
 	// events that are ignored by checkHealth
-	logAndExpect("health_status: running", nil)
-	logAndExpect("health_status: healthy", nil)
-	logAndExpect("die", nil)
+	logAndExpect(eventtypes.ActionHealthStatusRunning, nil)
+	logAndExpect(eventtypes.ActionHealthStatusHealthy, nil)
+	logAndExpect(eventtypes.ActionDie, nil)
 
 	// unhealthy event will be caught by checkHealth
-	logAndExpect("health_status: unhealthy", ErrContainerUnhealthy)
+	logAndExpect(eventtypes.ActionHealthStatusUnhealthy, ErrContainerUnhealthy)
 }

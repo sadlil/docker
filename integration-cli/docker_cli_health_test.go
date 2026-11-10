@@ -1,48 +1,63 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/integration-cli/cli/build"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
 	"gotest.tools/v3/assert"
 )
 
-func waitForHealthStatus(c *testing.T, name string, prev string, expected string) {
-	prev = prev + "\n"
-	expected = expected + "\n"
+type DockerCLIHealthSuite struct {
+	ds *DockerSuite
+}
+
+func (s *DockerCLIHealthSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
+}
+
+func (s *DockerCLIHealthSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
+}
+
+func waitForHealthStatus(t *testing.T, name string, prev container.HealthStatus, expected container.HealthStatus) {
 	for {
-		out, _ := dockerCmd(c, "inspect", "--format={{.State.Health.Status}}", name)
-		if out == expected {
+		out := cli.DockerCmd(t, "inspect", "--format={{.State.Health.Status}}", name).Stdout()
+		actual := container.HealthStatus(strings.TrimSpace(out))
+		if actual == expected {
 			return
 		}
-		assert.Equal(c, out, prev)
-		if out != prev {
+
+		// TODO(thaJeztah): this logic seems broken? assert.Assert would make it fail, so why the "actual != prev"?
+		assert.Equal(t, actual, prev)
+		if actual != prev {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func getHealth(c *testing.T, name string) *types.Health {
-	out, _ := dockerCmd(c, "inspect", "--format={{json .State.Health}}", name)
-	var health types.Health
+func getHealth(t *testing.T, name string) *container.Health {
+	out := cli.DockerCmd(t, "inspect", "--format={{json .State.Health}}", name).Stdout()
+	var health container.Health
 	err := json.Unmarshal([]byte(out), &health)
-	assert.Equal(c, err, nil)
+	assert.Equal(t, err, nil)
 	return &health
 }
 
-func (s *DockerSuite) TestHealth(c *testing.T) {
+func (s *DockerCLIHealthSuite) TestHealth(c *testing.T) {
 	testRequires(c, DaemonIsLinux) // busybox doesn't work on Windows
 
 	existingContainers := ExistingContainerIDs(c)
 
 	imageName := "testhealth"
-	buildImageSuccessfully(c, imageName, build.WithDockerfile(`FROM busybox
+	cli.BuildCmd(c, imageName, build.WithDockerfile(`FROM busybox
 		RUN echo OK > /status
 		CMD ["/bin/sleep", "120"]
 		STOPSIGNAL SIGKILL
@@ -51,117 +66,113 @@ func (s *DockerSuite) TestHealth(c *testing.T) {
 
 	// No health status before starting
 	name := "test_health"
-	cid, _ := dockerCmd(c, "create", "--name", name, imageName)
-	out, _ := dockerCmd(c, "ps", "-a", "--format={{.ID}} {{.Status}}")
+	cid := cli.DockerCmd(c, "create", "--name", name, imageName).Stdout()
+	out := cli.DockerCmd(c, "ps", "-a", "--format={{.ID}} {{.Status}}").Stdout()
 	out = RemoveOutputForExistingElements(out, existingContainers)
 	assert.Equal(c, out, cid[:12]+" Created\n")
 
 	// Inspect the options
-	out, _ = dockerCmd(c, "inspect",
-		"--format=timeout={{.Config.Healthcheck.Timeout}} interval={{.Config.Healthcheck.Interval}} retries={{.Config.Healthcheck.Retries}} test={{.Config.Healthcheck.Test}}", name)
+	out = cli.DockerCmd(c, "inspect", "--format=timeout={{.Config.Healthcheck.Timeout}} interval={{.Config.Healthcheck.Interval}} retries={{.Config.Healthcheck.Retries}} test={{.Config.Healthcheck.Test}}", name).Stdout()
 	assert.Equal(c, out, "timeout=30s interval=1s retries=0 test=[CMD-SHELL cat /status]\n")
 
 	// Start
-	dockerCmd(c, "start", name)
-	waitForHealthStatus(c, name, "starting", "healthy")
+	cli.DockerCmd(c, "start", name)
+	waitForHealthStatus(c, name, container.Starting, container.Healthy)
 
 	// Make it fail
-	dockerCmd(c, "exec", name, "rm", "/status")
-	waitForHealthStatus(c, name, "healthy", "unhealthy")
+	cli.DockerCmd(c, "exec", name, "rm", "/status")
+	waitForHealthStatus(c, name, container.Healthy, container.Unhealthy)
 
 	// Inspect the status
-	out, _ = dockerCmd(c, "inspect", "--format={{.State.Health.Status}}", name)
-	assert.Equal(c, out, "unhealthy\n")
+	out = cli.DockerCmd(c, "inspect", "--format={{.State.Health.Status}}", name).Stdout()
+	assert.Equal(c, container.HealthStatus(strings.TrimSpace(out)), container.Unhealthy)
 
 	// Make it healthy again
-	dockerCmd(c, "exec", name, "touch", "/status")
-	waitForHealthStatus(c, name, "unhealthy", "healthy")
+	cli.DockerCmd(c, "exec", name, "touch", "/status")
+	waitForHealthStatus(c, name, container.Unhealthy, container.Healthy)
 
 	// Remove container
-	dockerCmd(c, "rm", "-f", name)
+	cli.DockerCmd(c, "rm", "-f", name)
 
 	// Disable the check from the CLI
-	dockerCmd(c, "create", "--name=noh", "--no-healthcheck", imageName)
-	out, _ = dockerCmd(c, "inspect", "--format={{.Config.Healthcheck.Test}}", "noh")
+	cli.DockerCmd(c, "create", "--name=noh", "--no-healthcheck", imageName)
+	out = cli.DockerCmd(c, "inspect", "--format={{.Config.Healthcheck.Test}}", "noh").Stdout()
 	assert.Equal(c, out, "[NONE]\n")
-	dockerCmd(c, "rm", "noh")
+	cli.DockerCmd(c, "rm", "noh")
 
 	// Disable the check with a new build
-	buildImageSuccessfully(c, "no_healthcheck", build.WithDockerfile(`FROM testhealth
+	cli.BuildCmd(c, "no_healthcheck", build.WithDockerfile(`FROM testhealth
 		HEALTHCHECK NONE`))
 
-	out, _ = dockerCmd(c, "inspect", "--format={{.Config.Healthcheck.Test}}", "no_healthcheck")
+	out = cli.DockerCmd(c, "inspect", "--format={{.Config.Healthcheck.Test}}", "no_healthcheck").Stdout()
 	assert.Equal(c, out, "[NONE]\n")
 
 	// Enable the checks from the CLI
-	_, _ = dockerCmd(c, "run", "-d", "--name=fatal_healthcheck",
+	cli.DockerCmd(c, "run", "-d", "--name=fatal_healthcheck",
 		"--health-interval=1s",
 		"--health-retries=3",
 		"--health-cmd=cat /status",
-		"no_healthcheck")
-	waitForHealthStatus(c, "fatal_healthcheck", "starting", "healthy")
+		"no_healthcheck",
+	)
+	waitForHealthStatus(c, "fatal_healthcheck", container.Starting, container.Healthy)
 	health := getHealth(c, "fatal_healthcheck")
-	assert.Equal(c, health.Status, "healthy")
+	assert.Equal(c, health.Status, container.Healthy)
 	assert.Equal(c, health.FailingStreak, 0)
 	last := health.Log[len(health.Log)-1]
 	assert.Equal(c, last.ExitCode, 0)
 	assert.Equal(c, last.Output, "OK\n")
 
 	// Fail the check
-	dockerCmd(c, "exec", "fatal_healthcheck", "rm", "/status")
-	waitForHealthStatus(c, "fatal_healthcheck", "healthy", "unhealthy")
+	cli.DockerCmd(c, "exec", "fatal_healthcheck", "rm", "/status")
+	waitForHealthStatus(c, "fatal_healthcheck", container.Healthy, container.Unhealthy)
 
-	failsStr, _ := dockerCmd(c, "inspect", "--format={{.State.Health.FailingStreak}}", "fatal_healthcheck")
+	failsStr := cli.DockerCmd(c, "inspect", "--format={{.State.Health.FailingStreak}}", "fatal_healthcheck").Combined()
 	fails, err := strconv.Atoi(strings.TrimSpace(failsStr))
-	assert.Assert(c, err == nil)
+	assert.Check(c, err)
 	assert.Equal(c, fails >= 3, true)
-	dockerCmd(c, "rm", "-f", "fatal_healthcheck")
+	cli.DockerCmd(c, "rm", "-f", "fatal_healthcheck")
 
 	// Check timeout
 	// Note: if the interval is too small, it seems that Docker spends all its time running health
 	// checks and never gets around to killing it.
-	_, _ = dockerCmd(c, "run", "-d", "--name=test",
-		"--health-interval=1s", "--health-cmd=sleep 5m", "--health-timeout=1s", imageName)
-	waitForHealthStatus(c, "test", "starting", "unhealthy")
+	cli.DockerCmd(c, "run", "-d", "--name=test", "--health-interval=1s", "--health-cmd=sleep 5m", "--health-timeout=1s", imageName)
+	waitForHealthStatus(c, "test", container.Starting, container.Unhealthy)
 	health = getHealth(c, "test")
 	last = health.Log[len(health.Log)-1]
-	assert.Equal(c, health.Status, "unhealthy")
+	assert.Equal(c, health.Status, container.Unhealthy)
 	assert.Equal(c, last.ExitCode, -1)
 	assert.Equal(c, last.Output, "Health check exceeded timeout (1s)")
-	dockerCmd(c, "rm", "-f", "test")
+	cli.DockerCmd(c, "rm", "-f", "test")
 
 	// Check JSON-format
-	buildImageSuccessfully(c, imageName, build.WithDockerfile(`FROM busybox
+	cli.BuildCmd(c, imageName, build.WithDockerfile(`FROM busybox
 		RUN echo OK > /status
 		CMD ["/bin/sleep", "120"]
 		STOPSIGNAL SIGKILL
 		HEALTHCHECK --interval=1s --timeout=30s \
 		  CMD ["cat", "/my status"]`))
-	out, _ = dockerCmd(c, "inspect",
-		"--format={{.Config.Healthcheck.Test}}", imageName)
+	out = cli.DockerCmd(c, "inspect", "--format={{.Config.Healthcheck.Test}}", imageName).Stdout()
 	assert.Equal(c, out, "[CMD cat /my status]\n")
-
 }
 
 // GitHub #33021
-func (s *DockerSuite) TestUnsetEnvVarHealthCheck(c *testing.T) {
+func (s *DockerCLIHealthSuite) TestUnsetEnvVarHealthCheck(c *testing.T) {
 	testRequires(c, DaemonIsLinux) // busybox doesn't work on Windows
 
 	imageName := "testhealth"
-	buildImageSuccessfully(c, imageName, build.WithDockerfile(`FROM busybox
+	cli.BuildCmd(c, imageName, build.WithDockerfile(`FROM busybox
 HEALTHCHECK --interval=1s --timeout=5s --retries=5 CMD /bin/sh -c "sleep 1"
 ENTRYPOINT /bin/sh -c "sleep 600"`))
 
 	name := "env_test_health"
 	// No health status before starting
-	dockerCmd(c, "run", "-d", "--name", name, "-e", "FOO", imageName)
+	cli.DockerCmd(c, "run", "-d", "--name", name, "-e", "FOO", imageName)
 	defer func() {
-		dockerCmd(c, "rm", "-f", name)
-		dockerCmd(c, "rmi", imageName)
+		cli.DockerCmd(c, "rm", "-f", name)
+		cli.DockerCmd(c, "rmi", imageName)
 	}()
 
 	// Start
-	dockerCmd(c, "start", name)
-	waitForHealthStatus(c, name, "starting", "healthy")
-
+	cli.DockerCmd(c, "start", name)
+	waitForHealthStatus(c, name, container.Starting, container.Healthy)
 }

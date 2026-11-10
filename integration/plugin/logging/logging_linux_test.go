@@ -8,9 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/v2/integration/internal/container"
+	"github.com/moby/moby/v2/internal/testutil"
+	"github.com/moby/moby/v2/internal/testutil/daemon"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/skip"
 )
@@ -19,21 +20,28 @@ func TestContinueAfterPluginCrash(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon, "test requires daemon on the same host")
 	t.Parallel()
 
+	ctx := testutil.StartSpan(baseContext, t)
+
 	d := daemon.New(t)
-	d.StartWithBusybox(t, "--iptables=false", "--init")
+	d.StartWithBusybox(ctx, t, "--iptables=false", "--ip6tables=false", "--init")
 	defer d.Stop(t)
 
-	client := d.NewClientT(t)
-	createPlugin(t, client, "test", "close_on_start", asLogDriver)
+	apiclient := d.NewClientT(t)
+	createPlugin(ctx, t, apiclient, "test", "close_on_start", asLogDriver)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	assert.Assert(t, client.PluginEnable(ctx, "test", types.PluginEnableOptions{Timeout: 30}))
+	ctxT, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	_, err := apiclient.PluginEnable(ctxT, "test", client.PluginEnableOptions{Timeout: 30})
+	assert.NilError(t, err)
 	cancel()
-	defer client.PluginRemove(context.Background(), "test", types.PluginRemoveOptions{Force: true})
+	defer func() {
+		_, _ = apiclient.PluginRemove(ctx, "test", client.PluginRemoveOptions{Force: true})
+	}()
 
-	ctx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
+	ctxT, cancel = context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 
-	id := container.Run(ctx, t, client,
+	id := container.Run(ctxT, t, apiclient,
 		container.WithAutoRemove,
 		container.WithLogDriver("test"),
 		container.WithCmd(
@@ -41,17 +49,17 @@ func TestContinueAfterPluginCrash(t *testing.T) {
 		),
 	)
 	cancel()
-	defer client.ContainerRemove(context.Background(), id, types.ContainerRemoveOptions{Force: true})
+	defer apiclient.ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: true})
 
 	// Attach to the container to make sure it's written a few times to stdout
-	attach, err := client.ContainerAttach(context.Background(), id, types.ContainerAttachOptions{Stream: true, Stdout: true})
+	attach, err := apiclient.ContainerAttach(ctx, id, client.ContainerAttachOptions{Stream: true, Stdout: true})
 	assert.NilError(t, err)
 
 	chErr := make(chan error, 1)
 	go func() {
 		defer close(chErr)
 		rdr := bufio.NewReader(attach.Reader)
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			_, _, err := rdr.ReadLine()
 			if err != nil {
 				chErr <- err

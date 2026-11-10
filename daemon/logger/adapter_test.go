@@ -1,14 +1,15 @@
-package logger // import "github.com/docker/docker/daemon/logger"
+package logger
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/plugins/logdriver"
 	protoio "github.com/gogo/protobuf/io"
+	"github.com/moby/moby/v2/daemon/logger/internal/logdriver"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
@@ -47,7 +48,6 @@ func (l *mockLoggingPlugin) StartLogging(file string, info Info) error {
 
 				l.c.Broadcast()
 				return
-
 			}
 
 			l.c.L.Lock()
@@ -55,7 +55,6 @@ func (l *mockLoggingPlugin) StartLogging(file string, info Info) error {
 			l.c.L.Unlock()
 			l.c.Broadcast()
 		}
-
 	}()
 	return nil
 }
@@ -70,7 +69,7 @@ func (l *mockLoggingPlugin) StopLogging(file string) error {
 	return nil
 }
 
-func (l *mockLoggingPlugin) Capabilities() (cap Capability, err error) {
+func (l *mockLoggingPlugin) Capabilities() (Capability, error) {
 	return Capability{ReadLogs: true}, nil
 }
 
@@ -119,7 +118,7 @@ func (l *mockLoggingPlugin) waitLen(i int) {
 }
 
 func (l *mockLoggingPlugin) check(t *testing.T) {
-	if l.err != nil && l.err != io.EOF {
+	if l.err != nil && !errors.Is(l.err, io.EOF) {
 		t.Fatal(l.err)
 	}
 }
@@ -156,7 +155,7 @@ func TestAdapterReadLogs(t *testing.T) {
 	lr, ok := l.(LogReader)
 	assert.Check(t, ok, "Logger does not implement LogReader")
 
-	lw := lr.ReadLogs(ReadConfig{})
+	lw := lr.ReadLogs(t.Context(), ReadConfig{})
 
 	for _, x := range testMsg {
 		select {
@@ -172,11 +171,10 @@ func TestAdapterReadLogs(t *testing.T) {
 		assert.Check(t, !ok, "expected message channel to be closed")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for message channel to close")
-
 	}
-	lw.ProducerGone()
+	lw.ConsumerGone()
 
-	lw = lr.ReadLogs(ReadConfig{Follow: true})
+	lw = lr.ReadLogs(t.Context(), ReadConfig{Follow: true})
 	for _, x := range testMsg {
 		select {
 		case msg := <-lw.Msg:

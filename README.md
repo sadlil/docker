@@ -1,6 +1,12 @@
 The Moby Project
 ================
 
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/moby/moby/v2)](https://pkg.go.dev/github.com/moby/moby/v2)
+![GitHub License](https://img.shields.io/github/license/moby/moby)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/moby/moby/badge)](https://scorecard.dev/viewer/?uri=github.com/moby/moby)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/10989/badge)](https://www.bestpractices.dev/projects/10989)
+
+
 ![Moby Project logo](docs/static_files/moby-project-logo.png "The Moby Project")
 
 Moby is an open-source project created by Docker to enable and accelerate software containerization.
@@ -14,7 +20,7 @@ Moby is an open project guided by strong principles, aiming to be modular, flexi
 It is open to the community to help set its direction.
 
 - Modular: the project includes lots of components that have well-defined functions and APIs that work together.
-- Batteries included but swappable: Moby includes enough components to build fully featured container system, but its modular architecture ensures that most of the components can be swapped by different implementations.
+- Batteries included but swappable: Moby includes enough components to build fully featured container systems, but its modular architecture ensures that most of the components can be swapped by different implementations.
 - Usable security: Moby provides secure defaults without compromising usability.
 - Developer focused: The APIs are intended to be functional and useful to build powerful tools.
 They are not necessarily intended as end user tools but as components aimed at developers.
@@ -32,7 +38,45 @@ New projects can be added if they fit with the community goals. Docker is commit
 However, other projects are also encouraged to use Moby as an upstream, and to reuse the components in diverse ways, and all these uses will be treated in the same way. External maintainers and contributors are welcomed.
 
 The Moby project is not intended as a location for support or feature requests for Docker products, but as a place for contributors to work on open source code, fix bugs, and make the code more useful.
-The releases are supported by the maintainers, community and users, on a best efforts basis only, and are not intended for customers who want enterprise or commercial support; Docker EE is the appropriate product for these use cases.
+The releases are supported by the maintainers, community and users, on a best efforts basis only. For customers who want enterprise or commercial support, [Docker Desktop](https://www.docker.com/products/docker-desktop/) and [Mirantis Container Runtime](https://www.mirantis.com/software/mirantis-container-runtime/) are the appropriate products for these use cases.
+
+## Go modules
+
+> [!IMPORTANT]
+> Starting with Docker v29 (released November 2025), the Go module `github.com/docker/docker` is **deprecated** and won't be updated.
+
+The supported public Go modules are:
+
+| Module | Description |
+|---|---|
+| [`github.com/moby/moby/client`](client/) | Go client for the Docker Engine API |
+| [`github.com/moby/moby/api`](api/) | API types shared between client and server |
+
+The root module `github.com/moby/moby/v2` is the codebase for building container engines based on Moby (such as Docker Engine).
+It produces binaries only - it is **not intended to be imported as a Go library** and has no API stability guarantees.
+
+### Release tags
+
+Docker Engine releases are tagged with a **`docker-`** prefix (e.g. `docker-v29.0.0` for Docker Engine 29.0.0).
+
+These tags are only used to build the Docker Engine binary from the root module - they must not be consumed via `go get`.
+
+The `client` and `api` modules are versioned independently with their own tags (e.g. `client/v1.x.x`, `api/v1.x.x`).
+
+### Migrating from `github.com/docker/docker`
+
+Replace the old import paths:
+
+```diff
+- import "github.com/docker/docker/client"
++ import "github.com/moby/moby/client"
+
+- import "github.com/docker/docker/api/types"
++ import "github.com/moby/moby/api/types"
+```
+
+Note that v29 includes many breaking API changes (option structs, renamed methods, moved types).
+See the [v29.0.0 release notes](https://github.com/moby/moby/releases/tag/docker-v29.0.0) for the full list of Go SDK changes.
 
 -----
 

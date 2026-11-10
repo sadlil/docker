@@ -1,6 +1,8 @@
-package swarm // import "github.com/docker/docker/api/types/swarm"
+package swarm
 
-import "time"
+import (
+	"time"
+)
 
 // Service represents a service.
 type Service struct {
@@ -33,12 +35,7 @@ type ServiceSpec struct {
 	Mode           ServiceMode   `json:",omitempty"`
 	UpdateConfig   *UpdateConfig `json:",omitempty"`
 	RollbackConfig *UpdateConfig `json:",omitempty"`
-
-	// Networks field in ServiceSpec is deprecated. The
-	// same field in TaskSpec should be used instead.
-	// This field will be removed in a future release.
-	Networks     []NetworkAttachmentConfig `json:",omitempty"`
-	EndpointSpec *EndpointSpec             `json:",omitempty"`
+	EndpointSpec   *EndpointSpec `json:",omitempty"`
 }
 
 // ServiceMode represents the mode of a service.
@@ -109,18 +106,27 @@ type ReplicatedJob struct {
 // This type is deliberately empty.
 type GlobalJob struct{}
 
+// FailureAction is the action to perform when updating a service fails.
+type FailureAction string
+
 const (
 	// UpdateFailureActionPause PAUSE
-	UpdateFailureActionPause = "pause"
+	UpdateFailureActionPause FailureAction = "pause"
 	// UpdateFailureActionContinue CONTINUE
-	UpdateFailureActionContinue = "continue"
+	UpdateFailureActionContinue FailureAction = "continue"
 	// UpdateFailureActionRollback ROLLBACK
-	UpdateFailureActionRollback = "rollback"
+	UpdateFailureActionRollback FailureAction = "rollback"
+)
 
+// UpdateOrder is the order of operations when rolling out or rolling back
+// an updated tasks for a service.
+type UpdateOrder string
+
+const (
 	// UpdateOrderStopFirst STOP_FIRST
-	UpdateOrderStopFirst = "stop-first"
+	UpdateOrderStopFirst UpdateOrder = "stop-first"
 	// UpdateOrderStartFirst START_FIRST
-	UpdateOrderStartFirst = "start-first"
+	UpdateOrderStartFirst UpdateOrder = "start-first"
 )
 
 // UpdateConfig represents the update configuration.
@@ -133,7 +139,7 @@ type UpdateConfig struct {
 	Delay time.Duration `json:",omitempty"`
 
 	// FailureAction is the action to take when an update failures.
-	FailureAction string `json:",omitempty"`
+	FailureAction FailureAction `json:",omitempty"`
 
 	// Monitor indicates how long to monitor a task for failure after it is
 	// created. If the task fails by ending up in one of the states
@@ -159,7 +165,7 @@ type UpdateConfig struct {
 	// Order indicates the order of operations when rolling out an updated
 	// task. Either the old task is shut down before the new task is
 	// started, or the new task is started before the old task is shut down.
-	Order string
+	Order UpdateOrder
 }
 
 // ServiceStatus represents the number of running tasks in a service and the
@@ -200,3 +206,13 @@ type JobStatus struct {
 	// Swarm manager.
 	LastExecution time.Time `json:",omitempty"`
 }
+
+// RegistryAuthSource defines options for the "registryAuthFrom" query parameter
+// on service update.
+type RegistryAuthSource string
+
+// Values for RegistryAuthFrom in ServiceUpdateOptions
+const (
+	RegistryAuthFromSpec         RegistryAuthSource = "spec"
+	RegistryAuthFromPreviousSpec RegistryAuthSource = "previous-spec"
+)

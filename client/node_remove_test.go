@@ -1,31 +1,33 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestNodeRemoveError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	err := client.NodeRemove(context.Background(), "node_id", types.NodeRemoveOptions{Force: false})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.NodeRemove(t.Context(), "node_id", NodeRemoveOptions{Force: false})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.NodeRemove(t.Context(), "", NodeRemoveOptions{Force: false})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.NodeRemove(t.Context(), "    ", NodeRemoveOptions{Force: false})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestNodeRemove(t *testing.T) {
-	expectedURL := "/nodes/node_id"
+	const expectedURL = "/nodes/node_id"
 
 	removeCases := []struct {
 		force         bool
@@ -41,29 +43,20 @@ func TestNodeRemove(t *testing.T) {
 	}
 
 	for _, removeCase := range removeCases {
-		client := &Client{
-			client: newMockClient(func(req *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(req.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-				}
-				if req.Method != http.MethodDelete {
-					return nil, fmt.Errorf("expected DELETE method, got %s", req.Method)
-				}
-				force := req.URL.Query().Get("force")
-				if force != removeCase.expectedForce {
-					return nil, fmt.Errorf("force not set in URL query properly. expected '%s', got %s", removeCase.expectedForce, force)
-				}
+		client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodDelete, expectedURL); err != nil {
+				return nil, err
+			}
+			force := req.URL.Query().Get("force")
+			if force != removeCase.expectedForce {
+				return nil, fmt.Errorf("force not set in URL query properly. expected '%s', got %s", removeCase.expectedForce, force)
+			}
 
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte("body"))),
-				}, nil
-			}),
-		}
+			return mockResponse(http.StatusOK, nil, "body")(req)
+		}))
+		assert.NilError(t, err)
 
-		err := client.NodeRemove(context.Background(), "node_id", types.NodeRemoveOptions{Force: removeCase.force})
-		if err != nil {
-			t.Fatal(err)
-		}
+		_, err = client.NodeRemove(t.Context(), "node_id", NodeRemoveOptions{Force: removeCase.force})
+		assert.NilError(t, err)
 	}
 }

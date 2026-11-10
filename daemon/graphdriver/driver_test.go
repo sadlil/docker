@@ -1,4 +1,4 @@
-package graphdriver // import "github.com/docker/docker/daemon/graphdriver"
+package graphdriver
 
 import (
 	"os"
@@ -14,22 +14,23 @@ func TestIsEmptyDir(t *testing.T) {
 	defer os.RemoveAll(tmp)
 
 	d := filepath.Join(tmp, "empty-dir")
-	err = os.Mkdir(d, 0755)
+	err = os.Mkdir(d, 0o755)
 	assert.NilError(t, err)
 	empty := isEmptyDir(d)
 	assert.Check(t, empty)
 
 	d = filepath.Join(tmp, "dir-with-subdir")
-	err = os.MkdirAll(filepath.Join(d, "subdir"), 0755)
+	err = os.MkdirAll(filepath.Join(d, "subdir"), 0o755)
 	assert.NilError(t, err)
 	empty = isEmptyDir(d)
 	assert.Check(t, !empty)
 
 	d = filepath.Join(tmp, "dir-with-empty-file")
-	err = os.Mkdir(d, 0755)
+	err = os.Mkdir(d, 0o755)
 	assert.NilError(t, err)
-	_, err = os.CreateTemp(d, "file")
+	f, err := os.CreateTemp(d, "file")
 	assert.NilError(t, err)
+	defer f.Close()
 	empty = isEmptyDir(d)
 	assert.Check(t, !empty)
 }

@@ -1,8 +1,9 @@
-package requirement // import "github.com/docker/docker/integration/internal/requirement"
+package requirement
 
 import (
+	"errors"
+	"net"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 )
@@ -12,12 +13,12 @@ import (
 func HasHubConnectivity(t *testing.T) bool {
 	t.Helper()
 	// Set a timeout on the GET at 15s
-	var timeout = 15 * time.Second
-	var url = "https://hub.docker.com"
+	timeout := 15 * time.Second
+	url := "https://hub.docker.com"
 
 	client := http.Client{Timeout: timeout}
 	resp, err := client.Get(url)
-	if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
+	if errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Timeout for GET request on %s", url)
 	}
 	if resp != nil {

@@ -1,12 +1,11 @@
 //go:build linux
-// +build linux
 
-package zfs // import "github.com/docker/docker/daemon/graphdriver/zfs"
+package zfs
 
 import (
 	"testing"
 
-	"github.com/docker/docker/daemon/graphdriver/graphtest"
+	"github.com/moby/moby/v2/daemon/graphdriver/graphtest"
 )
 
 // This avoids creating a new driver for each test if all tests are run

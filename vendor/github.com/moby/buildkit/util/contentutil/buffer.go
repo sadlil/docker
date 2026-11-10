@@ -3,14 +3,15 @@ package contentutil
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"io"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/v2/core/content"
+	cerrdefs "github.com/containerd/errdefs"
 	digest "github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
@@ -18,12 +19,15 @@ import (
 type Buffer interface {
 	content.Provider
 	content.Ingester
+	content.IngestManager
+	content.Manager
 }
 
 // NewBuffer returns a new buffer
 func NewBuffer() Buffer {
 	return &buffer{
 		buffers: map[digest.Digest][]byte{},
+		infos:   map[digest.Digest]content.Info{},
 		refs:    map[string]struct{}{},
 	}
 }
@@ -31,7 +35,57 @@ func NewBuffer() Buffer {
 type buffer struct {
 	mu      sync.Mutex
 	buffers map[digest.Digest][]byte
+	infos   map[digest.Digest]content.Info
 	refs    map[string]struct{}
+}
+
+func (b *buffer) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
+	b.mu.Lock()
+	v, ok := b.infos[dgst]
+	b.mu.Unlock()
+	if !ok {
+		return content.Info{}, cerrdefs.ErrNotFound
+	}
+	return v, nil
+}
+
+func (b *buffer) Update(ctx context.Context, new content.Info, fieldpaths ...string) (content.Info, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	updated, ok := b.infos[new.Digest]
+	if !ok {
+		return content.Info{}, cerrdefs.ErrNotFound
+	}
+
+	if len(fieldpaths) == 0 {
+		fieldpaths = []string{"labels"}
+	}
+
+	for _, path := range fieldpaths {
+		if strings.HasPrefix(path, "labels.") {
+			if updated.Labels == nil {
+				updated.Labels = map[string]string{}
+			}
+			key := strings.TrimPrefix(path, "labels.")
+			updated.Labels[key] = new.Labels[key]
+			continue
+		}
+		if path == "labels" {
+			updated.Labels = new.Labels
+		}
+	}
+
+	b.infos[new.Digest] = updated
+	return updated, nil
+}
+
+func (b *buffer) Walk(ctx context.Context, fn content.WalkFunc, filters ...string) error {
+	return nil // not implemented
+}
+
+func (b *buffer) Delete(ctx context.Context, dgst digest.Digest) error {
+	return nil // not implemented
 }
 
 func (b *buffer) Writer(ctx context.Context, opts ...content.WriterOpt) (content.Writer, error) {
@@ -42,8 +96,15 @@ func (b *buffer) Writer(ctx context.Context, opts ...content.WriterOpt) (content
 		}
 	}
 	b.mu.Lock()
+	if wOpts.Desc.Digest != "" {
+		if _, ok := b.buffers[wOpts.Desc.Digest]; ok {
+			b.mu.Unlock()
+			return nil, errors.Wrapf(cerrdefs.ErrAlreadyExists, "content %v already exists", wOpts.Desc.Digest)
+		}
+	}
 	if _, ok := b.refs[wOpts.Ref]; ok {
-		return nil, errors.Wrapf(errdefs.ErrUnavailable, "ref %s locked", wOpts.Ref)
+		b.mu.Unlock()
+		return nil, errors.Wrapf(cerrdefs.ErrUnavailable, "ref %s locked", wOpts.Ref)
 	}
 	b.mu.Unlock()
 	return &bufferedWriter{
@@ -59,15 +120,30 @@ func (b *buffer) Writer(ctx context.Context, opts ...content.WriterOpt) (content
 	}, nil
 }
 
-func (b *buffer) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
-	r, err := b.getBytesReader(ctx, desc.Digest)
+func (b *buffer) Status(ctx context.Context, ref string) (content.Status, error) {
+	return content.Status{}, cerrdefs.ErrNotFound
+}
+
+func (b *buffer) ListStatuses(ctx context.Context, filters ...string) ([]content.Status, error) {
+	return nil, nil
+}
+
+func (b *buffer) Abort(ctx context.Context, ref string) error {
+	b.mu.Lock()
+	delete(b.refs, ref)
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *buffer) ReaderAt(ctx context.Context, desc ocispecs.Descriptor) (content.ReaderAt, error) {
+	r, err := b.getBytesReader(desc.Digest)
 	if err != nil {
 		return nil, err
 	}
-	return &readerAt{Reader: r, Closer: ioutil.NopCloser(r), size: int64(r.Len())}, nil
+	return &readerAt{Reader: r, Closer: io.NopCloser(r), size: int64(r.Len())}, nil
 }
 
-func (b *buffer) getBytesReader(ctx context.Context, dgst digest.Digest) (*bytes.Reader, error) {
+func (b *buffer) getBytesReader(dgst digest.Digest) (*bytes.Reader, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -75,13 +151,14 @@ func (b *buffer) getBytesReader(ctx context.Context, dgst digest.Digest) (*bytes
 		return bytes.NewReader(dt), nil
 	}
 
-	return nil, errors.Wrapf(errdefs.ErrNotFound, "content %v", dgst)
+	return nil, errors.Wrapf(cerrdefs.ErrNotFound, "content %v", dgst)
 }
 
 func (b *buffer) addValue(k digest.Digest, dt []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.buffers[k] = dt
+	b.infos[k] = content.Info{Digest: k, Size: int64(len(dt))}
 }
 
 type bufferedWriter struct {
@@ -129,7 +206,7 @@ func (w *bufferedWriter) Digest() digest.Digest {
 
 func (w *bufferedWriter) Commit(ctx context.Context, size int64, expected digest.Digest, opt ...content.Opt) error {
 	if w.buffer == nil {
-		return errors.Errorf("can't commit already committed or closed")
+		return errors.New("can't commit already committed or closed")
 	}
 	if s := int64(w.buffer.Len()); size > 0 && size != s {
 		return errors.Errorf("unexpected commit size %d, expected %d", s, size)

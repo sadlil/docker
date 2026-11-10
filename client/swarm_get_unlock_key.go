@@ -1,21 +1,26 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"context"
 	"encoding/json"
 
-	"github.com/docker/docker/api/types"
+	"github.com/moby/moby/api/types/swarm"
 )
 
+// SwarmGetUnlockKeyResult contains the swarm unlock key.
+type SwarmGetUnlockKeyResult struct {
+	Key string
+}
+
 // SwarmGetUnlockKey retrieves the swarm's unlock key.
-func (cli *Client) SwarmGetUnlockKey(ctx context.Context) (types.SwarmUnlockKeyResponse, error) {
-	serverResp, err := cli.get(ctx, "/swarm/unlockkey", nil, nil)
-	defer ensureReaderClosed(serverResp)
+func (cli *Client) SwarmGetUnlockKey(ctx context.Context) (SwarmGetUnlockKeyResult, error) {
+	resp, err := cli.get(ctx, "/swarm/unlockkey", nil, nil)
+	defer ensureReaderClosed(resp)
 	if err != nil {
-		return types.SwarmUnlockKeyResponse{}, err
+		return SwarmGetUnlockKeyResult{}, err
 	}
 
-	var response types.SwarmUnlockKeyResponse
-	err = json.NewDecoder(serverResp.body).Decode(&response)
-	return response, err
+	var response swarm.UnlockKeyResponse
+	err = json.NewDecoder(resp.Body).Decode(&response)
+	return SwarmGetUnlockKeyResult{Key: response.UnlockKey}, err
 }

@@ -2,14 +2,32 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os/exec"
-	"strings"
+	"runtime"
 	"testing"
 
+	"github.com/moby/moby/v2/integration-cli/cli"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
-func (s *DockerSuite) TestLoginWithoutTTY(c *testing.T) {
+type DockerCLILoginSuite struct {
+	ds *DockerSuite
+}
+
+func (s *DockerCLILoginSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
+}
+
+func (s *DockerCLILoginSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
+}
+
+func (s *DockerCLILoginSuite) TestLoginWithoutTTY(c *testing.T) {
+	skip.If(c, runtime.GOOS == "windows", "FIXME: doesn't produce error without TTY with CLI v25.0")
+
 	cmd := exec.Command(dockerBinary, "login")
 
 	// Send to stdin so the process does not get the TTY
@@ -17,15 +35,15 @@ func (s *DockerSuite) TestLoginWithoutTTY(c *testing.T) {
 
 	// run the command and block until it's done
 	err := cmd.Run()
-	assert.ErrorContains(c, err, "") //"Expected non nil err when logging in & TTY not available"
+	assert.ErrorContains(c, err, "", "Expected an err when logging in & TTY not available")
 }
 
 func (s *DockerRegistryAuthHtpasswdSuite) TestLoginToPrivateRegistry(c *testing.T) {
 	// wrong credentials
 	out, _, err := dockerCmdWithError("login", "-u", s.reg.Username(), "-p", "WRONGPASSWORD", privateRegistryURL)
 	assert.ErrorContains(c, err, "", out)
-	assert.Assert(c, strings.Contains(out, "401 Unauthorized"))
+	assert.Assert(c, is.Contains(out, "401 Unauthorized"))
 
 	// now it's fine
-	dockerCmd(c, "login", "-u", s.reg.Username(), "-p", s.reg.Password(), privateRegistryURL)
+	cli.DockerCmd(c, "login", "-u", s.reg.Username(), "-p", s.reg.Password(), privateRegistryURL)
 }

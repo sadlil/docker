@@ -1,13 +1,19 @@
 package msgp
 
 import (
+	"encoding/binary"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"reflect"
 	"sync"
 	"time"
+)
+
+const (
+	// min buffer size for the writer
+	minWriterSize = 18
 )
 
 // Sizer is an interface implemented
@@ -120,16 +126,27 @@ func NewWriter(w io.Writer) *Writer {
 
 // NewWriterSize returns a writer with a custom buffer size.
 func NewWriterSize(w io.Writer, sz int) *Writer {
-	// we must be able to require() 18
+	// we must be able to require() 'minWriterSize'
 	// contiguous bytes, so that is the
 	// practical minimum buffer size
-	if sz < 18 {
-		sz = 18
+	if sz < minWriterSize {
+		sz = minWriterSize
 	}
+	buf := make([]byte, sz)
+	return NewWriterBuf(w, buf)
+}
 
+// NewWriterBuf returns a writer with a provided buffer.
+// 'buf' is not used when the capacity is smaller than 18,
+// custom buffer is allocated instead.
+func NewWriterBuf(w io.Writer, buf []byte) *Writer {
+	if cap(buf) < minWriterSize {
+		buf = make([]byte, minWriterSize)
+	}
+	buf = buf[:cap(buf)]
 	return &Writer{
 		w:   w,
-		buf: make([]byte, sz),
+		buf: buf,
 	}
 }
 
@@ -331,6 +348,16 @@ func (mw *Writer) WriteNil() error {
 	return mw.push(mnil)
 }
 
+// WriteFloat writes a float to the writer as either float64
+// or float32 when it represents the exact same value
+func (mw *Writer) WriteFloat(f float64) error {
+	f32 := float32(f)
+	if float64(f32) == f {
+		return mw.prefix32(mfloat32, math.Float32bits(f32))
+	}
+	return mw.prefix64(mfloat64, math.Float64bits(f))
+}
+
 // WriteFloat64 writes a float64 to the writer
 func (mw *Writer) WriteFloat64(f float64) error {
 	return mw.prefix64(mfloat64, math.Float64bits(f))
@@ -339,6 +366,11 @@ func (mw *Writer) WriteFloat64(f float64) error {
 // WriteFloat32 writes a float32 to the writer
 func (mw *Writer) WriteFloat32(f float32) error {
 	return mw.prefix32(mfloat32, math.Float32bits(f))
+}
+
+// WriteDuration writes a time.Duration to the writer
+func (mw *Writer) WriteDuration(d time.Duration) error {
+	return mw.WriteInt64(int64(d))
 }
 
 // WriteInt64 writes an int64 to the writer
@@ -604,14 +636,73 @@ func (mw *Writer) WriteTime(t time.Time) error {
 	return nil
 }
 
+// WriteTimeExt will write t using the official msgpack extension spec.
+// https://github.com/msgpack/msgpack/blob/master/spec.md#timestamp-extension-type
+func (mw *Writer) WriteTimeExt(t time.Time) error {
+	// Time rounded towards zero.
+	secPrec := t.Truncate(time.Second)
+	remain := t.Sub(secPrec).Nanoseconds()
+	asSecs := secPrec.Unix()
+	switch {
+	case remain == 0 && asSecs > 0 && asSecs <= math.MaxUint32:
+		// 4 bytes
+		o, err := mw.require(6)
+		if err != nil {
+			return err
+		}
+		mw.buf[o] = mfixext4
+		mw.buf[o+1] = byte(msgTimeExtension)
+		binary.BigEndian.PutUint32(mw.buf[o+2:], uint32(asSecs))
+		return nil
+	case asSecs < 0 || asSecs >= (1<<34):
+		// 12 bytes
+		o, err := mw.require(12 + 3)
+		if err != nil {
+			return err
+		}
+		mw.buf[o] = mext8
+		mw.buf[o+1] = 12
+		mw.buf[o+2] = byte(msgTimeExtension)
+		binary.BigEndian.PutUint32(mw.buf[o+3:], uint32(remain))
+		binary.BigEndian.PutUint64(mw.buf[o+3+4:], uint64(asSecs))
+	default:
+		// 8 bytes
+		o, err := mw.require(10)
+		if err != nil {
+			return err
+		}
+		mw.buf[o] = mfixext8
+		mw.buf[o+1] = byte(msgTimeExtension)
+		binary.BigEndian.PutUint64(mw.buf[o+2:], uint64(asSecs)|(uint64(remain)<<34))
+	}
+	return nil
+}
+
+// WriteJSONNumber writes the json.Number to the stream as either integer or float.
+func (mw *Writer) WriteJSONNumber(n json.Number) error {
+	if n == "" {
+		// The zero value outputs the 0 integer.
+		return mw.push(0)
+	}
+	ii, err := n.Int64()
+	if err == nil {
+		return mw.WriteInt64(ii)
+	}
+	ff, err := n.Float64()
+	if err == nil {
+		return mw.WriteFloat(ff)
+	}
+	return err
+}
+
 // WriteIntf writes the concrete type of 'v'.
 // WriteIntf will error if 'v' is not one of the following:
-//  - A bool, float, string, []byte, int, uint, or complex
-//  - A map of supported types (with string keys)
-//  - An array or slice of supported types
-//  - A pointer to a supported type
-//  - A type that satisfies the msgp.Encodable interface
-//  - A type that satisfies the msgp.Extension interface
+//   - A bool, float, string, []byte, int, uint, or complex
+//   - A map of supported types (with string keys)
+//   - An array or slice of supported types
+//   - A pointer to a supported type
+//   - A type that satisfies the msgp.Encodable interface
+//   - A type that satisfies the msgp.Extension interface
 func (mw *Writer) WriteIntf(v interface{}) error {
 	if v == nil {
 		return mw.WriteNil()
@@ -667,11 +758,15 @@ func (mw *Writer) WriteIntf(v interface{}) error {
 		return mw.WriteMapStrIntf(v)
 	case time.Time:
 		return mw.WriteTime(v)
+	case time.Duration:
+		return mw.WriteDuration(v)
+	case json.Number:
+		return mw.WriteJSONNumber(v)
 	}
 
 	val := reflect.ValueOf(v)
 	if !isSupported(val.Kind()) || !val.IsValid() {
-		return fmt.Errorf("msgp: type %s not supported", val)
+		return errors.New("msgp: type " + val.String() + " not supported")
 	}
 
 	switch val.Kind() {
@@ -729,60 +824,6 @@ func (mw *Writer) writeSlice(v reflect.Value) (err error) {
 		}
 	}
 	return
-}
-
-func (mw *Writer) writeStruct(v reflect.Value) error {
-	if enc, ok := v.Interface().(Encodable); ok {
-		return enc.EncodeMsg(mw)
-	}
-	return fmt.Errorf("msgp: unsupported type: %s", v.Type())
-}
-
-func (mw *Writer) writeVal(v reflect.Value) error {
-	if !isSupported(v.Kind()) {
-		return fmt.Errorf("msgp: msgp/enc: type %q not supported", v.Type())
-	}
-
-	// shortcut for nil values
-	if v.IsNil() {
-		return mw.WriteNil()
-	}
-	switch v.Kind() {
-	case reflect.Bool:
-		return mw.WriteBool(v.Bool())
-
-	case reflect.Float32, reflect.Float64:
-		return mw.WriteFloat64(v.Float())
-
-	case reflect.Complex64, reflect.Complex128:
-		return mw.WriteComplex128(v.Complex())
-
-	case reflect.Int, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int8:
-		return mw.WriteInt64(v.Int())
-
-	case reflect.Interface, reflect.Ptr:
-		if v.IsNil() {
-			mw.WriteNil()
-		}
-		return mw.writeVal(v.Elem())
-
-	case reflect.Map:
-		return mw.writeMap(v)
-
-	case reflect.Uint, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint8:
-		return mw.WriteUint64(v.Uint())
-
-	case reflect.String:
-		return mw.WriteString(v.String())
-
-	case reflect.Slice, reflect.Array:
-		return mw.writeSlice(v)
-
-	case reflect.Struct:
-		return mw.writeStruct(v)
-
-	}
-	return fmt.Errorf("msgp: msgp/enc: type %q not supported", v.Type())
 }
 
 // is the reflect.Kind encodable?

@@ -1,11 +1,13 @@
+//go:build windows
+
 package wclayer
 
 import (
 	"context"
 
 	"github.com/Microsoft/hcsshim/internal/hcserror"
-	"github.com/Microsoft/hcsshim/internal/oc"
-	"go.opencensus.io/trace"
+	"github.com/Microsoft/hcsshim/internal/ot"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // ActivateLayer will find the layer with the given id and mount it's filesystem.
@@ -14,10 +16,10 @@ import (
 // An activated layer must later be deactivated via DeactivateLayer.
 func ActivateLayer(ctx context.Context, path string) (err error) {
 	title := "hcsshim::ActivateLayer"
-	ctx, span := trace.StartSpan(ctx, title) //nolint:ineffassign,staticcheck
+	ctx, span := ot.StartSpan(ctx, title) //nolint:ineffassign,staticcheck
 	defer span.End()
-	defer func() { oc.SetSpanStatus(span, err) }()
-	span.AddAttributes(trace.StringAttribute("path", path))
+	defer func() { ot.SetSpanStatus(span, err) }()
+	span.SetAttributes(attribute.String("path", path))
 
 	err = activateLayer(&stdDriverInfo, path)
 	if err != nil {

@@ -1,5 +1,5 @@
 // Package syslog provides the logdriver for forwarding server logs to syslog endpoints.
-package syslog // import "github.com/docker/docker/daemon/logger/syslog"
+package syslog
 
 import (
 	"crypto/tls"
@@ -13,17 +13,15 @@ import (
 	"time"
 
 	syslog "github.com/RackSec/srslog"
-
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/daemon/logger/loggerutils"
-	"github.com/docker/docker/pkg/urlutil"
 	"github.com/docker/go-connections/tlsconfig"
-	"github.com/sirupsen/logrus"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger/loggerutils"
 )
 
 const (
 	name        = "syslog"
 	secureProto = "tcp+tls"
+	defaultPort = "514"
 )
 
 var facilities = map[string]syslog.Priority{
@@ -51,15 +49,6 @@ var facilities = map[string]syslog.Priority{
 
 type syslogger struct {
 	writer *syslog.Writer
-}
-
-func init() {
-	if err := logger.RegisterLogDriver(name, New); err != nil {
-		logrus.Fatal(err)
-	}
-	if err := logger.RegisterLogOptValidator(name, ValidateLogOpt); err != nil {
-		logrus.Fatal(err)
-	}
 }
 
 // rsyslog uses appname part of syslog message to fill in an %syslogtag% template
@@ -131,18 +120,20 @@ func New(info logger.Info) (logger.Logger, error) {
 	}, nil
 }
 
-func (s *syslogger) Log(msg *logger.Message) error {
+func (s *syslogger) Log(msg *logger.Message) (err error) {
+	defer func() {
+		if err == nil {
+			logger.PutMessage(msg)
+		}
+	}()
 	if len(msg.Line) == 0 {
 		return nil
 	}
 
-	line := string(msg.Line)
-	source := msg.Source
-	logger.PutMessage(msg)
-	if source == "stderr" {
-		return s.writer.Err(line)
+	if msg.Source == "stderr" {
+		return s.writer.Err(string(msg.Line))
 	}
-	return s.writer.Info(line)
+	return s.writer.Info(string(msg.Line))
 }
 
 func (s *syslogger) Close() error {
@@ -157,32 +148,32 @@ func parseAddress(address string) (string, string, error) {
 	if address == "" {
 		return "", "", nil
 	}
-	if !urlutil.IsTransportURL(address) {
-		return "", "", fmt.Errorf("syslog-address should be in form proto://address, got %v", address)
-	}
-	url, err := url.Parse(address)
+	addr, err := url.Parse(address)
 	if err != nil {
 		return "", "", err
 	}
 
 	// unix and unixgram socket validation
-	if url.Scheme == "unix" || url.Scheme == "unixgram" {
-		if _, err := os.Stat(url.Path); err != nil {
+	if addr.Scheme == "unix" || addr.Scheme == "unixgram" {
+		if _, err := os.Stat(addr.Path); err != nil {
 			return "", "", err
 		}
-		return url.Scheme, url.Path, nil
+		return addr.Scheme, addr.Path, nil
+	}
+	if addr.Scheme != "udp" && addr.Scheme != "tcp" && addr.Scheme != secureProto {
+		return "", "", fmt.Errorf("unsupported scheme: '%s'", addr.Scheme)
 	}
 
 	// here we process tcp|udp
-	host := url.Host
+	host := addr.Host
 	if _, _, err := net.SplitHostPort(host); err != nil {
 		if !strings.Contains(err.Error(), "missing port in address") {
 			return "", "", err
 		}
-		host = host + ":514"
+		host = net.JoinHostPort(host, defaultPort)
 	}
 
-	return url.Scheme, host, nil
+	return addr.Scheme, host, nil
 }
 
 // ValidateLogOpt looks for syslog specific log options
@@ -190,17 +181,15 @@ func parseAddress(address string) (string, string, error) {
 func ValidateLogOpt(cfg map[string]string) error {
 	for key := range cfg {
 		switch key {
-		case "env":
-		case "env-regex":
-		case "labels":
-		case "labels-regex":
+		case logger.AttrEnv, logger.AttrEnvRegex, logger.AttrLabels, logger.AttrLabelsRegex, logger.AttrLogTag:
+			// Common attributes handled through [logger.Info.ExtraAttributes] and [loggerutils.ParseLogTag].
+			continue
 		case "syslog-address":
 		case "syslog-facility":
 		case "syslog-tls-ca-cert":
 		case "syslog-tls-cert":
 		case "syslog-tls-key":
 		case "syslog-tls-skip-verify":
-		case "tag":
 		case "syslog-format":
 		default:
 			return fmt.Errorf("unknown log opt '%s' for syslog log driver", key)
@@ -267,5 +256,4 @@ func parseLogFormat(logFormat, proto string) (syslog.Formatter, syslog.Framer, e
 	default:
 		return nil, nil, errors.New("Invalid syslog format")
 	}
-
 }

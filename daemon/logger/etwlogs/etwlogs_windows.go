@@ -10,16 +10,17 @@
 //
 // Each container log message generates an ETW event that also contains:
 // the container name and ID, the timestamp, and the stream type.
-package etwlogs // import "github.com/docker/docker/daemon/logger/etwlogs"
+package etwlogs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"unsafe"
 
-	"github.com/docker/docker/daemon/logger"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+	"github.com/moby/moby/v2/daemon/logger"
 	"golang.org/x/sys/windows"
 )
 
@@ -41,23 +42,19 @@ var (
 	procEventWriteString = modAdvapi32.NewProc("EventWriteString")
 	procEventUnregister  = modAdvapi32.NewProc("EventUnregister")
 )
-var providerHandle windows.Handle
-var refCount int
-var mu sync.Mutex
 
-func init() {
+var (
 	providerHandle = windows.InvalidHandle
-	if err := logger.RegisterLogDriver(name, New); err != nil {
-		logrus.Fatal(err)
-	}
-}
+	refCount       int
+	mu             sync.Mutex
+)
 
 // New creates a new etwLogs logger for the given container and registers the EWT provider.
 func New(info logger.Info) (logger.Logger, error) {
 	if err := registerETWProvider(); err != nil {
 		return nil, err
 	}
-	logrus.Debugf("logging driver etwLogs configured for container: %s.", info.ContainerID)
+	log.G(context.TODO()).Debugf("logging driver etwLogs configured for container: %s.", info.ContainerID)
 
 	return &etwLogs{
 		containerName: info.Name(),
@@ -72,7 +69,7 @@ func (etwLogger *etwLogs) Log(msg *logger.Message) error {
 	if providerHandle == windows.InvalidHandle {
 		// This should never be hit, if it is, it indicates a programming error.
 		errorMessage := "ETWLogs cannot log the message, because the event provider has not been registered."
-		logrus.Error(errorMessage)
+		log.G(context.TODO()).Error(errorMessage)
 		return errors.New(errorMessage)
 	}
 	m := createLogMessage(etwLogger, msg)
@@ -140,7 +137,7 @@ func callEventRegister() error {
 	ret, _, _ := procEventRegister.Call(uintptr(unsafe.Pointer(&guid)), 0, 0, uintptr(unsafe.Pointer(&providerHandle)))
 	if ret != win32CallSuccess {
 		errorMessage := fmt.Sprintf("Failed to register ETW provider. Error: %d", ret)
-		logrus.Error(errorMessage)
+		log.G(context.TODO()).Error(errorMessage)
 		return errors.New(errorMessage)
 	}
 	return nil
@@ -148,7 +145,6 @@ func callEventRegister() error {
 
 func callEventWriteString(message string) error {
 	utf16message, err := windows.UTF16FromString(message)
-
 	if err != nil {
 		return err
 	}
@@ -156,7 +152,7 @@ func callEventWriteString(message string) error {
 	ret, _, _ := procEventWriteString.Call(uintptr(providerHandle), 0, 0, uintptr(unsafe.Pointer(&utf16message[0])))
 	if ret != win32CallSuccess {
 		errorMessage := fmt.Sprintf("ETWLogs provider failed to log message. Error: %d", ret)
-		logrus.Error(errorMessage)
+		log.G(context.TODO()).Error(errorMessage)
 		return errors.New(errorMessage)
 	}
 	return nil

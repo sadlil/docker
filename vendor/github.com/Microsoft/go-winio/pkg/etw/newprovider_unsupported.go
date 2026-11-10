@@ -1,5 +1,4 @@
-// +build windows
-// +build arm
+//go:build windows && arm
 
 package etw
 

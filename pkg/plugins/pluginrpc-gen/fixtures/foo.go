@@ -1,9 +1,9 @@
-package foo // import "github.com/docker/docker/pkg/plugins/pluginrpc-gen/fixtures"
+package foo
 
 import (
 	aliasedio "io"
 
-	"github.com/docker/docker/pkg/plugins/pluginrpc-gen/fixtures/otherfixture"
+	"github.com/moby/moby/v2/pkg/plugins/pluginrpc-gen/fixtures/otherfixture"
 )
 
 type wobble struct {
@@ -13,7 +13,7 @@ type wobble struct {
 }
 
 // Fooer is an empty interface used for tests.
-type Fooer interface{}
+type Fooer interface{} //nolint:revive // any Alias is not supported yet
 
 // Fooer2 is an interface used for tests.
 type Fooer2 interface {
@@ -80,4 +80,15 @@ type Fooer11 interface {
 // Fooer12 is an interface used for tests.
 type Fooer12 interface {
 	Foo(a aliasedio.Reader)
+}
+
+type FooerWithTimeout interface {
+	// pluginrpc-gen:timeout-type=long
+	WithTimeout() (err error)
+}
+
+type FooerWithMultilineAnnotation interface {
+	// Foo is a method that does something
+	// pluginrpc-gen:timeout-type=long
+	WithMultilineAnnotation() (err error)
 }

@@ -1,12 +1,13 @@
 package main
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/integration-cli/daemon"
-	testdaemon "github.com/docker/docker/testutil/daemon"
+	"github.com/moby/moby/v2/integration-cli/daemon"
+	testdaemon "github.com/moby/moby/v2/internal/testutil/daemon"
 	"gotest.tools/v3/assert"
 )
 
@@ -30,38 +31,39 @@ func newDockerHubPullSuite() *DockerHubPullSuite {
 }
 
 // SetUpSuite starts the suite daemon.
-func (s *DockerHubPullSuite) SetUpSuite(c *testing.T) {
-	testRequires(c, DaemonIsLinux, testEnv.IsLocalDaemon)
-	s.d = daemon.New(c, dockerBinary, dockerdBinary, testdaemon.WithEnvironment(testEnv.Execution))
-	s.d.Start(c)
+func (s *DockerHubPullSuite) SetUpSuite(ctx context.Context, t *testing.T) {
+	testRequires(t, DaemonIsLinux, testEnv.IsLocalDaemon)
+	s.d = daemon.New(t, dockerBinary, dockerdBinary, testdaemon.WithEnvironment(testEnv.Execution))
+	s.d.Start(t)
 }
 
 // TearDownSuite stops the suite daemon.
-func (s *DockerHubPullSuite) TearDownSuite(c *testing.T) {
+func (s *DockerHubPullSuite) TearDownSuite(ctx context.Context, t *testing.T) {
 	if s.d != nil {
-		s.d.Stop(c)
+		s.d.Stop(t)
 	}
 }
 
 // SetUpTest declares that all tests of this suite require network.
-func (s *DockerHubPullSuite) SetUpTest(c *testing.T) {
-	testRequires(c, Network)
+func (s *DockerHubPullSuite) SetUpTest(ctx context.Context, t *testing.T) {
+	testRequires(t, Network)
 }
 
 // TearDownTest removes all images from the suite daemon.
-func (s *DockerHubPullSuite) TearDownTest(c *testing.T) {
-	out := s.Cmd(c, "images", "-aq")
+func (s *DockerHubPullSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	out := s.Cmd(t, "images", "-aq")
 	images := strings.Split(out, "\n")
 	images = append([]string{"rmi", "-f"}, images...)
 	s.d.Cmd(images...)
-	s.ds.TearDownTest(c)
+	s.ds.TearDownTest(ctx, t)
 }
 
 // Cmd executes a command against the suite daemon and returns the combined
 // output. The function fails the test when the command returns an error.
-func (s *DockerHubPullSuite) Cmd(c *testing.T, name string, arg ...string) string {
+func (s *DockerHubPullSuite) Cmd(t *testing.T, name string, arg ...string) string {
+	t.Helper()
 	out, err := s.CmdWithError(name, arg...)
-	assert.Assert(c, err == nil, "%q failed with errors: %s, %v", strings.Join(arg, " "), out, err)
+	assert.Assert(t, err == nil, "%q failed with errors: %s, %v", strings.Join(arg, " "), out, err)
 	return out
 }
 

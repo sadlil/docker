@@ -1,27 +1,27 @@
 //go:build linux || freebsd
-// +build linux freebsd
 
-package graphtest // import "github.com/docker/docker/daemon/graphdriver/graphtest"
+package graphtest
 
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path"
 	"testing"
 
-	"github.com/docker/docker/daemon/graphdriver"
-	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/quota"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/moby/go-archive"
+	"github.com/moby/moby/v2/daemon/graphdriver"
+	"github.com/moby/moby/v2/daemon/internal/quota"
+	"github.com/moby/moby/v2/daemon/internal/stringid"
 	"golang.org/x/sys/unix"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
-var (
-	drv *Driver
-)
+var drv *Driver
 
 // Driver conforms to graphdriver.Driver interface and
 // contains information such as root and reference count of the number of clients using it.
@@ -33,11 +33,16 @@ type Driver struct {
 }
 
 func newDriver(t testing.TB, name string, options []string) *Driver {
+	if name == "" {
+		// Prevent graphdriver.New() from auto-detecting / picking a storage driver.
+		t.Fatal("newDriver requires a name for the storage driver to use")
+	}
+
 	root, err := os.MkdirTemp("", "docker-graphtest-")
 	assert.NilError(t, err)
 
-	assert.NilError(t, os.MkdirAll(root, 0755))
-	d, err := graphdriver.GetDriver(name, nil, graphdriver.Options{DriverOptions: options, Root: root})
+	assert.NilError(t, os.MkdirAll(root, 0o755))
+	d, err := graphdriver.New(name, graphdriver.Options{DriverOptions: options, Root: root})
 	if err != nil {
 		t.Logf("graphdriver: %v\n", err)
 		if graphdriver.IsDriverNotSupported(err) {
@@ -82,7 +87,11 @@ func DriverTestCreateEmpty(t testing.TB, drivername string, driverOptions ...str
 	driver := GetDriver(t, drivername, driverOptions...)
 	defer PutDriver(t)
 
+	// The daemon clears its umask, so drivers must set modes explicitly instead
+	// of relying on the umask to strip the group/other-write bits.
+	oldmask := unix.Umask(0)
 	err := driver.Create("empty", "", nil)
+	unix.Umask(oldmask)
 	assert.NilError(t, err)
 
 	defer func() {
@@ -96,10 +105,10 @@ func DriverTestCreateEmpty(t testing.TB, drivername string, driverOptions ...str
 	dir, err := driver.Get("empty", "")
 	assert.NilError(t, err)
 
-	verifyFile(t, dir.Path(), 0755|os.ModeDir, 0, 0)
+	verifyFile(t, dir, 0o755|os.ModeDir, 0, 0)
 
 	// Verify that the directory is empty
-	fis, err := readDir(dir, dir.Path())
+	fis, err := readDir(dir)
 	assert.NilError(t, err)
 	assert.Check(t, is.Len(fis, 0))
 
@@ -286,9 +295,12 @@ func DriverTestChanges(t testing.TB, drivername string, driverOptions ...string)
 		t.Fatal(err)
 	}
 
-	if err = checkChanges(expectedChanges, changes); err != nil {
-		t.Fatal(err)
-	}
+	assert.DeepEqual(t, changes, expectedChanges, cmpopts.SortSlices(func(a, b archive.Change) bool {
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		return a.Kind < b.Kind
+	}))
 }
 
 func writeRandomFile(path string, size uint64) error {
@@ -297,7 +309,7 @@ func writeRandomFile(path string, size uint64) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0700)
+	return os.WriteFile(path, data, 0o700)
 }
 
 // DriverTestSetQuota Create a driver and test setting quota.
@@ -310,7 +322,7 @@ func DriverTestSetQuota(t *testing.T, drivername string, required bool) {
 	createOpts.StorageOpt = make(map[string]string, 1)
 	createOpts.StorageOpt["size"] = "50M"
 	layerName := drivername + "Test"
-	if err := driver.CreateReadWrite(layerName, "Base", createOpts); err == quota.ErrQuotaNotSupported && !required {
+	if err := driver.CreateReadWrite(layerName, "Base", createOpts); errors.Is(err, quota.ErrQuotaNotSupported) && !required {
 		t.Skipf("Quota not supported on underlying filesystem: %v", err)
 	} else if err != nil {
 		t.Fatal(err)
@@ -321,22 +333,22 @@ func DriverTestSetQuota(t *testing.T, drivername string, required bool) {
 		t.Fatal(err)
 	}
 
-	quota := uint64(50 * units.MiB)
+	const sizeQuota = uint64(50 * units.MiB)
 
 	// Try to write a file smaller than quota, and ensure it works
-	err = writeRandomFile(path.Join(mountPath.Path(), "smallfile"), quota/2)
+	err = writeRandomFile(path.Join(mountPath, "smallfile"), sizeQuota/2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(path.Join(mountPath.Path(), "smallfile"))
+	defer os.Remove(path.Join(mountPath, "smallfile"))
 
 	// Try to write a file bigger than quota. We've already filled up half the quota, so hitting the limit should be easy
-	err = writeRandomFile(path.Join(mountPath.Path(), "bigfile"), quota)
+	err = writeRandomFile(path.Join(mountPath, "bigfile"), sizeQuota)
 	if err == nil {
 		t.Fatalf("expected write to fail(), instead had success")
 	}
-	if pathError, ok := err.(*os.PathError); ok && pathError.Err != unix.EDQUOT && pathError.Err != unix.ENOSPC {
-		os.Remove(path.Join(mountPath.Path(), "bigfile"))
+	if pathError, ok := err.(*os.PathError); ok && !errors.Is(pathError.Err, unix.EDQUOT) && !errors.Is(pathError.Err, unix.ENOSPC) {
+		os.Remove(path.Join(mountPath, "bigfile"))
 		t.Fatalf("expect write() to fail with %v or %v, got %v", unix.EDQUOT, unix.ENOSPC, pathError.Err)
 	}
 }

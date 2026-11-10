@@ -1,119 +1,126 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/go-connections/sockets"
-	"github.com/pkg/errors"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // postHijacked sends a POST request and hijacks the connection.
-func (cli *Client) postHijacked(ctx context.Context, path string, query url.Values, body interface{}, headers map[string][]string) (types.HijackedResponse, error) {
-	bodyEncoded, err := encodeData(body)
+func (cli *Client) postHijacked(ctx context.Context, path string, query url.Values, headers map[string][]string, body any) (HijackedResponse, error) {
+	jsonBody, err := jsonEncode(body)
 	if err != nil {
-		return types.HijackedResponse{}, err
+		return HijackedResponse{}, err
+	}
+	req, err := cli.buildRequest(ctx, http.MethodPost, cli.getAPIPath(ctx, path, query), headers, jsonBody)
+	if err != nil {
+		return HijackedResponse{}, err
+	}
+	conn, mediaType, err := cli.setupHijackConn(req, "tcp")
+	if err != nil {
+		return HijackedResponse{}, err
 	}
 
-	apiPath := cli.getAPIPath(ctx, path, query)
-	req, err := http.NewRequest(http.MethodPost, apiPath, bodyEncoded)
-	if err != nil {
-		return types.HijackedResponse{}, err
-	}
-	req = cli.addHeaders(req, headers)
-
-	conn, err := cli.setupHijackConn(ctx, req, "tcp")
-	if err != nil {
-		return types.HijackedResponse{}, err
-	}
-
-	return types.HijackedResponse{Conn: conn, Reader: bufio.NewReader(conn)}, err
+	return NewHijackedResponse(conn, mediaType), nil
 }
 
 // DialHijack returns a hijacked connection with negotiated protocol proto.
 func (cli *Client) DialHijack(ctx context.Context, url, proto string, meta map[string][]string) (net.Conn, error) {
-	req, err := http.NewRequest(http.MethodPost, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
 	req = cli.addHeaders(req, meta)
 
-	return cli.setupHijackConn(ctx, req, proto)
+	conn, _, err := cli.setupHijackConn(req, proto)
+	return conn, err
 }
 
-// fallbackDial is used when WithDialer() was not called.
-// See cli.Dialer().
-func fallbackDial(proto, addr string, tlsConfig *tls.Config) (net.Conn, error) {
-	if tlsConfig != nil && proto != "unix" && proto != "npipe" {
-		return tls.Dial(proto, addr, tlsConfig)
-	}
-	if proto == "npipe" {
-		return sockets.DialPipe(addr, 32*time.Second)
-	}
-	return net.Dial(proto, addr)
-}
-
-func (cli *Client) setupHijackConn(ctx context.Context, req *http.Request, proto string) (net.Conn, error) {
-	req.Host = cli.addr
+func (cli *Client) setupHijackConn(req *http.Request, proto string) (retConn net.Conn, mediaType string, retErr error) {
+	ctx := req.Context()
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", proto)
 
-	dialer := cli.Dialer()
-	conn, err := dialer(ctx)
+	dial := cli.dialer()
+	conn, err := dial(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "cannot connect to the Docker daemon. Is 'docker daemon' running on this host?")
+		return nil, "", fmt.Errorf("cannot connect to the Docker daemon. Is 'docker daemon' running on this host?: %w", err)
 	}
+	defer func() {
+		if retErr != nil {
+			_ = conn.Close()
+		}
+	}()
 
 	// When we set up a TCP connection for hijack, there could be long periods
 	// of inactivity (a long running command with no output) that in certain
 	// network setups may cause ECONNTIMEOUT, leaving the client in an unknown
-	// state. Setting TCP KeepAlive on the socket connection will prohibit
+	// state. Setting TCP KeepAlive on the socket connection prohibits
 	// ECONNTIMEOUT unless the socket connection truly is broken
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	clientconn := httputil.NewClientConn(conn, nil)
-	defer clientconn.Close()
+	hc := &hijackedConn{conn, bufio.NewReader(conn)}
+
+	// Cancel the handshake without tying the returned connection to ctx.
+	cancelled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = hc.Conn.Close()
+		close(cancelled)
+	})
+	defer func() {
+		if !stop() {
+			// Cancellation won the race; don't return a connection being closed.
+			<-cancelled
+			retConn, mediaType, retErr = nil, "", ctx.Err()
+		}
+	}()
+
+	cfg := &cli.clientConfig
+
+	var rt http.RoundTripper = otelhttp.NewTransport(hc, cli.traceOpts...)
+	if len(cfg.requestHooks) > 0 || len(cfg.responseHooks) > 0 {
+		rt = &hookTransport{
+			base:      rt,
+			reqHooks:  cfg.requestHooks,
+			respHooks: cfg.responseHooks,
+		}
+	}
 
 	// Server hijacks the connection, error 'connection closed' expected
-	resp, err := clientconn.Do(req)
-
-	//nolint:staticcheck // ignore SA1019 for connecting to old (pre go1.8) daemons
-	if err != httputil.ErrPersistEOF {
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode != http.StatusSwitchingProtocols {
-			resp.Body.Close()
-			return nil, fmt.Errorf("unable to upgrade to %s, received %d", proto, resp.StatusCode)
-		}
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		return nil, "", err
+	}
+	// Closing the body ends the otelhttp span. A 101 response has no body,
+	// so this does not close the connection.
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, "", fmt.Errorf("unable to upgrade to %s, received %d", proto, resp.StatusCode)
 	}
 
-	c, br := clientconn.Hijack()
-	if br.Buffered() > 0 {
+	if hc.r.Buffered() > 0 {
 		// If there is buffered content, wrap the connection.  We return an
-		// object that implements CloseWrite iff the underlying connection
+		// object that implements CloseWrite if the underlying connection
 		// implements it.
-		if _, ok := c.(types.CloseWriter); ok {
-			c = &hijackedConnCloseWriter{&hijackedConn{c, br}}
+		if _, ok := hc.Conn.(CloseWriter); ok {
+			conn = &hijackedConnCloseWriter{hc}
 		} else {
-			c = &hijackedConn{c, br}
+			conn = hc
 		}
 	} else {
-		br.Reset(nil)
+		hc.r.Reset(nil)
 	}
 
-	return c, nil
+	return conn, resp.Header.Get("Content-Type"), nil
 }
 
 // hijackedConn wraps a net.Conn and is returned by setupHijackConn in the case
@@ -123,6 +130,13 @@ func (cli *Client) setupHijackConn(ctx context.Context, req *http.Request, proto
 type hijackedConn struct {
 	net.Conn
 	r *bufio.Reader
+}
+
+func (c *hijackedConn) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := req.Write(c.Conn); err != nil {
+		return nil, err
+	}
+	return http.ReadResponse(c.r, req)
 }
 
 func (c *hijackedConn) Read(b []byte) (int, error) {
@@ -137,9 +151,50 @@ type hijackedConnCloseWriter struct {
 	*hijackedConn
 }
 
-var _ types.CloseWriter = &hijackedConnCloseWriter{}
+var _ CloseWriter = &hijackedConnCloseWriter{}
 
 func (c *hijackedConnCloseWriter) CloseWrite() error {
-	conn := c.Conn.(types.CloseWriter)
+	conn := c.Conn.(CloseWriter)
 	return conn.CloseWrite()
+}
+
+// NewHijackedResponse initializes a [HijackedResponse] type.
+func NewHijackedResponse(conn net.Conn, mediaType string) HijackedResponse {
+	return HijackedResponse{Conn: conn, Reader: bufio.NewReader(conn), mediaType: mediaType}
+}
+
+// HijackedResponse holds connection information for a hijacked request.
+type HijackedResponse struct {
+	mediaType string
+	Conn      net.Conn
+	Reader    *bufio.Reader
+}
+
+// Close closes the hijacked connection and reader.
+func (h *HijackedResponse) Close() {
+	h.Conn.Close()
+}
+
+// MediaType let client know if HijackedResponse hold a raw or multiplexed stream.
+// returns false if HTTP Content-Type is not relevant, and the container must be
+// inspected.
+func (h *HijackedResponse) MediaType() (string, bool) {
+	if h.mediaType == "" {
+		return "", false
+	}
+	return h.mediaType, true
+}
+
+// CloseWriter is an interface that implements structs
+// that close input streams to prevent from writing.
+type CloseWriter interface {
+	CloseWrite() error
+}
+
+// CloseWrite closes a readWriter for writing.
+func (h *HijackedResponse) CloseWrite() error {
+	if conn, ok := h.Conn.(CloseWriter); ok {
+		return conn.CloseWrite()
+	}
+	return nil
 }

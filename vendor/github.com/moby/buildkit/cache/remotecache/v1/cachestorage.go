@@ -2,11 +2,12 @@ package cacheimport
 
 import (
 	"context"
+	"slices"
 	"time"
 
-	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
@@ -19,7 +20,9 @@ func NewCacheKeyStorage(cc *CacheChains, w worker.Worker) (solver.CacheKeyStorag
 		byResult: map[string]map[string]struct{}{},
 	}
 
-	for _, it := range cc.items {
+	cc.computeIDs()
+
+	for it := range cc.leaves() {
 		if _, err := addItemToStorage(storage, it); err != nil {
 			return nil, nil, err
 		}
@@ -36,23 +39,17 @@ func NewCacheKeyStorage(cc *CacheChains, w worker.Worker) (solver.CacheKeyStorag
 }
 
 func addItemToStorage(k *cacheKeyStorage, it *item) (*itemWithOutgoingLinks, error) {
+	// byItem is shared across all leaf traversals and must be the sole source
+	// of memoized items. A separate per-traversal map can retain a nil marker
+	// when this shortcut finds an item completed by an earlier traversal,
+	// causing a later reference to that item to silently lose its link.
 	if id, ok := k.byItem[it]; ok {
-		if id == "" {
-			return nil, errors.Errorf("invalid loop")
-		}
 		return k.byID[id], nil
 	}
 
-	var id string
-	if len(it.links) == 0 {
-		id = it.dgst.String()
-	} else {
-		id = identity.NewID()
-	}
+	id := it.id
 
-	k.byItem[it] = ""
-
-	for i, m := range it.links {
+	for i, m := range it.parents {
 		for l := range m {
 			src, err := addItemToStorage(k, l.src)
 			if err != nil {
@@ -67,17 +64,20 @@ func addItemToStorage(k *cacheKeyStorage, it *item) (*itemWithOutgoingLinks, err
 		}
 	}
 
-	k.byItem[it] = id
-
 	itl := &itemWithOutgoingLinks{
 		item:  it,
 		links: map[nlink][]string{},
 	}
-
+	k.byItem[it] = id
 	k.byID[id] = itl
 
-	if res := it.result; res != nil {
-		resultID := remoteID(res)
+	seen := map[string]struct{}{}
+	for _, res := range it.results {
+		resultID := remoteID(res.Result)
+		if _, ok := seen[resultID]; ok {
+			continue
+		}
+		seen[resultID] = struct{}{}
 		ids, ok := k.byResult[resultID]
 		if !ok {
 			ids = map[string]struct{}{}
@@ -104,7 +104,12 @@ func (cs *cacheKeyStorage) Exists(id string) bool {
 	return ok
 }
 
-func (cs *cacheKeyStorage) Walk(func(id string) error) error {
+func (cs *cacheKeyStorage) Walk(cb func(id string) error) error {
+	for id := range cs.byID {
+		if err := cb(id); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -113,21 +118,32 @@ func (cs *cacheKeyStorage) WalkResults(id string, fn func(solver.CacheResult) er
 	if !ok {
 		return nil
 	}
-	if res := it.result; res != nil {
-		return fn(solver.CacheResult{ID: remoteID(res), CreatedAt: it.resultTime})
+	seen := map[string]struct{}{}
+	for _, res := range it.results {
+		id := remoteID(res.Result)
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		if err := fn(solver.CacheResult{ID: id, CreatedAt: res.CreatedAt}); err != nil {
+			return err
+		}
+		seen[id] = struct{}{}
 	}
 	return nil
 }
 
 func (cs *cacheKeyStorage) Load(id string, resultID string) (solver.CacheResult, error) {
-	it, ok := cs.byID[id]
-	if !ok {
-		return solver.CacheResult{}, nil
+	var res solver.CacheResult
+	if err := cs.WalkResults(id, func(r solver.CacheResult) error {
+		if r.ID == resultID {
+			res = r
+			return nil
+		}
+		return nil
+	}); err != nil {
+		return solver.CacheResult{}, errors.Wrapf(err, "failed to load cache result for %s", id)
 	}
-	if res := it.result; res != nil {
-		return solver.CacheResult{ID: remoteID(res), CreatedAt: it.resultTime}, nil
-	}
-	return solver.CacheResult{}, nil
+	return res, nil
 }
 
 func (cs *cacheKeyStorage) AddResult(id string, res solver.CacheResult) error {
@@ -140,6 +156,26 @@ func (cs *cacheKeyStorage) Release(resultID string) error {
 func (cs *cacheKeyStorage) AddLink(id string, link solver.CacheInfoLink, target string) error {
 	return nil
 }
+
+func (cs *cacheKeyStorage) WalkLinksAll(id string, fn func(id string, link solver.CacheInfoLink) error) error {
+	it, ok := cs.byID[id]
+	if !ok {
+		return nil
+	}
+	for nl, ids := range it.links {
+		for _, id2 := range ids {
+			if err := fn(id2, solver.CacheInfoLink{
+				Input:    solver.Index(nl.input),
+				Selector: digest.Digest(nl.selector),
+				Digest:   nl.dgst,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (cs *cacheKeyStorage) WalkLinks(id string, link solver.CacheInfoLink, fn func(id string) error) error {
 	it, ok := cs.byID[id]
 	if !ok {
@@ -193,10 +229,8 @@ func (cs *cacheKeyStorage) HasLink(id string, link solver.CacheInfoLink, target 
 		selector: link.Selector.String(),
 	}
 	if it, ok := cs.byID[id]; ok {
-		for _, id := range it.links[l] {
-			if id == target {
-				return true
-			}
+		if slices.Contains(it.links[l], target) {
+			return true
 		}
 	}
 	return false
@@ -210,39 +244,52 @@ type cacheResultStorage struct {
 }
 
 func (cs *cacheResultStorage) Save(res solver.Result, createdAt time.Time) (solver.CacheResult, error) {
-	return solver.CacheResult{}, errors.Errorf("importer is immutable")
+	return solver.CacheResult{}, errors.New("importer is immutable")
 }
 
 func (cs *cacheResultStorage) LoadWithParents(ctx context.Context, res solver.CacheResult) (map[string]solver.Result, error) {
-	v := cs.byResultID(res.ID)
-	if v == nil || v.result == nil {
-		return nil, errors.WithStack(solver.ErrNotFound)
-	}
-
 	m := map[string]solver.Result{}
 
 	visited := make(map[*item]struct{})
-	if err := v.walkAllResults(func(i *item) error {
-		if i.result == nil {
-			return nil
-		}
-		id, ok := cs.byItem[i]
-		if !ok {
-			return nil
-		}
-		if isSubRemote(*i.result, *v.result) {
-			ref, err := cs.w.FromRemote(ctx, i.result)
-			if err != nil {
-				return err
+
+	ids, ok := cs.byResult[res.ID]
+	if !ok || len(ids) == 0 {
+		return nil, errors.WithStack(solver.ErrNotFound)
+	}
+
+	for id := range ids {
+		v, ok := cs.byID[id]
+		if ok {
+			if _, ok := visited[v.item]; ok {
+				continue
 			}
-			m[id] = worker.NewWorkerRefResult(ref, cs.w)
+			for _, result := range v.results {
+				resultID := remoteID(result.Result)
+				if resultID == res.ID {
+					if err := v.walkAllResults(func(i *item) error {
+						for _, subRes := range i.results {
+							id, ok := cs.byItem[i]
+							if !ok {
+								return nil
+							}
+							if isSubRemote(*subRes.Result, *result.Result) {
+								ref, err := cs.w.FromRemote(ctx, subRes.Result)
+								if err != nil {
+									return err
+								}
+								m[id] = worker.NewWorkerRefResult(ref, cs.w)
+							}
+						}
+						return nil
+					}, visited); err != nil {
+						for _, v := range m {
+							v.Release(context.TODO())
+						}
+						return nil, err
+					}
+				}
+			}
 		}
-		return nil
-	}, visited); err != nil {
-		for _, v := range m {
-			v.Release(context.TODO())
-		}
-		return nil, err
 	}
 
 	return m, nil
@@ -250,25 +297,50 @@ func (cs *cacheResultStorage) LoadWithParents(ctx context.Context, res solver.Ca
 
 func (cs *cacheResultStorage) Load(ctx context.Context, res solver.CacheResult) (solver.Result, error) {
 	item := cs.byResultID(res.ID)
-	if item == nil || item.result == nil {
-		return nil, errors.WithStack(solver.ErrNotFound)
-	}
-
-	ref, err := cs.w.FromRemote(ctx, item.result)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to load result from remote")
-	}
-	return worker.NewWorkerRefResult(ref, cs.w), nil
-}
-
-func (cs *cacheResultStorage) LoadRemote(ctx context.Context, res solver.CacheResult, _ session.Group) (*solver.Remote, error) {
-	if r := cs.byResultID(res.ID); r != nil && r.result != nil {
-		return r.result, nil
+	for _, r := range item.results {
+		resultID := remoteID(r.Result)
+		if resultID != res.ID {
+			continue
+		}
+		ref, err := cs.w.FromRemote(ctx, r.Result)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load result from remote")
+		}
+		return worker.NewWorkerRefResult(ref, cs.w), nil
 	}
 	return nil, errors.WithStack(solver.ErrNotFound)
 }
 
-func (cs *cacheResultStorage) Exists(id string) bool {
+func (cs *cacheResultStorage) LoadRemotes(ctx context.Context, res solver.CacheResult, compressionopts *compression.Config, _ session.Group) ([]*solver.Remote, error) {
+	if it := cs.byResultID(res.ID); it != nil {
+		for _, r := range it.results {
+			if compressionopts == nil {
+				resultID := remoteID(r.Result)
+				if resultID != res.ID {
+					continue
+				}
+				return []*solver.Remote{r.Result}, nil
+			}
+			// Any of blobs in the remote must meet the specified compression option.
+			match := false
+			for _, desc := range r.Result.Descriptors {
+				m := compression.IsMediaType(compressionopts.Type, desc.MediaType)
+				match = match || m
+				if compressionopts.Force && !m {
+					match = false
+					break
+				}
+			}
+			if match {
+				return []*solver.Remote{r.Result}, nil
+			}
+		}
+		return nil, nil // return nil as it's best effort.
+	}
+	return nil, errors.WithStack(solver.ErrNotFound)
+}
+
+func (cs *cacheResultStorage) Exists(ctx context.Context, id string) bool {
 	return cs.byResultID(id) != nil
 }
 

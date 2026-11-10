@@ -1,37 +1,76 @@
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"context"
 
-	"github.com/containerd/containerd/pkg/apparmor"
-	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/exec"
-	"github.com/docker/docker/oci/caps"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	containerd "github.com/containerd/containerd/v2/client"
+	coci "github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/moby/moby/v2/daemon/config"
+	"github.com/moby/moby/v2/daemon/container"
+	"github.com/moby/moby/v2/daemon/pkg/oci/caps"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config, p *specs.Process) error {
-	if len(ec.User) > 0 {
+func getUserFromContainerd(ctx context.Context, containerdCli *containerd.Client, ec *container.ExecConfig) (specs.User, error) {
+	ctr, err := containerdCli.LoadContainer(ctx, ec.Container.ID)
+	if err != nil {
+		return specs.User{}, err
+	}
+
+	cinfo, err := ctr.Info(ctx)
+	if err != nil {
+		return specs.User{}, err
+	}
+
+	spec, err := ctr.Spec(ctx)
+	if err != nil {
+		return specs.User{}, err
+	}
+
+	opts := []coci.SpecOpts{
+		coci.WithUser(ec.User),
+		coci.WithAdditionalGIDs(ec.User),
+		coci.WithAppendAdditionalGroups(ec.Container.HostConfig.GroupAdd...),
+	}
+	for _, opt := range opts {
+		if err := opt(ctx, containerdCli, &cinfo, spec); err != nil {
+			return specs.User{}, err
+		}
+	}
+
+	return spec.Process.User, nil
+}
+
+func (daemon *Daemon) execSetPlatformOpt(ctx context.Context, daemonCfg *config.Config, ec *container.ExecConfig, p *specs.Process) error {
+	if ec.User != "" {
+		var user specs.User
 		var err error
-		p.User, err = getUser(c, ec.User)
+		if daemon.UsesSnapshotter() {
+			user, err = getUserFromContainerd(ctx, daemon.containerdClient, ec)
+		} else {
+			user, err = getUser(ec.Container, ec.User)
+		}
 		if err != nil {
 			return err
 		}
+		// Preserve the umask inherited from the container's process spec.
+		user.Umask = p.User.Umask
+		p.User = user
 	}
+
 	if ec.Privileged {
-		if p.Capabilities == nil {
-			p.Capabilities = &specs.LinuxCapabilities{}
+		p.Capabilities = &specs.LinuxCapabilities{
+			Bounding:  caps.GetAllCapabilities(),
+			Permitted: caps.GetAllCapabilities(),
+			Effective: caps.GetAllCapabilities(),
 		}
-		p.Capabilities.Bounding = caps.GetAllCapabilities()
-		p.Capabilities.Permitted = p.Capabilities.Bounding
-		p.Capabilities.Inheritable = p.Capabilities.Bounding
-		p.Capabilities.Effective = p.Capabilities.Bounding
 	}
-	if apparmor.HostSupports() {
+
+	if appArmorSupported() {
 		var appArmorProfile string
-		if c.AppArmorProfile != "" {
-			appArmorProfile = c.AppArmorProfile
-		} else if c.HostConfig.Privileged {
+		if ec.Container.AppArmorProfile != "" {
+			appArmorProfile = ec.Container.AppArmorProfile
+		} else if ec.Container.HostConfig.Privileged {
 			// `docker exec --privileged` does not currently disable AppArmor
 			// profiles. Privileged configuration of the container is inherited
 			appArmorProfile = unconfinedAppArmorProfile
@@ -44,14 +83,14 @@ func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config
 			// profiles inadvertently. Since we cannot store our profile in
 			// /etc/apparmor.d, nor can we practically add other ways of
 			// telling the system to keep our profile loaded, in order to make
-			// sure that we keep the default profile enabled we dynamically
-			// reload it if necessary.
-			if err := ensureDefaultAppArmorProfile(); err != nil {
+			// sure that we keep the default profile enabled we load it again
+			// if it is missing.
+			if err := daemon.loadDefaultAppArmorProfileIfMissing(); err != nil {
 				return err
 			}
 		}
 		p.ApparmorProfile = appArmorProfile
 	}
 	s := &specs.Spec{Process: p}
-	return WithRlimits(daemon, c)(context.Background(), nil, nil, s)
+	return withRlimits(daemon, daemonCfg, ec.Container)(ctx, nil, nil, s)
 }

@@ -1,34 +1,35 @@
 //go:build !windows
-// +build !windows
 
-package daemon // import "github.com/docker/docker/daemon"
+package daemon
 
 import (
 	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/v2/daemon/internal/lazyregexp"
+	libcontainerdtypes "github.com/moby/moby/v2/daemon/internal/libcontainerd/types"
+	"github.com/moby/moby/v2/errdefs"
 	"github.com/pkg/errors"
 )
 
+// NOTE: \\s does not detect unicode whitespaces.
+// So we use fieldsASCII instead of strings.Fields in parsePSOutput.
+// See https://github.com/moby/moby/pull/24358
+var psArgsRegexp = lazyregexp.New("\\s+([^\\s]*)=\\s*(PID[^\\s]*)")
+
 func validatePSArgs(psArgs string) error {
-	// NOTE: \\s does not detect unicode whitespaces.
-	// So we use fieldsASCII instead of strings.Fields in parsePSOutput.
-	// See https://github.com/docker/docker/pull/24358
-	//nolint: gosimple
-	re := regexp.MustCompile("\\s+([^\\s]*)=\\s*(PID[^\\s]*)")
-	for _, group := range re.FindAllStringSubmatch(psArgs, -1) {
+	for _, group := range psArgsRegexp.FindAllStringSubmatch(psArgs, -1) {
 		if len(group) >= 3 {
 			k := group[1]
 			v := group[2]
 			if k != "pid" {
-				return fmt.Errorf("specifying \"%s=%s\" is not allowed", k, v)
+				return fmt.Errorf(`specifying "%s=%s" is not allowed`, k, v)
 			}
 		}
 	}
@@ -47,7 +48,7 @@ func fieldsASCII(s string) []string {
 	return strings.FieldsFunc(s, fn)
 }
 
-func appendProcess2ProcList(procList *container.ContainerTopOKBody, fields []string) {
+func appendProcess2ProcList(procList *container.TopResponse, fields []string) {
 	// Make sure number of fields equals number of header titles
 	// merging "overhanging" fields
 	process := fields[:len(procList.Titles)-1]
@@ -64,8 +65,8 @@ func hasPid(procs []uint32, pid int) bool {
 	return false
 }
 
-func parsePSOutput(output []byte, procs []uint32) (*container.ContainerTopOKBody, error) {
-	procList := &container.ContainerTopOKBody{}
+func parsePSOutput(output []byte, procs []uint32) (*container.TopResponse, error) {
+	procList := &container.TopResponse{}
 
 	lines := strings.Split(string(output), "\n")
 	procList.Titles = fieldsASCII(lines[0])
@@ -78,7 +79,7 @@ func parsePSOutput(output []byte, procs []uint32) (*container.ContainerTopOKBody
 		}
 	}
 	if pidIndex == -1 {
-		return nil, fmt.Errorf("Couldn't find PID field in ps output")
+		return nil, errors.New("Couldn't find PID field in ps output")
 	}
 
 	// loop through the output and extract the PID from each line
@@ -86,7 +87,7 @@ func parsePSOutput(output []byte, procs []uint32) (*container.ContainerTopOKBody
 	// in "docker top" client command
 	preContainedPidFlag := false
 	for _, line := range lines[1:] {
-		if len(line) == 0 {
+		if line == "" {
 			continue
 		}
 		fields := fieldsASCII(line)
@@ -136,7 +137,7 @@ func psPidsArg(pids []uint32) string {
 // "-ef" if no args are given.  An error is returned if the container
 // is not found, or is not running, or if there are any problems
 // running ps, or parsing the output.
-func (daemon *Daemon) ContainerTop(name string, psArgs string) (*container.ContainerTopOKBody, error) {
+func (daemon *Daemon) ContainerTop(name string, psArgs string) (*container.TopResponse, error) {
 	if psArgs == "" {
 		psArgs = "-ef"
 	}
@@ -150,17 +151,30 @@ func (daemon *Daemon) ContainerTop(name string, psArgs string) (*container.Conta
 		return nil, err
 	}
 
-	if !ctr.IsRunning() {
-		return nil, errNotRunning(ctr.ID)
-	}
+	tsk, err := func() (libcontainerdtypes.Task, error) {
+		ctr.Lock()
+		defer ctr.Unlock()
 
-	if ctr.IsRestarting() {
-		return nil, errContainerIsRestarting(ctr.ID)
-	}
-
-	procs, err := daemon.containerd.ListPids(context.Background(), ctr.ID)
+		tsk, err := ctr.GetRunningTask()
+		if err != nil {
+			return nil, err
+		}
+		if ctr.State.Restarting {
+			return nil, errContainerIsRestarting(ctr.ID)
+		}
+		return tsk, nil
+	}()
 	if err != nil {
 		return nil, err
+	}
+
+	infos, err := tsk.Pids(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	procs := make([]uint32, len(infos))
+	for i, p := range infos {
+		procs[i] = p.Pid
 	}
 
 	args := strings.Split(psArgs, " ")
@@ -185,6 +199,6 @@ func (daemon *Daemon) ContainerTop(name string, psArgs string) (*container.Conta
 	if err != nil {
 		return nil, err
 	}
-	daemon.LogContainerEvent(ctr, "top")
+	daemon.LogContainerEvent(ctr, events.ActionTop)
 	return procList, nil
 }

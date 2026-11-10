@@ -1,61 +1,62 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestContainerDiffError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ContainerDiff(context.Background(), "nothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(
+		WithMockClient(errorMock(http.StatusInternalServerError, "Server error")),
+	)
+	assert.NilError(t, err)
+
+	_, err = client.ContainerDiff(t.Context(), "nothing", ContainerDiffOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.ContainerDiff(t.Context(), "", ContainerDiffOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.ContainerDiff(t.Context(), "    ", ContainerDiffOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestContainerDiff(t *testing.T) {
-	expectedURL := "/containers/container_id/changes"
-	client := &Client{
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
-			b, err := json.Marshal([]container.ContainerChangeResponseItem{
-				{
-					Kind: 0,
-					Path: "/path/1",
-				},
-				{
-					Kind: 1,
-					Path: "/path/2",
-				},
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(b)),
-			}, nil
-		}),
+	const expectedURL = "/containers/container_id/changes"
+
+	expected := []container.FilesystemChange{
+		{
+			Kind: container.ChangeModify,
+			Path: "/path/1",
+		},
+		{
+			Kind: container.ChangeAdd,
+			Path: "/path/2",
+		},
+		{
+			Kind: container.ChangeDelete,
+			Path: "/path/3",
+		},
 	}
 
-	changes, err := client.ContainerDiff(context.Background(), "container_id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(changes) != 2 {
-		t.Fatalf("expected an array of 2 changes, got %v", changes)
-	}
+	client, err := New(
+		WithMockClient(func(req *http.Request) (*http.Response, error) {
+			if err := assertRequest(req, http.MethodGet, expectedURL); err != nil {
+				return nil, err
+			}
+			return mockJSONResponse(http.StatusOK, nil, expected)(req)
+		}),
+	)
+	assert.NilError(t, err)
+
+	result, err := client.ContainerDiff(t.Context(), "container_id", ContainerDiffOptions{})
+	assert.NilError(t, err)
+	assert.Check(t, is.DeepEqual(result.Changes, expected))
 }

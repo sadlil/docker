@@ -1,96 +1,94 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
 	"bytes"
-	"context"
-	"fmt"
+	"encoding/json"
 	"io"
 	"net/http"
-	"strings"
+	"net/url"
 	"testing"
 
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestImageLoadError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	_, err := client.ImageLoad(context.Background(), nil, true)
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.ImageLoad(t.Context(), nil, ImageLoadWithQuiet(true))
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestImageLoad(t *testing.T) {
-	expectedURL := "/images/load"
-	expectedInput := "inputBody"
-	expectedOutput := "outputBody"
-	loadCases := []struct {
-		quiet                bool
-		responseContentType  string
-		expectedResponseJSON bool
-		expectedQueryParams  map[string]string
+	const (
+		expectedURL         = "/images/load"
+		expectedContentType = "application/x-tar"
+		expectedInput       = "inputBody"
+		expectedOutput      = `{"stream":"Loaded image: busybox:latest\n"}`
+	)
+	tests := []struct {
+		doc                 string
+		quiet               bool
+		platforms           []ocispec.Platform
+		expectedQueryParams url.Values
 	}{
 		{
-			quiet:                false,
-			responseContentType:  "text/plain",
-			expectedResponseJSON: false,
-			expectedQueryParams: map[string]string{
-				"quiet": "0",
+			doc: "no options",
+			expectedQueryParams: url.Values{
+				"quiet": {"0"},
 			},
 		},
 		{
-			quiet:                true,
-			responseContentType:  "application/json",
-			expectedResponseJSON: true,
-			expectedQueryParams: map[string]string{
-				"quiet": "1",
+			doc:   "quiet",
+			quiet: true,
+			expectedQueryParams: url.Values{
+				"quiet": {"1"},
+			},
+		},
+		{
+			doc:       "with platform",
+			platforms: []ocispec.Platform{{Architecture: "arm64", OS: "linux", Variant: "v8"}},
+			expectedQueryParams: url.Values{
+				"platform": {`{"architecture":"arm64","os":"linux","variant":"v8"}`},
+				"quiet":    {"0"},
+			},
+		},
+		{
+			doc: "multiple platforms",
+			platforms: []ocispec.Platform{
+				{Architecture: "arm64", OS: "linux", Variant: "v8"},
+				{Architecture: "amd64", OS: "linux"},
+			},
+			expectedQueryParams: url.Values{
+				"platform": {`{"architecture":"arm64","os":"linux","variant":"v8"}`, `{"architecture":"amd64","os":"linux"}`},
+				"quiet":    {"0"},
 			},
 		},
 	}
-	for _, loadCase := range loadCases {
-		client := &Client{
-			client: newMockClient(func(req *http.Request) (*http.Response, error) {
-				if !strings.HasPrefix(req.URL.Path, expectedURL) {
-					return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-				}
-				contentType := req.Header.Get("Content-Type")
-				if contentType != "application/x-tar" {
-					return nil, fmt.Errorf("content-type not set in URL headers properly. Expected 'application/x-tar', got %s", contentType)
-				}
-				query := req.URL.Query()
-				for key, expected := range loadCase.expectedQueryParams {
-					actual := query.Get(key)
-					if actual != expected {
-						return nil, fmt.Errorf("%s not set in URL query properly. Expected '%s', got %s", key, expected, actual)
-					}
-				}
-				headers := http.Header{}
-				headers.Add("Content-Type", loadCase.responseContentType)
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(bytes.NewReader([]byte(expectedOutput))),
-					Header:     headers,
-				}, nil
-			}),
-		}
+	for _, tc := range tests {
+		t.Run(tc.doc, func(t *testing.T) {
+			client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+				assert.Check(t, assertRequest(req, http.MethodPost, expectedURL))
+				assert.Check(t, is.Equal(req.Header.Get("Content-Type"), expectedContentType))
+				assert.Check(t, is.DeepEqual(req.URL.Query(), tc.expectedQueryParams))
 
-		input := bytes.NewReader([]byte(expectedInput))
-		imageLoadResponse, err := client.ImageLoad(context.Background(), input, loadCase.quiet)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if imageLoadResponse.JSON != loadCase.expectedResponseJSON {
-			t.Fatalf("expected a JSON response, was not.")
-		}
-		body, err := io.ReadAll(imageLoadResponse.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(body) != expectedOutput {
-			t.Fatalf("expected %s, got %s", expectedOutput, string(body))
-		}
+				return mockJSONResponse(http.StatusOK, nil, json.RawMessage(expectedOutput))(req)
+			}))
+			assert.NilError(t, err)
+
+			input := bytes.NewReader([]byte(expectedInput))
+			imageLoadResponse, err := client.ImageLoad(t.Context(), input,
+				ImageLoadWithQuiet(tc.quiet),
+				ImageLoadWithPlatforms(tc.platforms...),
+			)
+			assert.NilError(t, err)
+
+			body, err := io.ReadAll(imageLoadResponse)
+			assert.NilError(t, err)
+			assert.Check(t, is.Equal(string(body), expectedOutput))
+		})
 	}
 }

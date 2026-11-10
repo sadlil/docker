@@ -1,61 +1,53 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/image"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestImageHistoryError(t *testing.T) {
-	client := &Client{
-		client: newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
-	_, err := client.ImageHistory(context.Background(), "nothing")
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
+	_, err = client.ImageHistory(t.Context(), "nothing")
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
 }
 
 func TestImageHistory(t *testing.T) {
-	expectedURL := "/images/image_id/history"
-	client := &Client{
-		client: newMockClient(func(r *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(r.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, r.URL)
-			}
-			b, err := json.Marshal([]image.HistoryResponseItem{
-				{
-					ID:   "image_id1",
-					Tags: []string{"tag1", "tag2"},
-				},
-				{
-					ID:   "image_id2",
-					Tags: []string{"tag1", "tag2"},
-				},
-			})
-			if err != nil {
-				return nil, err
-			}
+	const (
+		expectedURL      = "/images/image_id/history"
+		historyResponse  = `[{"Comment":"","Created":0,"CreatedBy":"","Id":"image_id1","Size":0,"Tags":["tag1","tag2"]},{"Comment":"","Created":0,"CreatedBy":"","Id":"image_id2","Size":0,"Tags":["tag1","tag2"]}]`
+		expectedPlatform = `{"architecture":"arm64","os":"linux","variant":"v8"}`
+	)
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		assert.Check(t, assertRequest(req, http.MethodGet, expectedURL))
+		assert.Check(t, is.Equal(req.URL.Query().Get("platform"), expectedPlatform))
+		return mockResponse(http.StatusOK, nil, historyResponse)(req)
+	}))
+	assert.NilError(t, err)
+	expected := ImageHistoryResult{
+		Items: []image.HistoryResponseItem{
+			{
+				ID:   "image_id1",
+				Tags: []string{"tag1", "tag2"},
+			},
+			{
+				ID:   "image_id2",
+				Tags: []string{"tag1", "tag2"},
+			},
+		},
+	}
 
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader(b)),
-			}, nil
-		}),
-	}
-	imageHistories, err := client.ImageHistory(context.Background(), "image_id")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(imageHistories) != 2 {
-		t.Fatalf("expected 2 containers, got %v", imageHistories)
-	}
+	imageHistories, err := client.ImageHistory(t.Context(), "image_id", ImageHistoryWithPlatform(ocispec.Platform{
+		Architecture: "arm64",
+		OS:           "linux",
+		Variant:      "v8",
+	}))
+	assert.NilError(t, err)
+	assert.Check(t, is.DeepEqual(imageHistories, expected))
 }

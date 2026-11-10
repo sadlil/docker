@@ -4,11 +4,12 @@ import (
 	"context"
 	"time"
 
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/compression"
 	digest "github.com/opencontainers/go-digest"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Vertex is a node in a build graph. It defines an interface for a
@@ -20,7 +21,7 @@ type Vertex interface {
 
 	// Sys returns an object used to resolve the executor for this vertex.
 	// In LLB solver, this value would be of type `llb.Op`.
-	Sys() interface{}
+	Sys() any
 
 	// Options return metadata associated with the vertex that doesn't change the
 	// definition or equality check of it.
@@ -54,13 +55,21 @@ type VertexOptions struct {
 	Description  map[string]string // text values with no special meaning for solver
 	ExportCache  *bool
 	// WorkerConstraint
+	ProgressGroup *pb.ProgressGroup
+	Metadata      VertexMetadata
+}
+
+// VertexMetadata is opaque per-vertex metadata that gets merged when the same
+// vertex is shared by multiple jobs.
+type VertexMetadata interface {
+	Merge(other VertexMetadata) VertexMetadata
 }
 
 // Result is an abstract return value for a solve
 type Result interface {
 	ID() string
 	Release(context.Context) error
-	Sys() interface{}
+	Sys() any
 	Clone() Result
 }
 
@@ -70,10 +79,17 @@ type CachedResult interface {
 	CacheKeys() []ExportableCacheKey
 }
 
+type CachedResultWithProvenance interface {
+	CachedResult
+	WalkProvenance(context.Context, func(ProvenanceProvider) error) error
+}
+
 type ResultProxy interface {
+	ID() string
 	Result(context.Context) (CachedResult, error)
 	Release(context.Context) error
 	Definition() *pb.Definition
+	Provenance() any
 }
 
 // CacheExportMode is the type for setting cache exporting modes
@@ -92,12 +108,20 @@ const (
 
 // CacheExportOpt defines options for exporting build cache
 type CacheExportOpt struct {
-	// Convert can convert a build result to transferable object
-	Convert func(context.Context, Result) (*Remote, error)
+	// ResolveRemotes can convert a build result to transferable objects
+	ResolveRemotes func(context.Context, Result) ([]*Remote, error)
 	// Mode defines a cache export algorithm
 	Mode CacheExportMode
 	// Session is the session group to client (for auth credentials etc)
 	Session session.Group
+	// CompressionOpt is an option to specify the compression of the object to load.
+	// If specified, all objects that meet the option will be cached.
+	CompressionOpt *compression.Config
+	// ExportRoots defines if records for root vertexes should be exported.
+	ExportRoots bool
+	// IgnoreBacklinks defines if other cache chains for same result that did not
+	// participate in the current build should be exported.
+	IgnoreBacklinks bool
 }
 
 // CacheExporter can export the artifacts of the build chain
@@ -107,32 +131,37 @@ type CacheExporter interface {
 
 // CacheExporterTarget defines object capable of receiving exports
 type CacheExporterTarget interface {
-	Add(dgst digest.Digest) CacheExporterRecord
-	Visit(interface{})
-	Visited(interface{}) bool
+	Add(dgst digest.Digest, deps [][]CacheLink, results []CacheExportResult) (CacheExporterRecord, bool, error)
 }
 
-// CacheExporterRecord is a single object being exported
+// opaque interface
 type CacheExporterRecord interface {
-	AddResult(createdAt time.Time, result *Remote)
-	LinkFrom(src CacheExporterRecord, index int, selector string)
+	isCacheExporterRecord()
+}
+
+type CacheExporterRecordBase struct {
+}
+
+func (c *CacheExporterRecordBase) isCacheExporterRecord() {}
+
+type CacheLink struct {
+	Src      CacheExporterRecord
+	Selector string
+}
+
+type CacheExportResult struct {
+	CreatedAt  time.Time
+	Result     *Remote
+	EdgeVertex digest.Digest
+	EdgeIndex  Index
 }
 
 // Remote is a descriptor or a list of stacked descriptors that can be pulled
 // from a content provider
 // TODO: add closer to keep referenced data from getting deleted
 type Remote struct {
-	Descriptors []ocispec.Descriptor
-	Provider    content.Provider
-}
-
-// CacheLink is a link between two cache records
-type CacheLink struct {
-	Source   digest.Digest `json:",omitempty"`
-	Input    Index         `json:",omitempty"`
-	Output   Index         `json:",omitempty"`
-	Base     digest.Digest `json:",omitempty"`
-	Selector digest.Digest `json:",omitempty"`
+	Descriptors []ocispecs.Descriptor
+	Provider    content.InfoReaderProvider
 }
 
 type ReleaseFunc func()
@@ -144,13 +173,40 @@ type ReleaseFunc func()
 type Op interface {
 	// CacheMap returns structure describing how the operation is cached.
 	// Currently only roots are allowed to return multiple cache maps per op.
-	CacheMap(context.Context, session.Group, int) (*CacheMap, bool, error)
+	CacheMap(context.Context, JobContext, int) (*CacheMap, bool, error)
 
 	// Exec runs an operation given results from previous operations.
-	Exec(ctx context.Context, g session.Group, inputs []Result) (outputs []Result, err error)
+	// On error, outputs must be nil; the operation must release any outputs
+	// it created or transfer their ownership to the error.
+	Exec(ctx context.Context, jobCtx JobContext, inputs []Result) (outputs []Result, err error)
 
 	// Acquire acquires the necessary resources to execute the `Op`.
 	Acquire(ctx context.Context) (release ReleaseFunc, err error)
+}
+
+type JobContext interface {
+	// Session returns the session group associated with the clients building current step.
+	Session() session.Group
+	// Cleanup adds a function that is called when the job is done. This can be used to associate
+	// resources with the job and keep them from being released until the job is done.
+	Cleanup(func() error) error
+	// ResolverCache returns object for memorizing/synchronizing remote resolving decisions during the job.
+	// Steps from same build job will share the same resolver cache.
+	ResolverCache() ResolverCache
+	// CompatibilityVersion returns the solve-wide compatibility version for the current job.
+	CompatibilityVersion() (int, error)
+}
+
+type ResolverCache interface {
+	// Lock locks a key until the returned release function is called.
+	// Release function can return value that will be returned to next callers.
+	// Lock can return multiple values because two steps can be merged once
+	// both have independently completed their resolution.
+	Lock(key any) (values []any, release func(any) error, err error)
+}
+
+type ProvenanceProvider interface {
+	IsProvenanceProvider()
 }
 
 type ResultBasedCacheFunc func(context.Context, Result, session.Group) (digest.Digest, error)
@@ -210,6 +266,17 @@ type CacheRecord struct {
 	key          *CacheKey
 }
 
+func (ck *CacheRecord) TraceFields() map[string]any {
+	return map[string]any{
+		"id":            ck.ID,
+		"size":          ck.Size,
+		"createdAt":     ck.CreatedAt,
+		"priority":      ck.Priority,
+		"cache_manager": ck.cacheManager.ID(),
+		"cache_key":     ck.key.TraceFields(),
+	}
+}
+
 // CacheManager determines if there is a result that matches the cache keys
 // generated during the build that could be reused instead of fully
 // reevaluating the vertex and its inputs. There can be multiple cache
@@ -223,11 +290,13 @@ type CacheManager interface {
 	// Query searches for cache paths from one cache key to the output of a
 	// possible match.
 	Query(inp []CacheKeyWithSelector, inputIndex Index, dgst digest.Digest, outputIndex Index) ([]*CacheKey, error)
-	Records(ck *CacheKey) ([]*CacheRecord, error)
+	Records(ctx context.Context, ck *CacheKey) ([]*CacheRecord, error)
 
 	// Load loads a cache record into a result reference.
 	Load(ctx context.Context, rec *CacheRecord) (Result, error)
 
 	// Save saves a result based on a cache key
 	Save(key *CacheKey, s Result, createdAt time.Time) (*ExportableCacheKey, error)
+
+	ReleaseUnreferenced(context.Context) error
 }

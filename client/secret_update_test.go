@@ -1,62 +1,41 @@
-package client // import "github.com/docker/docker/client"
+package client
 
 import (
-	"bytes"
-	"context"
-	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
-func TestSecretUpdateUnsupported(t *testing.T) {
-	client := &Client{
-		version: "1.24",
-		client:  &http.Client{},
-	}
-	err := client.SecretUpdate(context.Background(), "secret_id", swarm.Version{}, swarm.SecretSpec{})
-	assert.Check(t, is.Error(err, `"secret update" requires API version 1.25, but the Docker daemon API version is 1.24`))
-}
-
 func TestSecretUpdateError(t *testing.T) {
-	client := &Client{
-		version: "1.25",
-		client:  newMockClient(errorMock(http.StatusInternalServerError, "Server error")),
-	}
+	client, err := New(WithMockClient(errorMock(http.StatusInternalServerError, "Server error")))
+	assert.NilError(t, err)
 
-	err := client.SecretUpdate(context.Background(), "secret_id", swarm.Version{}, swarm.SecretSpec{})
-	if !errdefs.IsSystem(err) {
-		t.Fatalf("expected a Server Error, got %[1]T: %[1]v", err)
-	}
+	_, err = client.SecretUpdate(t.Context(), "secret_id", SecretUpdateOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInternal))
+
+	_, err = client.SecretUpdate(t.Context(), "", SecretUpdateOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	_, err = client.SecretUpdate(t.Context(), "    ", SecretUpdateOptions{})
+	assert.Check(t, is.ErrorType(err, cerrdefs.IsInvalidArgument))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestSecretUpdate(t *testing.T) {
-	expectedURL := "/v1.25/secrets/secret_id/update"
+	const expectedURL = "/secrets/secret_id/update"
 
-	client := &Client{
-		version: "1.25",
-		client: newMockClient(func(req *http.Request) (*http.Response, error) {
-			if !strings.HasPrefix(req.URL.Path, expectedURL) {
-				return nil, fmt.Errorf("Expected URL '%s', got '%s'", expectedURL, req.URL)
-			}
-			if req.Method != http.MethodPost {
-				return nil, fmt.Errorf("expected POST method, got %s", req.Method)
-			}
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(bytes.NewReader([]byte("body"))),
-			}, nil
-		}),
-	}
+	client, err := New(WithMockClient(func(req *http.Request) (*http.Response, error) {
+		if err := assertRequest(req, http.MethodPost, expectedURL); err != nil {
+			return nil, err
+		}
+		return mockResponse(http.StatusOK, nil, "body")(req)
+	}))
+	assert.NilError(t, err)
 
-	err := client.SecretUpdate(context.Background(), "secret_id", swarm.Version{}, swarm.SecretSpec{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, err = client.SecretUpdate(t.Context(), "secret_id", SecretUpdateOptions{})
+	assert.NilError(t, err)
 }

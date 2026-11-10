@@ -119,7 +119,7 @@ can take over 15 minutes to complete.
 4. Use `make` to build a development environment image and run it in a container.
 
    ```none
-   $ make BIND_DIR=. shell
+   $ make shell
    ```
 
    Using the instructions in the
@@ -129,16 +129,21 @@ can take over 15 minutes to complete.
 
    ```none
    Successfully built 3d872560918e
-   Successfully tagged docker-dev:dry-run-test
-   docker run --rm -i --privileged -e BUILDFLAGS -e KEEPBUNDLE -e DOCKER_BUILD_GOGC -e DOCKER_BUILD_PKGS -e DOCKER_CLIENTONLY -e DOCKER_DEBUG -e DOCKER_EXPERIMENTAL -e DOCKER_GITCOMMIT -e DOCKER_GRAPHDRIVER=devicemapper -e DOCKER_REMAP_ROOT -e DOCKER_STORAGE_OPTS -e DOCKER_USERLANDPROXY -e TESTDIRS -e TESTFLAGS -e TIMEOUT -v "home/ubuntu/repos/docker/bundles:/go/src/github.com/docker/docker/bundles" -t "docker-dev:dry-run-test" bash
+   docker run --rm -i --privileged -e BUILDFLAGS -e KEEPBUNDLE -e DOCKER_DEBUG ...
    #
    ```
 
    At this point, your prompt reflects the container's BASH shell.
 
-5. List the contents of the current directory (`/go/src/github.com/docker/docker`).
+   Alternatively you can use the provided devcontainer in an IDE that supports them (VSCode, Goland, etc.)
 
-   You should see the image's source from the  `/go/src/github.com/docker/docker`
+   > **Note:** The `make shell` command creates an image tagged as `docker-dev:latest` by default.
+   > It does not automatically tag the image with your current branch name, even if you are on a feature branch.
+   > Some older documentation or examples may refer to a branch-specific tag, but that behavior is no longer used.
+
+5. List the contents of the current directory (`/usr/src/moby`).
+
+   You should see the image's source from the `/usr/src/moby`
    directory.
 
    ![List example](images/list_example.png)
@@ -150,10 +155,10 @@ can take over 15 minutes to complete.
    Removing bundles/
 
    ---> Making bundle: binary (in bundles/binary)
-   Building: bundles/binary-daemon/dockerd-17.06.0-dev
-   Created binary: bundles/binary-daemon/dockerd-17.06.0-dev
-   Copying nested executables into bundles/binary-daemon
-
+   Building bundles/binary-daemon/dockerd (linux/amd64)...
+   Created binary: bundles/binary-daemon/dockerd
+   Building bundles/binary-daemon/docker-proxy (linux/amd64)...
+   Created binary:bundles/binary-daemon/docker-proxy
    ```
 
 7. Run `make install`, which copies the binary to the container's
@@ -211,13 +216,13 @@ can take over 15 minutes to complete.
    Notice the split versions between client and server, which might be
    unexpected. In more recent times the Docker CLI component (which provides the
    `docker` command) has split out from the Moby project and is now maintained in [docker/cli](https://github.com/docker/cli).
-   
+
    The Moby project now defaults to a [fixed
    version](https://github.com/docker/cli/commits/v17.06.0-ce) of the
    `docker` CLI for integration tests.
 
    You may have noticed the following message when starting the container with the `shell` command:
-   
+
    ```none
    Makefile:123: The docker client CLI has moved to github.com/docker/cli. For a dev-test cycle involving the CLI, run:
    DOCKER_CLI_PATH=/host/path/to/cli/binary make shell
@@ -229,12 +234,12 @@ can take over 15 minutes to complete.
    test-execution:
 
    ```none
-   make DOCKER_CLI_PATH=/home/ubuntu/git/docker-ce/components/packaging/static/build/linux/docker/docker BIND_DIR=. shell
+   make DOCKER_CLI_PATH=~/go/src/github.com/docker/cli/build/docker shell
    ...
    # which docker
    /usr/local/cli/docker
    # docker --version
-   Docker version 17.09.0-dev, build 
+   Docker version 29.0.0-dev, build 09cd4ea26c
    ```
 
     This Docker CLI should be built from the [docker-cli
@@ -265,12 +270,9 @@ can take over 15 minutes to complete.
 
     ```none
     ubuntu@ubuntu1404:~$ docker ps
-    CONTAINER ID        IMAGE                     COMMAND             CREATED             STATUS              PORTS               NAMES
-    a8b2885ab900        docker-dev:dry-run-test   "hack/dind bash"    43 minutes ago      Up 43 minutes                           hungry_payne
+    CONTAINER ID   IMAGE        COMMAND            CREATED          STATUS          PORTS     NAMES
+    a8b2885ab900   docker-dev   "hack/dind bash"   43 minutes ago   Up 43 minutes             hungry_payne
     ```
-
-    Notice that the tag on the container is marked with the `dry-run-test` branch name.
-
 
 ## Task 3. Make a code change
 
@@ -280,15 +282,13 @@ you have:
 * forked and cloned the Moby Engine code repository
 * created a feature branch for development
 * created and started an Engine development container from your branch
-* built a binary inside of your development container
+* built a binary inside your development container
 * launched a `docker` daemon using your newly compiled binary
 * called the `docker` client to run a `hello-world` container inside
   your development container
 
-Running the `make BIND_DIR=. shell` command mounted your local Docker repository source into
+Running the `make shell` command mounted your local Docker repository source into
 your Docker container.
-
-   > **Note**: Inspecting the `Dockerfile` shows a `COPY . /go/src/github.com/docker/docker` instruction, suggesting that dynamic code changes will _not_ be reflected in the container. However inspecting the `Makefile` shows that the current working directory _will_ be mounted via a `-v` volume mount.
 
 When you start to develop code though, you'll
 want to iterate code changes and builds inside the container. If you have
@@ -310,7 +310,7 @@ example, you'll edit the help for the `attach` subcommand.
    Your location should be different because, at least, your username is
    different.
 
-3. Open the `cmd/dockerd/docker.go` file.
+3. Open the `daemon/command/docker.go` file.
 
 4. Edit the command's help message.
 
@@ -326,7 +326,7 @@ example, you'll edit the help for the `attach` subcommand.
    Short:         "A self-sufficient and really fun runtime for containers.",
    ```
 
-5. Save and close the `cmd/dockerd/docker.go` file.
+5. Save and close the `daemon/command/docker.go` file.
 
 6. Go to your running docker development container shell.
 
@@ -334,7 +334,7 @@ example, you'll edit the help for the `attach` subcommand.
 
 8. Stop Docker if it is running.
 
-9. Copy the binaries to **/usr/bin** by entering the following commands in the docker development container shell.
+9. Copy the binaries to **/usr/local/bin** by entering the following commands in the docker development container shell.
 
    ```
    hack/make.sh binary install-binary

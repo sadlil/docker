@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -11,14 +13,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
 )
 
 const attachWait = 5 * time.Second
 
-func (s *DockerSuite) TestAttachMultipleAndRestart(c *testing.T) {
+type DockerCLIAttachSuite struct {
+	ds *DockerSuite
+}
+
+func (s *DockerCLIAttachSuite) TearDownTest(ctx context.Context, t *testing.T) {
+	s.ds.TearDownTest(ctx, t)
+}
+
+func (s *DockerCLIAttachSuite) OnTimeout(t *testing.T) {
+	s.ds.OnTimeout(t)
+}
+
+func (s *DockerCLIAttachSuite) TestAttachMultipleAndRestart(c *testing.T) {
 	endGroup := &sync.WaitGroup{}
 	startGroup := &sync.WaitGroup{}
 	endGroup.Add(3)
@@ -40,7 +54,7 @@ func (s *DockerSuite) TestAttachMultipleAndRestart(c *testing.T) {
 		close(startDone)
 	}()
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		go func() {
 			cmd := exec.Command(dockerBinary, "attach", "attacher")
 
@@ -88,7 +102,7 @@ func (s *DockerSuite) TestAttachMultipleAndRestart(c *testing.T) {
 	}
 }
 
-func (s *DockerSuite) TestAttachTTYWithoutStdin(c *testing.T) {
+func (s *DockerCLIAttachSuite) TestAttachTTYWithoutStdin(c *testing.T) {
 	// TODO: Figure out how to get this running again reliable on Windows.
 	// It works by accident at the moment. Sometimes. I've gone back to v1.13.0 and see the same.
 	// On Windows, docker run -d -ti busybox causes the container to exit immediately.
@@ -97,10 +111,9 @@ func (s *DockerSuite) TestAttachTTYWithoutStdin(c *testing.T) {
 	// will just fail and `MISS` all the other tests. For now, disabling it. Will
 	// open an issue to track re-enabling this and root-causing the problem.
 	testRequires(c, DaemonIsLinux)
-	out, _ := dockerCmd(c, "run", "-d", "-ti", "busybox")
-
+	out := cli.DockerCmd(c, "run", "-d", "-ti", "busybox").Stdout()
 	id := strings.TrimSpace(out)
-	assert.NilError(c, waitRun(id))
+	cli.WaitRun(c, id)
 
 	done := make(chan error, 1)
 	go func() {
@@ -116,10 +129,17 @@ func (s *DockerSuite) TestAttachTTYWithoutStdin(c *testing.T) {
 		if runtime.GOOS == "windows" {
 			expected += ".  If you are using mintty, try prefixing the command with 'winpty'"
 		}
-		if out, _, err := runCommandWithOutput(cmd); err == nil {
-			done <- fmt.Errorf("attach should have failed")
+		result := icmd.RunCmd(icmd.Cmd{
+			Command: cmd.Args,
+			Env:     cmd.Env,
+			Dir:     cmd.Dir,
+			Stdin:   cmd.Stdin,
+			Stdout:  cmd.Stdout,
+		})
+		if result.Error == nil {
+			done <- errors.New("attach should have failed")
 			return
-		} else if !strings.Contains(out, expected) {
+		} else if !strings.Contains(result.Combined(), expected) {
 			done <- fmt.Errorf("attach failed with error %q: expected %q", out, expected)
 			return
 		}
@@ -133,9 +153,9 @@ func (s *DockerSuite) TestAttachTTYWithoutStdin(c *testing.T) {
 	}
 }
 
-func (s *DockerSuite) TestAttachDisconnect(c *testing.T) {
+func (s *DockerCLIAttachSuite) TestAttachDisconnect(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
-	out, _ := dockerCmd(c, "run", "-di", "busybox", "/bin/cat")
+	out := cli.DockerCmd(c, "run", "-di", "busybox", "/bin/cat").Stdout()
 	id := strings.TrimSpace(out)
 
 	cmd := exec.Command(dockerBinary, "attach", id)
@@ -147,7 +167,7 @@ func (s *DockerSuite) TestAttachDisconnect(c *testing.T) {
 	stdout, err := cmd.StdoutPipe()
 	assert.NilError(c, err)
 	defer stdout.Close()
-	assert.Assert(c, cmd.Start() == nil)
+	assert.NilError(c, cmd.Start())
 	defer func() {
 		cmd.Process.Kill()
 		cmd.Wait()
@@ -159,22 +179,22 @@ func (s *DockerSuite) TestAttachDisconnect(c *testing.T) {
 	assert.NilError(c, err)
 	assert.Equal(c, strings.TrimSpace(out), "hello")
 
-	assert.Assert(c, stdin.Close() == nil)
+	assert.NilError(c, stdin.Close())
 
 	// Expect container to still be running after stdin is closed
 	running := inspectField(c, id, "State.Running")
 	assert.Equal(c, running, "true")
 }
 
-func (s *DockerSuite) TestAttachPausedContainer(c *testing.T) {
+func (s *DockerCLIAttachSuite) TestAttachPausedContainer(c *testing.T) {
 	testRequires(c, IsPausable)
 	runSleepingContainer(c, "-d", "--name=test")
-	dockerCmd(c, "pause", "test")
+	cli.DockerCmd(c, "pause", "test")
 
-	result := dockerCmdWithResult("attach", "test")
+	result := cli.Docker(cli.Args("attach", "test"))
 	result.Assert(c, icmd.Expected{
 		Error:    "exit status 1",
 		ExitCode: 1,
-		Err:      "You cannot attach to a paused container, unpause it first",
+		Err:      "cannot attach to a paused container",
 	})
 }

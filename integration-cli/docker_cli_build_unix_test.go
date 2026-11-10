@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package main
 
@@ -16,25 +15,36 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/integration-cli/cli"
-	"github.com/docker/docker/integration-cli/cli/build"
-	"github.com/docker/docker/testutil/fakecontext"
-	units "github.com/docker/go-units"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/v2/integration-cli/cli"
+	"github.com/moby/moby/v2/integration-cli/cli/build"
+	"github.com/moby/moby/v2/internal/testutil/fakecontext"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
 )
 
-func (s *DockerSuite) TestBuildResourceConstraintsAreUsed(c *testing.T) {
+func (s *DockerCLIBuildSuite) TestBuildResourceConstraintsAreUsed(c *testing.T) {
 	testRequires(c, cpuCfsQuota)
-	name := "testbuildresourceconstraints"
-	buildLabel := "DockerSuite.TestBuildResourceConstraintsAreUsed"
+	const name = "testbuildresourceconstraints"
+	const buildLabel = "DockerCLIBuildSuite.TestBuildResourceConstraintsAreUsed"
 
 	ctx := fakecontext.New(c, "", fakecontext.WithDockerfile(`
 	FROM hello-world:frozen
 	RUN ["/hello"]
 	`))
 	cli.Docker(
-		cli.Args("build", "--no-cache", "--rm=false", "--memory=64m", "--memory-swap=-1", "--cpuset-cpus=0", "--cpuset-mems=0", "--cpu-shares=100", "--cpu-quota=8000", "--ulimit", "nofile=42", "--label="+buildLabel, "-t", name, "."),
+		cli.Args("build",
+			"--no-cache",
+			"--rm=false",
+			"--memory=64m",
+			"--memory-swap=-1",
+			"--cpuset-cpus=0",
+			"--cpuset-mems=0",
+			"--cpu-shares=100",
+			"--cpu-quota=8000",
+			"--ulimit", "nofile=50",
+			"--label="+buildLabel,
+			"-t", name, "."),
 		cli.InDir(ctx.Dir),
 	).Assert(c, icmd.Success)
 
@@ -48,7 +58,7 @@ func (s *DockerSuite) TestBuildResourceConstraintsAreUsed(c *testing.T) {
 		CpusetMems string
 		CPUShares  int64
 		CPUQuota   int64
-		Ulimits    []*units.Ulimit
+		Ulimits    []*container.Ulimit
 	}
 
 	cfg := inspectFieldJSON(c, cID, "HostConfig")
@@ -64,7 +74,7 @@ func (s *DockerSuite) TestBuildResourceConstraintsAreUsed(c *testing.T) {
 	assert.Equal(c, c1.CPUShares, int64(100), "resource constraints not set properly for CPUShares")
 	assert.Equal(c, c1.CPUQuota, int64(8000), "resource constraints not set properly for CPUQuota")
 	assert.Equal(c, c1.Ulimits[0].Name, "nofile", "resource constraints not set properly for Ulimits")
-	assert.Equal(c, c1.Ulimits[0].Hard, int64(42), "resource constraints not set properly for Ulimits")
+	assert.Equal(c, c1.Ulimits[0].Hard, int64(50), "resource constraints not set properly for Ulimits")
 
 	// Make sure constraints aren't saved to image
 	cli.DockerCmd(c, "run", "--name=test", name)
@@ -81,12 +91,12 @@ func (s *DockerSuite) TestBuildResourceConstraintsAreUsed(c *testing.T) {
 	assert.Assert(c, c2.CpusetMems != "0", "resource leaked from build for CpusetMems")
 	assert.Assert(c, c2.CPUShares != int64(100), "resource leaked from build for CPUShares")
 	assert.Assert(c, c2.CPUQuota != int64(8000), "resource leaked from build for CPUQuota")
-	assert.Assert(c, c2.Ulimits == nil, "resource leaked from build for Ulimits")
+	assert.Assert(c, len(c2.Ulimits) == 0, "resource leaked from build for Ulimits")
 }
 
-func (s *DockerSuite) TestBuildAddChangeOwnership(c *testing.T) {
+func (s *DockerCLIBuildSuite) TestBuildAddChangeOwnership(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
-	name := "testbuildaddown"
+	const name = "testbuildaddown"
 
 	ctx := func() *fakecontext.Fake {
 		dockerfile := `
@@ -108,7 +118,7 @@ func (s *DockerSuite) TestBuildAddChangeOwnership(c *testing.T) {
 			Dir:     tmpDir,
 		}).Assert(c, icmd.Success)
 
-		if err := os.WriteFile(filepath.Join(tmpDir, "Dockerfile"), []byte(dockerfile), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(tmpDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 			c.Fatalf("failed to open destination dockerfile: %v", err)
 		}
 		return fakecontext.New(c, tmpDir)
@@ -116,7 +126,7 @@ func (s *DockerSuite) TestBuildAddChangeOwnership(c *testing.T) {
 
 	defer ctx.Close()
 
-	buildImageSuccessfully(c, name, build.WithExternalBuildContext(ctx))
+	cli.BuildCmd(c, name, build.WithExternalBuildContext(ctx))
 }
 
 // Test that an infinite sleep during a build is killed if the client disconnects.
@@ -130,9 +140,9 @@ func (s *DockerSuite) TestBuildAddChangeOwnership(c *testing.T) {
 // TODO(buildkit): this test needs to be rewritten for buildkit.
 // It has been manually tested positive. Confirmed issue: docker build output parsing.
 // Potential issue: newEventObserver uses docker events, which is not hooked up to buildkit.
-func (s *DockerSuite) TestBuildCancellationKillsSleep(c *testing.T) {
+func (s *DockerCLIBuildSuite) TestBuildCancellationKillsSleep(c *testing.T) {
 	testRequires(c, DaemonIsLinux, TODOBuildkit)
-	name := "testbuildcancellation"
+	const name = "testbuildcancellation"
 
 	observer, err := newEventObserver(c)
 	assert.NilError(c, err)
